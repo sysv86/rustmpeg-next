@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, for example 0.1.0-alpha.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Verify, build, and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
+
+      - name: Resolve tag and version
+        id: meta
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            version="${VERSION_INPUT#v}"
+            tag="v${version}"
+          else
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          fi
+          if [ -z "${version}" ]; then
+            echo "::error::empty release version"
+            exit 1
+          fi
+          workspace_version="$(cargo metadata --format-version 1 --no-deps |
+            python3 -c 'import json, sys; d = json.load(sys.stdin); print(next(p["version"] for p in d["packages"] if p["name"] == "rustmpeg-core"))')"
+          if [ "${workspace_version}" != "${version}" ]; then
+            echo "::error::release version ${version} does not match workspace version ${workspace_version}"
+            exit 1
+          fi
+          echo "tag=${tag}" >>"${GITHUB_OUTPUT}"
+          echo "version=${version}" >>"${GITHUB_OUTPUT}"
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: License audit
+        run: python3 scripts/check-licenses.py
+
+      - name: Build release examples
+        run: cargo build --release --workspace --examples
+
+      - name: Package release artifacts
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/rustmpeg-release"
+          rm -rf "${out}"
+          mkdir -p "${out}/examples"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            source_ref="${TAG}"
+          else
+            source_ref="${GITHUB_SHA}"
+          fi
+          git archive --format=tar.gz --prefix="rustmpeg-next-${TAG}/" \
+            -o "${out}/rustmpeg-next-${TAG}-source.tar.gz" "${source_ref}"
+          find target/release/examples -maxdepth 1 -type f -executable ! -name '*.d' -print0 |
+            while IFS= read -r -d '' binary; do
+              cp "${binary}" "${out}/examples/"
+            done
+          tar -czf "${out}/rustmpeg-next-${TAG}-examples-linux-$(uname -m).tar.gz" \
+            -C "${out}/examples" .
+          (cd "${out}" && sha256sum ./*.tar.gz >SHA256SUMS)
+          ls -l "${out}"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/rustmpeg-release"
+          mapfile -t assets < <(find "${out}" -maxdepth 1 -type f \
+            \( -name '*.tar.gz' -o -name 'SHA256SUMS' \) -print | sort)
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${assets[@]}" --clobber
+            exit 0
+          fi
+          target=()
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            target=(--target "${GITHUB_SHA}")
+          fi
+          gh release create "${TAG}" "${assets[@]}" "${target[@]}" \
+            --title "rustmpeg-next ${VERSION}" \
+            --generate-notes
+
+      - name: Publish crates (optional)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is not configured; skipping crates.io publication." >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          for crate in rustmpeg-core rustmpeg-format rustmpeg-audio rustmpeg-image rustmpeg-video rustmpeg-vulkan rustmpeg-cli; do
+            echo "::group::cargo publish -p ${crate}"
+            cargo publish -p "${crate}"
+            echo "::endgroup::"
+            # Give the sparse index a moment before the next dependent crate resolves.
+            if [ "${crate}" != "rustmpeg-cli" ]; then
+              sleep 30
+            fi
+          done

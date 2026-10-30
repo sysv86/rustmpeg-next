@@ -47,8 +47,16 @@ Nightly is pinned in `rust-toolchain.toml` (`std::simd`). More commands:
 
 Pre-alpha. Self-reported workspace completion is in the footer and in
 [`docs/status.json`](docs/status.json); conformance is claimed only where an
-external oracle was run ([VVC status](docs/vvc/STATUS.md)). Nothing here is
-published to crates.io yet.
+external oracle was run ([VVC status](docs/vvc/STATUS.md)).
+
+## Releases
+
+A `v<version>` tag or a manual `Release` workflow run verifies the tree
+(`cargo fmt`, `clippy`, tests, license audit), builds the release examples, and
+publishes a GitHub Release with the source archive, the example binaries, and
+their checksums. Crates are published in dependency order only when the
+`CARGO_REGISTRY_TOKEN` repository secret is configured; otherwise the step
+records the skip in the run summary.
 
 ## License
 
