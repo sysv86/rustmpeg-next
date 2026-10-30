@@ -1,0 +1,20 @@
+# Repository-relative links are used deliberately: this checkout has no git
+# remote configured, so an absolute owner/repository URL cannot be derived
+# without inventing one. Once the remote exists, these can be made absolute.
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: "../../security/policy"
+    about: >-
+      Do not open a public issue for a vulnerability. Follow the security
+      policy for private reporting.
+  - name: Questions and design discussion
+    url: "../../discussions"
+    about: >-
+      Ask usage questions and discuss proposals before filing an issue.
+  - name: Frequently asked questions
+    url: "../../blob/main/docs/faq/FAQ.md"
+    about: Read the FAQ before opening a support request.
+  - name: Configuration reference
+    url: "../../blob/main/docs/configs/CONFIG.md"
+    about: Check supported options, profiles, and feature flags.

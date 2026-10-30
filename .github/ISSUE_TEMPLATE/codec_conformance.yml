@@ -1,0 +1,197 @@
+name: Codec conformance mismatch
+description: Report a bitstream, reconstruction, or entropy-coding mismatch against a named reference implementation.
+title: "[conformance] "
+labels: ["type/conformance", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form only for codec correctness against a normative oracle.
+        Generic crashes and API defects belong in the bug report form.
+
+        A conformance report must identify the exact oracle build, the exact
+        stream hash, and the first differing byte or sample. Reports without
+        `cmp` (or equivalent) evidence are not actionable.
+
+  - type: dropdown
+    id: direction
+    attributes:
+      label: Encoder or decoder
+      options:
+        - Decoder
+        - Encoder
+        - Encoder and decoder
+        - Muxer/demuxer bitstream packaging
+    validations:
+      required: true
+
+  - type: dropdown
+    id: codec
+    attributes:
+      label: Codec
+      options:
+        - AV2
+        - H.266/VVC
+        - APV
+        - Opus
+        - FLAC
+        - LPCM
+        - LC3
+        - IAMF
+        - JPEG XL
+        - OpenEXR
+    validations:
+      required: true
+
+  - type: dropdown
+    id: oracle
+    attributes:
+      label: Reference oracle
+      description: Name the implementation used to decide correctness. FFmpeg is a black-box comparator only, never a source.
+      options:
+        - VTM (VVC reference software)
+        - VVdeC
+        - dav2d (AV2)
+        - AVM (AV2 reference software)
+        - OpenAPV / RFC 9924 reference
+        - libFLAC / flac CLI
+        - libopus / opus CLI
+        - FFmpeg (black-box comparison only)
+        - Normative text only
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: oracle-version
+    attributes:
+      label: Exact oracle version and build
+      description: >-
+        Include tag/commit, compiler, build flags, and whether it was built in
+        release mode. "Latest" is not a version.
+      placeholder: "VTM 24.0, commit ...; GCC 14.2 -O3; RExt__HIGH_BIT_DEPTH_SUPPORT=0"
+    validations:
+      required: true
+
+  - type: input
+    id: stream-hash
+    attributes:
+      label: Input stream hash
+      description: Paste `sha256sum` of the exact input bitstream and report its size in bytes.
+      placeholder: "<sha256>  <file> (<bytes> bytes)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: commands
+    attributes:
+      label: Encoder and decoder command lines
+      description: >-
+        Paste the full rustmpeg-next command and the full oracle command,
+        including every option, profile, level, and build profile.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: first-difference
+    attributes:
+      label: First differing byte or sample
+      description: >-
+        Report the byte offset for bitstreams or the plane/x/y/sample index for
+        reconstructed pictures, with both values in hex or decimal.
+      placeholder: "byte 0x1f3a: ours 0x7c, oracle 0x7e; or Y plane (x=48, y=17): 412 vs 411"
+    validations:
+      required: true
+
+  - type: textarea
+    id: cmp-output
+    attributes:
+      label: cmp / checksum output
+      description: Paste `cmp -l` (or `xxd` around the diff) and `sha256sum` for both outputs.
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: bit-depth
+    attributes:
+      label: Bit depth
+      options:
+        - "8"
+        - "10"
+        - "12"
+        - "16"
+        - "f16"
+        - "f32"
+        - Mixed / other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: chroma
+    attributes:
+      label: Chroma format
+      options:
+        - "4:0:0 (monochrome)"
+        - "4:2:0"
+        - "4:2:2"
+        - "4:4:4"
+        - "4:4:4:4"
+        - "N/A (audio)"
+    validations:
+      required: true
+
+  - type: input
+    id: block-size
+    attributes:
+      label: CTU / superblock / tile size
+      description: Report the coding tree unit or superblock size and tile configuration used by the stream.
+      placeholder: "CTU 128, tiles 2x2, no WPP"
+    validations:
+      required: true
+
+  - type: input
+    id: dimensions
+    attributes:
+      label: Picture dimensions and frame count
+      description: Include visible and coded dimensions, and whether the stream is intra-only.
+      placeholder: "1920x1080 visible, 1920x1088 coded, 1 intra frame"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-actual
+    attributes:
+      label: Expected vs actual
+      description: >-
+        State whether the mismatch is syntax, coefficient, reconstruction, or
+        hashing, and whether it is deterministic across runs.
+    validations:
+      required: true
+
+  - type: input
+    id: vector-source
+    attributes:
+      label: Test vector source and license
+      description: >-
+        Name the conformance vector and its license/permission. Do not attach a
+        corpus that cannot be redistributed; describe how maintainers can obtain it.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues and this mismatch is not already reported.
+          required: true
+        - label: The oracle version, build flags, and command lines above are exact and complete.
+          required: true
+        - label: I reproduced the mismatch from a clean checkout on the pinned toolchain.
+          required: true
+        - label: This report contains no secrets, private media, or proprietary streams.
+          required: true
+        - label: I did not copy restricted implementation code into this report.
+          required: true

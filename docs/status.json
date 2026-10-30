@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "definition": "Self-reported implementation completeness per workspace crate, 0-100. Overall completion is the unweighted mean. Update this file when a crate reaches a new milestone; docs/CONCEPT.md and NOTES.md remain the narrative sources.",
+  "updated": "2026-10-30",
+  "crates": [
+    { "name": "rustmpeg-core", "percent": 85 },
+    { "name": "rustmpeg-format", "percent": 55 },
+    { "name": "rustmpeg-audio", "percent": 50 },
+    { "name": "rustmpeg-image", "percent": 92 },
+    { "name": "rustmpeg-video", "percent": 55 },
+    { "name": "rustmpeg-vulkan", "percent": 35 },
+    { "name": "rustmpeg-cli", "percent": 70 }
+  ]
+}

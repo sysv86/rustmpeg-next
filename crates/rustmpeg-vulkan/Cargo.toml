@@ -1,0 +1,23 @@
+[package]
+name = "rustmpeg-vulkan"
+description = "Vulkan Compute backend for rustmpeg-next"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["vulkan", "wgpu", "compute", "video", "gpu"]
+categories = ["multimedia::video", "graphics"]
+publish.workspace = true
+
+[dependencies]
+rustmpeg-video.workspace = true
+naga.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+wgpu.workspace = true
+
+[lints]
+workspace = true

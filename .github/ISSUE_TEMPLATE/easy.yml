@@ -1,0 +1,53 @@
+name: Easy report (newcomers welcome)
+description: A lightweight form for general users — no strict rules, just tell us what happened.
+title: "[easy] "
+labels: ["community/newcomer", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        You do not need to follow the strict bug or conformance templates here.
+        If you are unsure which template fits, use this one.
+
+        A maintainer will triage it and move it to the right label. Please avoid
+        pasting secrets, tokens, private media, or proprietary streams.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A sentence or two is enough. Screenshots or logs are welcome but optional.
+      placeholder: I ran ... and expected ..., but ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: how-to-reproduce
+    attributes:
+      label: How can we reproduce it? (optional)
+      description: Command, input description, or a link. Skip it if you do not know.
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit (optional)
+      placeholder: rustmpeg 0.1.0-alpha.1, commit 72cfc82, or "unknown"
+    validations:
+      required: false
+
+  - type: input
+    id: environment
+    attributes:
+      label: OS and toolchain (optional)
+      placeholder: Linux x86_64, stable/nightly version
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else? (optional)
+    validations:
+      required: false

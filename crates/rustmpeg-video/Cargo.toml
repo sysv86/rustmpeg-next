@@ -1,0 +1,21 @@
+[package]
+name = "rustmpeg-video"
+description = "Safe Rust software codecs AV1, AV2, H.266/VVC and APV for rustmpeg-next"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause"
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["video", "av2", "vvc", "apv", "codec"]
+categories = ["multimedia::video", "multimedia::encoding"]
+publish.workspace = true
+
+[dependencies]
+rustmpeg-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rustmpeg-core",
+    "crates/rustmpeg-format",
+    "crates/rustmpeg-audio",
+    "crates/rustmpeg-image",
+    "crates/rustmpeg-video",
+    "crates/rustmpeg-vulkan",
+    "crates/rustmpeg-cli",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+authors = ["sysv86 (kerneldroid)"]
+repository = "https://github.com/sysv86/rustmpeg-next"
+homepage = "https://github.com/sysv86/rustmpeg-next"
+readme = "README.md"
+publish = true
+
+[workspace.dependencies]
+# Internal crates
+rustmpeg-core = { path = "crates/rustmpeg-core", version = "0.1.0-alpha.1" }
+rustmpeg-format = { path = "crates/rustmpeg-format", version = "0.1.0-alpha.1" }
+rustmpeg-audio = { path = "crates/rustmpeg-audio", version = "0.1.0-alpha.1" }
+rustmpeg-image = { path = "crates/rustmpeg-image", version = "0.1.0-alpha.1" }
+rustmpeg-video = { path = "crates/rustmpeg-video", version = "0.1.0-alpha.1" }
+rustmpeg-vulkan = { path = "crates/rustmpeg-vulkan", version = "0.1.0-alpha.1" }
+
+# Async runtime and buffers
+tokio = "1.54.1"
+bytes = "1.12.1"
+
+# Errors and observability
+thiserror = "2.0.21"
+tracing = "0.1.44"
+
+# Color management
+moxcms = "0.9.1"
+
+# GPU: Vulkan Compute through wgpu, WGSL shaders validated by naga
+wgpu = "30.0.1"
+naga = "30.0.1"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

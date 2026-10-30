@@ -1,0 +1,14 @@
+# LC3 test vectors
+#
+# Each .lc3 stream was produced by liblc3 `elc3` (Apache-2.0) from a
+# deterministic synthetic signal; the .s16le file is the matching `dlc3`
+# output (black-box oracle). See README.md for provenance.
+
+name sample_rate channels frame_ms bitrate
+lc3_48k_10ms_stereo_96k 48000 2 10.0 96000
+lc3_48k_10ms_stereo_256k 48000 2 10.0 256000
+lc3_32k_10ms_mono_24k 32000 1 10.0 24000
+lc3_16k_75ms_stereo_64k 16000 2 7.5 64000
+lc3_8k_10ms_mono_32k 8000 1 10.0 32000
+lc3_48k_75ms_stereo_48k 48000 2 7.5 48000
+lc3_24k_10ms_mono_48k 24000 1 10.0 48000

@@ -1,0 +1,23 @@
+[package]
+name = "rustmpeg-format"
+description = "ISOBMFF/CMAF and Matroska demuxers/muxers plus MoQ transport for rustmpeg-next"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["matroska", "isobmff", "cmaf", "demuxer", "muxer"]
+categories = ["multimedia", "encoding", "parser-implementations"]
+publish.workspace = true
+
+[dependencies]
+rustmpeg-core.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync"] }
+tracing.workspace = true
+
+[lints]
+workspace = true

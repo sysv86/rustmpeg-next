@@ -1,0 +1,130 @@
+name: Feature request
+description: Propose a capability that fits the rolling-window scope in docs/CONCEPT.md.
+title: "[feature] "
+labels: ["type/feature", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This project has a strict rolling-window scope and no legacy formats.
+        A proposal that adds a codec, container, or transport outside
+        `docs/CONCEPT.md` will be closed unless `docs/CONCEPT.md` is changed
+        first through a separate accepted proposal.
+
+        State the problem, not only the desired API. Requests that skip
+        licensing/provenance impact cannot be accepted.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: >-
+        What user-facing or engineering problem exists today? Include the
+        concrete workflow that is blocked or unnecessarily expensive.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope relative to docs/CONCEPT.md
+      description: Pick the statement that matches the current codec/container/transport matrix.
+      options:
+        - In scope - already listed as implemented
+        - In scope - listed as planned
+        - Out of scope - not in the matrix (requires a separate CONCEPT.md change)
+        - Needs a scope decision from maintainers
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope-evidence
+    attributes:
+      label: Scope evidence
+      description: Quote the relevant row or paragraph from `docs/CONCEPT.md`, or explain the proposed matrix change.
+    validations:
+      required: true
+
+  - type: input
+    id: spec-clause
+    attributes:
+      label: Normative specification clause
+      description: >-
+        Cite the exact document and section (for example ITU-T H.266 §8.3.2,
+        RFC 9639 §9.1, ISO/IEC 14496-12 §8.8.3). Write "no normative change"
+        for tooling-only work.
+      placeholder: "ITU-T H.266 §8.3.2 / RFC 9639 §9.1 / no normative change"
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior or API
+      description: Describe the smallest change that solves the problem. Include crate placement and layering (core -> format/audio/image/video -> vulkan).
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: >-
+        What existing APIs, external tools, or smaller changes did you evaluate
+        and why are they insufficient? "No alternative" is acceptable only with
+        a reason.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: licensing-impact
+    attributes:
+      label: Licensing and provenance impact
+      description: >-
+        New third-party code or test data must be compatible and recorded in
+        THIRD_PARTY.md. Copyleft, unknown licenses, and native build steps are
+        rejected.
+      options:
+        - No new third-party code or data
+        - Reuses an already recorded source (VTM/dav2d/rusty-opus constants)
+        - Adds a permissive dependency (must be justified in the PR)
+        - Adds new conformance data (source and license must be recorded)
+        - Unknown - needs a provenance review before implementation
+    validations:
+      required: true
+
+  - type: textarea
+    id: licensing-details
+    attributes:
+      label: Licensing details and patents
+      description: >-
+        Name every source, its license and version, and whether the codec is
+        royalty-free or patent-encumbered. Do not describe VVC as royalty-free.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: >-
+        List testable conditions: unit tests, bit-exactness against a named
+        oracle, benchmarks with measured numbers, and documentation updates.
+      placeholder: |
+        - [ ] Parser accepts ... and rejects ...
+        - [ ] Output is byte-identical to <oracle/version> on <vector>
+        - [ ] Benchmark at 1080p shows >= 10% ...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues and discussions for this proposal.
+          required: true
+        - label: I read `AGENTS.md`, `docs/CONCEPT.md`, and `LICENSING.md`.
+          required: true
+        - label: This request does not ask for a legacy codec, container, or transport.
+          required: true

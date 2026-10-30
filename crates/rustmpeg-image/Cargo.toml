@@ -1,0 +1,22 @@
+[package]
+name = "rustmpeg-image"
+description = "JPEG XL and OpenEXR pipeline with pure-Rust color management for rustmpeg-next"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0 AND BSD-3-Clause"
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["jpeg-xl", "openexr", "image", "codec", "color-management"]
+categories = ["multimedia::images", "encoding"]
+publish.workspace = true
+
+[dependencies]
+rustmpeg-core.workspace = true
+moxcms.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "rustmpeg-core"
+description = "Core traits, time and frame primitives, zero-copy buffers, and base errors for rustmpeg-next"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["multimedia", "codec", "no-std", "zero-copy", "framework"]
+categories = ["multimedia", "no-std", "encoding"]
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true, default-features = false }
+
+[lints]
+workspace = true

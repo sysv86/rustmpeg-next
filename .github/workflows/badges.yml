@@ -1,0 +1,58 @@
+name: Badges
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**/Cargo.toml
+      - docs/badges/render_badges.py
+      - docs/badges/templates/**
+      - .github/workflows/badges.yml
+  schedule:
+    # Counters refresh once a day; the generator also enforces a 24 h minimum.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: badges
+  cancel-in-progress: true
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render version badge
+        run: python3 docs/badges/render_badges.py version
+
+      - name: Refresh download counters
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          # GITHUB_TOKEN is provided by Actions and is enough to read releases.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: raise the crates.io rate limit. Add CRATES_IO_TOKEN as a
+          # repository secret when the anonymous API starts returning 429.
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: >-
+          python3 docs/badges/render_badges.py counts
+          --repo "${{ github.repository }}"
+          --crate rustmpeg
+          --max-age-hours 24
+
+      - name: Commit changed badges
+        run: |
+          if git diff --quiet -- docs/icons/version.svg docs/icons/crates.svg docs/icons/github.svg; then
+            echo "badges already current"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/icons/version.svg docs/icons/crates.svg docs/icons/github.svg
+          git commit -m "chore(badges): refresh generated SVGs [skip ci]"
+          git push

@@ -1,0 +1,188 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Benchmark profile
+        required: true
+        type: choice
+        default: full
+        options:
+          - full
+          - smoke
+      oracles:
+        description: >-
+          Reference builds to attempt (auto: SVT-AV1 and LC3 for smoke, every
+          oracle for full). Missing or failed builds are reported as skipped.
+        required: true
+        type: choice
+        default: auto
+        options:
+          - auto
+          - all
+          - none
+      update_results:
+        description: Commit docs/benchmarks/BENCHMARK.md back to the branch
+        required: true
+        type: boolean
+        default: true
+  schedule:
+    # Daily at 03:17 UTC. GitHub may delay scheduled jobs during peak load.
+    - cron: "17 3 * * *"
+  pull_request:
+    paths:
+      - ".github/workflows/benchmark.yml"
+      - "scripts/bench/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: Build oracles and run benchmarks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      CARGO_TERM_COLOR: always
+      PYTHONUNBUFFERED: "1"
+      BENCH_PROFILE: ${{ github.event_name == 'pull_request' && 'smoke' || inputs.profile || 'full' }}
+      ORACLE_MODE: ${{ github.event_name == 'pull_request' && 'auto' || inputs.oracles || 'auto' }}
+      UPDATE_RESULTS: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.update_results) }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Install the repository's pinned nightly
+        shell: bash
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "rust-toolchain.toml has no channel" >&2
+            exit 1
+          fi
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy \
+            --target wasm32-unknown-unknown
+          rustup override set "$channel"
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@8cbdedb5103daa674dcf46d3590fe06a76645684 # v2.8.0
+        with:
+          workspaces: ". -> target"
+          key: benchmark
+
+      - name: Install system benchmark tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git cmake ninja-build meson nasm yasm \
+            pkg-config libxxhash-dev python3 perl ffmpeg flac
+
+      - name: Cache pinned oracles
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: |
+            ${{ runner.temp }}/bench-oracles/bin
+            ${{ runner.temp }}/bench-oracles/oracles.json
+          key: oracles-bin-${{ runner.os }}-${{ env.BENCH_PROFILE }}-${{ hashFiles('scripts/bench/oracles.env', 'scripts/bench/fetch_oracles.sh') }}
+          restore-keys: |
+            oracles-bin-${{ runner.os }}-full-${{ hashFiles('scripts/bench/oracles.env', 'scripts/bench/fetch_oracles.sh') }}
+            oracles-bin-${{ runner.os }}-
+
+      - name: Build oracles
+        shell: bash
+        timeout-minutes: 60
+        run: |
+          case "${ORACLE_MODE}:${BENCH_PROFILE}" in
+            none:*) only="none" ;;
+            all:*) only="all" ;;
+            *:smoke) only="svt,lc3" ;;
+            *) only="all" ;;
+          esac
+          echo "oracle selection: ${only}"
+          scripts/bench/fetch_oracles.sh \
+            --dest "${{ runner.temp }}/bench-oracles" \
+            --jobs "$(getconf _NPROCESSORS_ONLN)" \
+            --only "${only}" \
+            --best-effort \
+            --build-timeout 1200
+
+      - name: Build examples in release mode
+        shell: bash
+        timeout-minutes: 20
+        run: cargo build --release --examples -p rustmpeg-video -p rustmpeg-audio
+
+      - name: Run benchmark
+        shell: bash
+        timeout-minutes: 150
+        run: |
+          mkdir -p docs/benchmarks
+          python3 -u scripts/bench/bench.py \
+            --profile "$BENCH_PROFILE" \
+            --oracle-dir "${{ runner.temp }}/bench-oracles" \
+            --allow-missing-oracles \
+            --command-timeout 2400 \
+            --time-budget 8100 \
+            --out docs/benchmarks/BENCHMARK.md \
+            --json "$RUNNER_TEMP/benchmark-results.json"
+
+      - name: Upload benchmark artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/benchmark-results.json
+            docs/benchmarks/BENCHMARK.md
+            ${{ runner.temp }}/bench-oracles/logs
+            ${{ runner.temp }}/bench-oracles/oracles.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Commit benchmark results
+        if: success() && env.UPDATE_RESULTS == 'true'
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/benchmarks/BENCHMARK.md; then
+            echo "benchmark document unchanged; nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/benchmarks/BENCHMARK.md
+          git commit -m "docs(benchmarks): ${BENCH_PROFILE} run $(date -u +%Y-%m-%d)"
+          # The repository receives frequent CI commits, so a single rebase is
+          # racy. Retry fetch/rebase/push a few times before giving up; the
+          # generated document stays in the artifact either way.
+          for attempt in 1 2 3 4 5; do
+            if ! git fetch origin "${GITHUB_REF_NAME}"; then
+              echo "::warning::fetch attempt ${attempt} failed"
+              sleep $((attempt * 5))
+              continue
+            fi
+            if ! git rebase "origin/${GITHUB_REF_NAME}"; then
+              git rebase --abort || true
+              echo "::warning::rebase attempt ${attempt} failed"
+              sleep $((attempt * 5))
+              continue
+            fi
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "pushed benchmark results on attempt ${attempt}"
+              exit 0
+            fi
+            echo "::warning::push attempt ${attempt} was rejected"
+            sleep $((attempt * 5))
+          done
+          echo "::warning::could not push benchmark results after 5 attempts; results stay in the run artifact"

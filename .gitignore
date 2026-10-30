@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.yuv
+.env
+.env.*
+# Private agent workspace: task briefs, wave reports, oracle transcripts.
+# Reader-facing documentation lives in docs/ and stays tracked.
+/docsagents/

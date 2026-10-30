@@ -1,0 +1,168 @@
+name: Bug report
+description: Report a reproducible defect in rustmpeg-next (not a codec conformance mismatch).
+title: "[bug] "
+labels: ["type/bug", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a defect. This project only accepts reports that can
+        be reproduced from a clean checkout of the pinned toolchain.
+
+        Before filing:
+        - Search existing issues and the documentation listed in
+          `docs/CONCEPT.md`.
+        - Reduce the problem to the smallest input you can share.
+        - Never paste secrets, tokens, private media, or proprietary streams.
+
+        A report without a reproduction command will be closed as
+        `status/needs-info`.
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction command
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction-notes
+    attributes:
+      label: Reproduction steps and environment setup
+      description: >-
+        List every step between a clean clone and the failure, including any
+        feature flags, fixture downloads, or generated files.
+      placeholder: |
+        1. git clone ...
+        2. cargo build --release -p rustmpeg-cli
+        3. ./target/release/rustmpeg ...
+    validations:
+      required: false
+
+  - type: dropdown
+    id: codec
+    attributes:
+      label: Codec or subsystem
+      description: Select the component where the defect occurs. Use "Other" only if it is genuinely outside this list.
+      options:
+        - AV2
+        - H.266/VVC
+        - APV
+        - Opus
+        - FLAC
+        - LPCM
+        - LC3
+        - IAMF
+        - JPEG XL
+        - OpenEXR
+        - ISOBMFF/CMAF
+        - Matroska/WebM
+        - MoQ transport
+        - rustmpeg-core
+        - rustmpeg-vulkan
+        - rustmpeg-cli
+        - Build/CI/tooling
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: container
+    attributes:
+      label: Container or transport
+      description: For example ISOBMFF (.mp4), fragmented CMAF, Matroska v4, WebM, raw Annex-B, or N/A.
+      placeholder: "ISOBMFF / fragmented CMAF"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Commit and crate version
+      description: Paste the output of `git rev-parse HEAD` and the affected crate version from `Cargo.toml`.
+      placeholder: "HEAD: <40-char sha>; rustmpeg-video 0.x.y"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and architecture
+      description: Include kernel or OS version and CPU architecture.
+      placeholder: "Linux 6.12 x86_64; Windows 11 aarch64; macOS 15 arm64"
+    validations:
+      required: true
+
+  - type: input
+    id: toolchain
+    attributes:
+      label: Rust toolchain
+      description: Paste the output of `rustc -Vv` and `cargo -V`. The repository pins nightly in `rust-toolchain.toml`.
+      placeholder: "rustc 1.XX.0-nightly (<date>) ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Describe the correct observable result and cite the specification or documented contract that defines it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Describe what happened instead. Include exit codes and whether the failure is deterministic.
+    validations:
+      required: true
+
+  - type: textarea
+    id: byte-exactness
+    attributes:
+      label: Byte-exactness evidence
+      description: >-
+        Paste `cmp -l`/`sha256sum` output, the oracle command, and the first
+        differing byte. If byte equality is not applicable, write
+        "not applicable" and explain why.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and backtrace
+      description: >-
+        Paste the full log with `RUST_BACKTRACE=1` and `RUST_LOG=debug`. Trim
+        unrelated noise, but keep the first error and the last 50 lines.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: sample
+    attributes:
+      label: Minimal sample description
+      description: >-
+        Describe how to generate the smallest input that reproduces the defect
+        (resolution, duration, frame count, bit depth, chroma, and generation
+        command). Do not attach private media; provide a generator script or a
+        link to a license-compatible sample.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Pre-flight checks
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I read `AGENTS.md`, `docs/CONCEPT.md`, and the relevant crate documentation.
+          required: true
+        - label: This report contains no secrets, access tokens, private media, or proprietary streams.
+          required: true
+        - label: I can reproduce this on the pinned toolchain from a clean checkout.
+          required: true
