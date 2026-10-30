@@ -29,8 +29,8 @@ with unchanged inputs leaves the file byte-identical.
 
 Usage:
     render_badges.py version [--out-dir DIR]
-    render_badges.py counts --repo OWNER/NAME --crate NAME [--max-age-hours 24]
-    render_badges.py all --repo OWNER/NAME --crate NAME [--max-age-hours 24]
+    render_badges.py counts --repo OWNER/NAME [--max-age-hours 24]
+    render_badges.py all --repo OWNER/NAME [--max-age-hours 24]
 """
 
 from __future__ import annotations
@@ -50,6 +50,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUT = ROOT / "docs" / "icons"
 TEMPLATES = ROOT / "docs" / "badges" / "templates"
+
+# Published crates whose download counters make up the crates.io badge.
+PUBLISHED_CRATES = (
+    "rustmpeg-core",
+    "rustmpeg-format",
+    "rustmpeg-audio",
+    "rustmpeg-image",
+    "rustmpeg-video",
+    "rustmpeg-vulkan",
+    "rustmpeg-cli",
+)
 
 # Source grid of the digits-pack glyphs: 7x9 cells of 3 px, 21x27 px per digit.
 PACK_CELL = 3
@@ -489,22 +500,28 @@ def github_downloads(repo: str, token: str | None) -> int | None:
     return total
 
 
-def crates_downloads(crate: str, token: str | None) -> int | None:
+def crates_downloads(crates: tuple[str, ...], token: str | None) -> int | None:
     headers = {
         "Accept": "application/json",
         "User-Agent": "rustmpeg-next-badges",
     }
     if token:
         headers["Authorization"] = token
-    try:
-        data = fetch_json(f"https://crates.io/api/v1/crates/{crate}", headers)
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return 0
-        raise
-    if not isinstance(data, dict):
-        return None
-    return int((data.get("crate") or {}).get("downloads") or 0)
+    total = 0
+    for crate in crates:
+        try:
+            data = fetch_json(f"https://crates.io/api/v1/crates/{crate}", headers)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                continue
+            raise
+        if not isinstance(data, dict):
+            return None
+        total += int((data.get("crate") or {}).get("downloads") or 0)
+        versions = data.get("versions")
+        if isinstance(versions, list) and versions:
+            total += int((versions[0] or {}).get("downloads") or 0)
+    return total
 
 
 def compact(value: int) -> str:
@@ -577,7 +594,6 @@ def main(argv: list[str]) -> int:
     parser.add_argument("mode", choices=("version", "counts", "all"))
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--repo", default="")
-    parser.add_argument("--crate", default="rustmpeg")
     parser.add_argument("--max-age-hours", type=float, default=24.0)
     args = parser.parse_args(argv)
 
@@ -597,7 +613,7 @@ def main(argv: list[str]) -> int:
             (
                 "crates",
                 "crates.io",
-                lambda: crates_downloads(args.crate, crates_token),
+                lambda: crates_downloads(PUBLISHED_CRATES, crates_token),
             ),
             (
                 "github",
