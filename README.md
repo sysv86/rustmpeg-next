@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/sysv86/rustmpeg-next/blob/main/Cargo.toml#L14"><img src="docs/icons/version.svg" alt="version" height="32"></a>
+  <a href="https://github.com/sysv86/rustmpeg-next/blob/main/Cargo.toml#L15"><img src="docs/icons/version.svg" alt="version" height="32"></a>
   <a href="https://crates.io/crates/rustmpeg"><img src="docs/icons/crates.svg" alt="crates.io downloads" height="32"></a>
   <a href="https://github.com/sysv86/rustmpeg-next/releases"><img src="docs/icons/github.svg" alt="GitHub release downloads" height="32"></a>
 </p>
