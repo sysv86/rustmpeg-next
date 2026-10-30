@@ -1,0 +1,24 @@
+[package]
+name = "rustmpeg"
+description = "Convenience facade for the rustmpeg-next multimedia framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["multimedia", "codec", "video", "audio", "framework"]
+categories = ["multimedia", "multimedia::video", "multimedia::audio"]
+publish.workspace = true
+
+[dependencies]
+rustmpeg-core.workspace = true
+rustmpeg-format.workspace = true
+rustmpeg-audio.workspace = true
+rustmpeg-image.workspace = true
+rustmpeg-video.workspace = true
+rustmpeg-vulkan.workspace = true
+
+[lints]
+workspace = true

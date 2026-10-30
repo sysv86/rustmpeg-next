@@ -60,6 +60,7 @@ PUBLISHED_CRATES = (
     "rustmpeg-video",
     "rustmpeg-vulkan",
     "rustmpeg-cli",
+    "rustmpeg",
 )
 
 # Source grid of the digits-pack glyphs: 7x9 cells of 3 px, 21x27 px per digit.

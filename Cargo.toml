@@ -8,6 +8,7 @@ members = [
     "crates/rustmpeg-video",
     "crates/rustmpeg-vulkan",
     "crates/rustmpeg-cli",
+    "crates/rustmpeg",
 ]
 
 [workspace.package]

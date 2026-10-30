@@ -139,12 +139,4 @@ jobs:
             echo "CARGO_REGISTRY_TOKEN is not configured; skipping crates.io publication." >>"${GITHUB_STEP_SUMMARY}"
             exit 0
           fi
-          for crate in rustmpeg-core rustmpeg-format rustmpeg-audio rustmpeg-image rustmpeg-video rustmpeg-vulkan rustmpeg-cli; do
-            echo "::group::cargo publish -p ${crate}"
-            cargo publish -p "${crate}"
-            echo "::endgroup::"
-            # Give the sparse index a moment before the next dependent crate resolves.
-            if [ "${crate}" != "rustmpeg-cli" ]; then
-              sleep 30
-            fi
-          done
+          bash scripts/publish_crates.sh
