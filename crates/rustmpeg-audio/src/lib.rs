@@ -14,6 +14,7 @@ mod frame;
 pub mod lc3;
 pub mod opus;
 pub mod pcm;
+pub mod synth;
 
 pub use flac::{
     FlacDecoder, FlacEncoder, FlacEncoderConfig, FlacError, OggFlacDecoder, StreamInfo,
@@ -23,3 +24,4 @@ pub use frame::PcmFrame;
 pub use lc3::{Lc3Config, Lc3Decoder, Lc3Encoder, Lc3Error, Lc3FrameDuration};
 pub use opus::{OpusBandwidth, OpusError, OpusMode, OpusPacket, OpusPacketInfo, RangeDecoder};
 pub use pcm::{FloatFrame, PcmData, PcmError, PcmFormat, PcmParams, decode_pcm, encode_pcm};
+pub use synth::{Family, SynthConfig, SynthError, SynthOutput, render as render_synth};

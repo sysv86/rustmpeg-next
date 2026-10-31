@@ -516,6 +516,12 @@ commits and are likewise only executed as external programs.
 See [`scripts/bench/README.md`](../../scripts/bench/README.md) for the online and
 offline commands, the oracle build steps, and the exact local dry-run.
 
+## Related local experiments
+
+- [`AUDIO_DIVERSITY.md`](AUDIO_DIVERSITY.md) compares seed-driven rustmpeg
+  synthesis with FFmpeg `sine`, `anoisesrc`, and `aevalsrc` corpora. It is a
+  local experiment with its own commands and is not part of the CI table above.
+
 ## Known limitations
 
 - The GitHub-hosted runner is shared and not CPU-pinned. Absolute MB/s varies

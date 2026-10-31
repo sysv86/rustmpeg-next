@@ -41,6 +41,7 @@ printed reason when neither resolves.
 | [`JXL.md`](JXL.md) | JPEG XL (ISO/IEC 18181-1 & 18181-2) decoder, clean-room encoder, and `moxcms` CMS |
 | [`OPENEXR.md`](OPENEXR.md) | OpenEXR v2 decoder and encoder (OpenEXRCore-derived, BSD-3-Clause; `None`, `Rle`, `Zips`, `Zip`, `Piz`, `Pxr24`, `B44`, `B44a`, `Dwaa`, `Dwab`, `Zstd`, tiled, deep, multipart) |
 | [`OPUS-DECODER-PLAN.md`](OPUS-DECODER-PLAN.md) | Opus packet/range layer and SILK decoder: implemented stages and remaining waves |
+| [`FLAC-ENCODER.md`](FLAC-ENCODER.md) | FLAC encoder scope, the LPC analysis fixes, measured sizes against `flac -8`, and what is still missing |
 
 Status at a glance:
 
@@ -68,6 +69,7 @@ Status at a glance:
 | [`ISOBMFF.md`](ISOBMFF.md) | ISOBMFF/CMAF reader and writers: supported boxes, limits, verification |
 | [`configs/CONFIG.md`](configs/CONFIG.md) | Every CLI command and example, environment variables, configuration structs, codec and format options, offline build |
 | [`benchmarks/BENCHMARK.md`](benchmarks/BENCHMARK.md) | Benchmark methodology, how to reproduce, and the results table format |
+| [`benchmarks/AUDIO_DIVERSITY.md`](benchmarks/AUDIO_DIVERSITY.md) | Local experiment: seed-driven synthesis vs fixed and varied FFmpeg generators |
 | [`faq/FAQ.md`](faq/FAQ.md) | Short answers: toolchain, no C dependencies, conformance, oracles, adding a codec, licensing, GPU policy |
 
 ## Licensing and provenance

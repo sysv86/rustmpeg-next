@@ -312,27 +312,63 @@ fn fixed_residual(samples: &[i64], order: usize) -> Vec<i64> {
     out
 }
 
-/// Computes autocorrelation values `r[0..=order]`.
-fn autocorrelation(samples: &[i64], order: usize) -> Vec<f64> {
+/// Applies a Tukey window with the given taper fraction to the block.
+///
+/// The reference encoder tapers the ends of each block before estimating the
+/// LPC coefficients. Without the taper the sample autocorrelation of a
+/// periodic signal is triangle-weighted, the normal equations become badly
+/// conditioned, and high-order predictors are far from the least-squares
+/// solution. Audio itself is unchanged; the window only feeds the analysis.
+fn apply_tukey_window(samples: &[i64], alpha: f64) -> Vec<f64> {
+    let len = samples.len();
+    let mut windowed = Vec::with_capacity(len);
+    if len <= 1 {
+        return samples.iter().map(|&sample| sample as f64).collect();
+    }
+    let half = alpha / 2.0;
+    let denominator = (len - 1) as f64;
+    for (index, &sample) in samples.iter().enumerate() {
+        let position = index as f64 / denominator;
+        let weight = if position < half {
+            0.5 * (1.0 + (std::f64::consts::PI * (2.0 * position / alpha - 1.0)).cos())
+        } else if position > 1.0 - half {
+            0.5 * (1.0
+                + (std::f64::consts::PI * (2.0 * position / alpha - 2.0 / alpha + 1.0)).cos())
+        } else {
+            1.0
+        };
+        windowed.push(sample as f64 * weight);
+    }
+    windowed
+}
+
+/// Computes windowed autocorrelation values `r[0..=order]`.
+fn autocorrelation(samples: &[i64], order: usize, alpha: f64) -> Vec<f64> {
+    let windowed = apply_tukey_window(samples, alpha);
     let mut r = vec![0.0f64; order + 1];
     for lag in 0..=order {
         let mut sum = 0.0f64;
-        for index in lag..samples.len() {
-            sum += samples[index] as f64 * samples[index - lag] as f64;
+        for index in lag..windowed.len() {
+            sum += windowed[index] * windowed[index - lag];
         }
         r[lag] = sum;
     }
     r
 }
 
-/// Solves the normal equations with Levinson-Durbin recursion.
-fn levinson_durbin(r: &[f64], order: usize) -> Option<Vec<f64>> {
+/// Solves the normal equations for every order with Levinson-Durbin recursion.
+///
+/// Returns one coefficient set per order (`result[0]` is order 1). Each set is
+/// the least-squares predictor of exactly that order; prefixes of the final
+/// set are not equivalent and compress worse.
+fn levinson_durbin(r: &[f64], order: usize) -> Option<Vec<Vec<f64>>> {
     if r[0] <= 0.0 || !r[0].is_finite() {
         return None;
     }
     let mut a = vec![0.0f64; order + 1];
     let mut previous = vec![0.0f64; order + 1];
     let mut error = r[0];
+    let mut result = Vec::with_capacity(order);
     for i in 1..=order {
         let mut acc = r[i];
         for j in 1..i {
@@ -351,13 +387,14 @@ fn levinson_durbin(r: &[f64], order: usize) -> Option<Vec<f64>> {
         if error <= 0.0 {
             return None;
         }
+        result.push(a[1..=i].to_vec());
     }
-    Some(a[1..=order].to_vec())
+    Some(result)
 }
 
 /// Quantizes LPC coefficients and returns `(coefficients, precision, shift)`.
-fn quantize_lpc(coefficients: &[f64], base_bits: u32) -> Option<(Vec<i32>, u32, u32)> {
-    let precision = if base_bits <= 16 { 12 } else { 15 };
+fn quantize_lpc(coefficients: &[f64], sample_bits: u32) -> Option<(Vec<i32>, u32, u32)> {
+    let precision = if sample_bits <= 16 { 12 } else { 15 };
     let limit = (1i64 << (precision - 1)) - 1;
     let max_abs = coefficients
         .iter()
@@ -600,11 +637,16 @@ fn plan_subframe(
 
     if max_lpc_order > 0 && block_size > 1 {
         let max_order = max_lpc_order.min(MAX_LPC_ORDER).min(block_size - 1);
-        let autocorrelation = autocorrelation(&shifted, max_order);
-        if let Some(coefficients) = levinson_durbin(&autocorrelation, max_order) {
+        // Two apodization windows: a half Tukey taper and a Hann taper. The
+        // actual encoded cost decides, so a block keeps the better estimate.
+        for alpha in [0.5f64, 1.0] {
+            let autocorrelation = autocorrelation(&shifted, max_order, alpha);
+            let Some(coefficient_sets) = levinson_durbin(&autocorrelation, max_order) else {
+                continue;
+            };
             for order in 1..=max_order {
-                let coefficients = &coefficients[..order];
-                let Some((quantized, precision, shift)) = quantize_lpc(coefficients, base_bits)
+                let coefficients = &coefficient_sets[order - 1];
+                let Some((quantized, precision, shift)) = quantize_lpc(coefficients, coded_bits)
                 else {
                     continue;
                 };
