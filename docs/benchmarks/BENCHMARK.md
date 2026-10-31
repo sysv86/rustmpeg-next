@@ -14,6 +14,248 @@ same oracle pins and the same clip hashes.
 ## Latest run
 
 <!-- BENCHMARK-TABLE -->
+### 2026-10-31 09:43 UTC - `full` profile
+
+- Commit: `f06b0ce4d99d351b7e224f428cbcde2ae779a9dc` (clean)
+- Content: 1920x1080, 10 frames, 30 fps, I420 8-bit; AV2 QP 60, 100, 140, 180, 220; AV1 CRF 22, 32, 42, 52, 63
+- Runner: runnervm48cm3 / Linux-7.0.0-1017-azure-x86_64-with-glibc2.39 / 4 logical CPUs / 15.6 GiB RAM
+- CPU: AMD EPYC 9V45 96-Core Processor
+- Rust: `rustc 1.101.0-nightly (12433c307 2026-10-24)`
+- FFmpeg: `ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023 the FFmpeg developers`
+- Oracles: SVT-AV1 `v4.2.0`, AVM `v1.0.0`, dav2d `d7df5418`, liblc3 `v1.1.3`, flac `flac 1.4.3`
+- Sources: `graphics` sha256 `fc3488c22426424e...`, `noise` sha256 `8d279d4a27fde1dc...`
+
+PSNR and SSIM are measured by FFmpeg against the exact source Y4M. Bitrate is `(container bytes * 8 * fps) / frame_count`; it includes the IVF/OBU container header. MB/s uses raw I420 bytes and wall-clock time for the encode or decode process only.
+
+#### Clip `graphics`
+
+| Codec | Implementation | Decoder | Point | Bitrate (kbps) | PSNR-Y (dB) | SSIM | Encode MB/s | Decode MB/s | Bytes |
+| :-- | :-- | :-- | :-- | --: | --: | --: | --: | --: | --: |
+| AV2 | rustmpeg-video | encoder reconstruction (native decode failed: Error: Unsupported("sub-block transform partitioning"); dav2d reconstruction mismatch) | `qp=220` | 213.1 | 31.53 | 0.9168 | 1.4 | n/a | 8878 |
+| AV2 | rustmpeg-video | encoder reconstruction (native decode failed: Error: BitstreamError("invalid warped-motion model"); dav2d reconstruction mismatch) | `qp=180` | 561.8 | 34.40 | 0.9446 | 1.4 | n/a | 23409 |
+| AV2 | rustmpeg-video | encoder reconstruction (native decode failed: Error: Unsupported("sub-block transform partitioning"); dav2d reconstruction mismatch) | `qp=140` | 2842.0 | 36.63 | 0.9677 | 1.4 | n/a | 118417 |
+| AV2 | rustmpeg-video | encoder reconstruction (native decode failed: Error: Unsupported("sub-block transform partitioning"); dav2d reconstruction mismatch) | `qp=100` | 11472.7 | 38.08 | 0.9823 | 1.4 | n/a | 478030 |
+| AV2 | rustmpeg-video | encoder reconstruction (native decode failed: Error: Unsupported("sub-block transform partitioning"); dav2d reconstruction mismatch) | `qp=60` | 25890.0 | 38.45 | 0.9889 | 1.4 | n/a | 1078749 |
+| AV2 | AVM avmenc | dav2d | `qp=100` | 6804.7 | 28.38 | 0.9633 | 0.1 | 444.2 | 283529 |
+| AV2 | AVM avmenc | dav2d | `qp=60` | 12180.6 | 28.39 | 0.9633 | 0.1 | 408.6 | 507527 |
+| AV2 | AVM avmenc | dav2d | `qp=220` | 47.5 | 28.44 | 0.9507 | 0.3 | 450.6 | 1978 |
+| AV2 | AVM avmenc | dav2d | `qp=140` | 2837.0 | 28.47 | 0.9639 | 0.0 | 454.7 | 118209 |
+| AV2 | AVM avmenc | dav2d | `qp=180` | 666.4 | 28.62 | 0.9640 | 0.1 | 514.7 | 27766 |
+| AV1 (cross-codec) | SVT-AV1 | ffmpeg | `crf=63` | 225.2 | 35.55 | 0.9696 | 145.2 | 490.0 | 9385 |
+| AV1 (cross-codec) | SVT-AV1 | ffmpeg | `crf=52` | 1023.9 | 38.40 | 0.9837 | 111.5 | 466.3 | 42662 |
+| AV1 (cross-codec) | SVT-AV1 | ffmpeg | `crf=42` | 2868.8 | 40.92 | 0.9887 | 91.8 | 443.8 | 119532 |
+| AV1 (cross-codec) | SVT-AV1 | ffmpeg | `crf=32` | 7023.2 | 45.62 | 0.9951 | 84.5 | 393.0 | 292634 |
+| AV1 (cross-codec) | SVT-AV1 | ffmpeg | `crf=22` | 12514.1 | 49.69 | 0.9971 | 82.5 | 358.9 | 521422 |
+
+#### Clip `noise`
+
+| Codec | Implementation | Decoder | Point | Bitrate (kbps) | PSNR-Y (dB) | SSIM | Encode MB/s | Decode MB/s | Bytes |
+| :-- | :-- | :-- | :-- | --: | --: | --: | --: | --: | --: |
+| AV2 | rustmpeg-video | encoder reconstruction (native decode failed: Error: Unsupported("sub-block transform partitioning"); dav2d reconstruction mismatch) | `qp=220` | 200.5 | 30.46 | 0.7663 | 1.1 | n/a | 8353 |
+| AV2 | rustmpeg-video | encoder reconstruction (native decode failed: Error: Unsupported("sub-block transform partitioning"); dav2d reconstruction mismatch) | `qp=180` | 558.0 | 32.55 | 0.7935 | 1.1 | n/a | 23250 |
+| AV2 | rustmpeg-video | encoder reconstruction (native decode failed: Error: Unsupported("sub-block transform partitioning"); dav2d reconstruction mismatch) | `qp=140` | 2992.2 | 33.88 | 0.8127 | 1.1 | n/a | 124675 |
+| AV2 | rustmpeg-video | encoder reconstruction (native decode failed: Error: Unsupported("sub-block transform partitioning"); dav2d reconstruction mismatch) | `qp=100` | 24852.8 | 34.65 | 0.8310 | 1.0 | n/a | 1035534 |
+| AV2 | rustmpeg-video | encoder reconstruction (native decode failed: Error: Unsupported("sub-block transform partitioning"); dav2d reconstruction mismatch) | `qp=60` | 110921.1 | 35.20 | 0.8940 | 1.0 | n/a | 4621711 |
+| AV1 (cross-codec) | SVT-AV1 | ffmpeg | `crf=63` | 217.2 | 33.00 | 0.8110 | 132.2 | 510.6 | 9048 |
+| AV1 (cross-codec) | SVT-AV1 | ffmpeg | `crf=52` | 957.6 | 34.61 | 0.8256 | 98.8 | 467.1 | 39898 |
+| AV1 (cross-codec) | SVT-AV1 | ffmpeg | `crf=42` | 2653.0 | 35.51 | 0.8300 | 79.9 | 450.5 | 110540 |
+| AV1 (cross-codec) | SVT-AV1 | ffmpeg | `crf=32` | 8281.9 | 36.60 | 0.8376 | 64.1 | 365.3 | 345079 |
+| AV1 (cross-codec) | SVT-AV1 | ffmpeg | `crf=22` | 20054.8 | 37.28 | 0.8469 | 35.5 | 213.5 | 835617 |
+
+#### BD-rate
+
+| Anchor | Test | Clip | BD-rate | Note |
+| :-- | :-- | :-- | --: | :-- |
+| AVM avmenc | rustmpeg-video | graphics | n/a | same codec (AV2) |
+| SVT-AV1 | rustmpeg-video | graphics | +699.57% | cross-codec: AV1 anchor vs AV2 test, indicative only |
+| SVT-AV1 | rustmpeg-video | noise | +1003.28% | cross-codec: AV1 anchor vs AV2 test, indicative only |
+| SVT-AV1 | rustmpeg-video | mean over clips | +851.42% | arithmetic mean of per-clip BD-rate |
+
+#### Audio
+
+| Codec | Implementation | Reference | Point | Bytes | Ratio | SNR (dB) | Encode MB/s | Decode MB/s | Quality |
+| :-- | :-- | :-- | :-- | --: | --: | --: | --: | --: | :-- |
+| FLAC | rustmpeg-audio | libFLAC | `16-bit stereo 48 kHz block 4096 level 5` | 315162 | 0.8207 | lossless | 0.2 | 57.9 | lossless, bit-exact |
+| FLAC | libFLAC | libFLAC | `16-bit stereo 48 kHz default level 5` | 322838 | 0.8407 | lossless | 91.6 | 121.5 | lossless, bit-exact |
+| LC3 | rustmpeg-audio | liblc3 | `32 kbps, 10 ms, mono` | 8418 | 0.0438 | 17.06 | 7.0 | 7.5 | SNR 17.06 dB (lag -264) |
+| LC3 | liblc3 | liblc3 | `32 kbps, 10 ms, mono` | 8460 | 0.0441 | 17.05 | 53.2 | 62.3 | SNR 17.05 dB (lag -144) |
+| LC3 | rustmpeg-audio | liblc3 | `64 kbps, 10 ms, mono` | 16418 | 0.0855 | 18.98 | 7.2 | 8.0 | SNR 18.98 dB (lag -119) |
+| LC3 | liblc3 | liblc3 | `64 kbps, 10 ms, mono` | 16500 | 0.0859 | 18.98 | 50.6 | 59.0 | SNR 18.98 dB (lag +1) |
+| LC3 | rustmpeg-audio | liblc3 | `96 kbps, 10 ms, mono` | 24418 | 0.1272 | 30.78 | 7.0 | 8.1 | SNR 30.78 dB (lag -120) |
+| LC3 | liblc3 | liblc3 | `96 kbps, 10 ms, mono` | 24540 | 0.1278 | 30.78 | 44.5 | 67.4 | SNR 30.78 dB (lag +0) |
+
+The rustmpeg FLAC encode time includes the example's deterministic in-process PCM synthesis, so compare decode throughput, sizes, and bit-exactness rather than its encode MB/s.
+
+#### Not benchmarked in this run
+
+| Item | Reason |
+| :-- | :-- |
+| AV2 vs AVM (noise) | AVM avmenc qp=60 exceeded the 2400s command limit |
+| Matroska / ISOBMFF (format) | No runnable format benchmark binary exists and this pipeline does not modify crates; compare via the format tests instead. |
+| Image codecs (JPEG XL, OpenEXR) | JPEG XL benchmark row is not wired into this workflow yet. |
+| Opus | Only packet parsing and the range decoder are implemented; no encoder/decoder is available to compare. |
+
+<details>
+<summary>Exact commands (144)</summary>
+
+```sh
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=1920x1080:rate=30 -vf format=yuv420p -frames:v 10 -f yuv4mpegpipe /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=1920x1080:rate=30 -vf noise=alls=12:allf=t+u:all_seed=1234,format=yuv420p -frames:v 10 -f yuv4mpegpipe /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_encode /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp60.ivf 10 1920 1080 60 0 0 1 420 1 1 1 1 1 1 1 8 1 0 /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp60-rec.y4m 0 1 0 /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m 0 0
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_decode /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp60.ivf /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp60.y4m 8
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp60.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp60-dav2d.y4m --muxer yuv4mpeg2 --limit 10 -q
+/home/runner/work/_temp/bench-oracles/bin/avmdec --limit=10 -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp60-avmdec.y4m /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp60.ivf
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp60-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp60-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_encode /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp100.ivf 10 1920 1080 100 0 0 1 420 1 1 1 1 1 1 1 8 1 0 /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp100-rec.y4m 0 1 0 /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m 0 0
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_decode /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp100.ivf /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp100.y4m 8
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp100.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp100-dav2d.y4m --muxer yuv4mpeg2 --limit 10 -q
+/home/runner/work/_temp/bench-oracles/bin/avmdec --limit=10 -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp100-avmdec.y4m /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp100.ivf
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp100-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp100-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_encode /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp140.ivf 10 1920 1080 140 0 0 1 420 1 1 1 1 1 1 1 8 1 0 /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp140-rec.y4m 0 1 0 /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m 0 0
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_decode /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp140.ivf /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp140.y4m 8
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp140.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp140-dav2d.y4m --muxer yuv4mpeg2 --limit 10 -q
+/home/runner/work/_temp/bench-oracles/bin/avmdec --limit=10 -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp140-avmdec.y4m /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp140.ivf
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp140-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp140-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_encode /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp180.ivf 10 1920 1080 180 0 0 1 420 1 1 1 1 1 1 1 8 1 0 /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp180-rec.y4m 0 1 0 /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m 0 0
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_decode /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp180.ivf /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp180.y4m 8
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp180.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp180-dav2d.y4m --muxer yuv4mpeg2 --limit 10 -q
+/home/runner/work/_temp/bench-oracles/bin/avmdec --limit=10 -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp180-avmdec.y4m /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp180.ivf
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp180-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp180-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_encode /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp220.ivf 10 1920 1080 220 0 0 1 420 1 1 1 1 1 1 1 8 1 0 /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp220-rec.y4m 0 1 0 /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m 0 0
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_decode /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp220.ivf /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp220.y4m 8
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp220.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp220-dav2d.y4m --muxer yuv4mpeg2 --limit 10 -q
+/home/runner/work/_temp/bench-oracles/bin/avmdec --limit=10 -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp220-avmdec.y4m /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp220.ivf
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp220-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/rustmpeg-qp220-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/SvtAv1EncApp -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -b /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf22.ivf --preset 8 --crf 22 --keyint 10 --frames 10 --lp 1 --progress 0
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf22.ivf -pix_fmt yuv420p -f yuv4mpegpipe /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf22.y4m
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf22.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf22.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/SvtAv1EncApp -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -b /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf32.ivf --preset 8 --crf 32 --keyint 10 --frames 10 --lp 1 --progress 0
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf32.ivf -pix_fmt yuv420p -f yuv4mpegpipe /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf32.y4m
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf32.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf32.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/SvtAv1EncApp -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -b /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf42.ivf --preset 8 --crf 42 --keyint 10 --frames 10 --lp 1 --progress 0
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf42.ivf -pix_fmt yuv420p -f yuv4mpegpipe /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf42.y4m
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf42.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf42.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/SvtAv1EncApp -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -b /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf52.ivf --preset 8 --crf 52 --keyint 10 --frames 10 --lp 1 --progress 0
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf52.ivf -pix_fmt yuv420p -f yuv4mpegpipe /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf52.y4m
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf52.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf52.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/SvtAv1EncApp -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -b /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf63.ivf --preset 8 --crf 63 --keyint 10 --frames 10 --lp 1 --progress 0
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf63.ivf -pix_fmt yuv420p -f yuv4mpegpipe /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf63.y4m
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf63.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/svt-crf63.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/avmenc --codec=av2 --passes=1 --end-usage=q --qp=60 --cpu-used=8 --threads=1 --limit=10 --width=1920 --height=1080 --ivf --quiet -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp60.ivf /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp60.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp60.y4m --muxer yuv4mpeg2 --limit 10 -q
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp60.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp60.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/avmenc --codec=av2 --passes=1 --end-usage=q --qp=100 --cpu-used=8 --threads=1 --limit=10 --width=1920 --height=1080 --ivf --quiet -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp100.ivf /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp100.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp100.y4m --muxer yuv4mpeg2 --limit 10 -q
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp100.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp100.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/avmenc --codec=av2 --passes=1 --end-usage=q --qp=140 --cpu-used=8 --threads=1 --limit=10 --width=1920 --height=1080 --ivf --quiet -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp140.ivf /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp140.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp140.y4m --muxer yuv4mpeg2 --limit 10 -q
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp140.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp140.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/avmenc --codec=av2 --passes=1 --end-usage=q --qp=180 --cpu-used=8 --threads=1 --limit=10 --width=1920 --height=1080 --ivf --quiet -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp180.ivf /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp180.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp180.y4m --muxer yuv4mpeg2 --limit 10 -q
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp180.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp180.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/avmenc --codec=av2 --passes=1 --end-usage=q --qp=220 --cpu-used=8 --threads=1 --limit=10 --width=1920 --height=1080 --ivf --quiet -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp220.ivf /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp220.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp220.y4m --muxer yuv4mpeg2 --limit 10 -q
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp220.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-graphics/avm-qp220.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-graphics-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_encode /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp60.ivf 10 1920 1080 60 0 0 1 420 1 1 1 1 1 1 1 8 1 0 /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp60-rec.y4m 0 1 0 /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m 0 0
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_decode /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp60.ivf /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp60.y4m 8
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp60.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp60-dav2d.y4m --muxer yuv4mpeg2 --limit 10 -q
+/home/runner/work/_temp/bench-oracles/bin/avmdec --limit=10 -o /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp60-avmdec.y4m /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp60.ivf
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp60-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp60-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_encode /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp100.ivf 10 1920 1080 100 0 0 1 420 1 1 1 1 1 1 1 8 1 0 /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp100-rec.y4m 0 1 0 /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m 0 0
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_decode /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp100.ivf /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp100.y4m 8
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp100.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp100-dav2d.y4m --muxer yuv4mpeg2 --limit 10 -q
+/home/runner/work/_temp/bench-oracles/bin/avmdec --limit=10 -o /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp100-avmdec.y4m /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp100.ivf
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp100-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp100-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_encode /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp140.ivf 10 1920 1080 140 0 0 1 420 1 1 1 1 1 1 1 8 1 0 /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp140-rec.y4m 0 1 0 /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m 0 0
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_decode /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp140.ivf /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp140.y4m 8
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp140.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp140-dav2d.y4m --muxer yuv4mpeg2 --limit 10 -q
+/home/runner/work/_temp/bench-oracles/bin/avmdec --limit=10 -o /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp140-avmdec.y4m /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp140.ivf
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp140-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp140-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_encode /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp180.ivf 10 1920 1080 180 0 0 1 420 1 1 1 1 1 1 1 8 1 0 /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp180-rec.y4m 0 1 0 /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m 0 0
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_decode /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp180.ivf /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp180.y4m 8
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp180.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp180-dav2d.y4m --muxer yuv4mpeg2 --limit 10 -q
+/home/runner/work/_temp/bench-oracles/bin/avmdec --limit=10 -o /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp180-avmdec.y4m /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp180.ivf
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp180-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp180-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_encode /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp220.ivf 10 1920 1080 220 0 0 1 420 1 1 1 1 1 1 1 8 1 0 /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp220-rec.y4m 0 1 0 /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m 0 0
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/av2_decode /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp220.ivf /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp220.y4m 8
+/home/runner/work/_temp/bench-oracles/bin/dav2d -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp220.ivf -o /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp220-dav2d.y4m --muxer yuv4mpeg2 --limit 10 -q
+/home/runner/work/_temp/bench-oracles/bin/avmdec --limit=10 -o /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp220-avmdec.y4m /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp220.ivf
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp220-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/rustmpeg-qp220-rec.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/SvtAv1EncApp -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -b /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf22.ivf --preset 8 --crf 22 --keyint 10 --frames 10 --lp 1 --progress 0
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf22.ivf -pix_fmt yuv420p -f yuv4mpegpipe /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf22.y4m
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf22.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf22.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/SvtAv1EncApp -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -b /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf32.ivf --preset 8 --crf 32 --keyint 10 --frames 10 --lp 1 --progress 0
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf32.ivf -pix_fmt yuv420p -f yuv4mpegpipe /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf32.y4m
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf32.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf32.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/SvtAv1EncApp -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -b /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf42.ivf --preset 8 --crf 42 --keyint 10 --frames 10 --lp 1 --progress 0
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf42.ivf -pix_fmt yuv420p -f yuv4mpegpipe /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf42.y4m
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf42.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf42.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/SvtAv1EncApp -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -b /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf52.ivf --preset 8 --crf 52 --keyint 10 --frames 10 --lp 1 --progress 0
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf52.ivf -pix_fmt yuv420p -f yuv4mpegpipe /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf52.y4m
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf52.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf52.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/SvtAv1EncApp -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -b /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf63.ivf --preset 8 --crf 63 --keyint 10 --frames 10 --lp 1 --progress 0
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf63.ivf -pix_fmt yuv420p -f yuv4mpegpipe /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf63.y4m
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf63.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]psnr' -f null -
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel info -i /tmp/rustmpeg-bench-atpj1j8q/video-noise/svt-crf63.y4m -i /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m -lavfi '[0:v][1:v]ssim' -f null -
+/home/runner/work/_temp/bench-oracles/bin/avmenc --codec=av2 --passes=1 --end-usage=q --qp=60 --cpu-used=8 --threads=1 --limit=10 --width=1920 --height=1080 --ivf --quiet -o /tmp/rustmpeg-bench-atpj1j8q/video-noise/avm-qp60.ivf /tmp/rustmpeg-bench-atpj1j8q/source-noise-1920x1080-10.y4m
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/flac_encode /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg.flac 16 2 96000 4096 5
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/flac_decode /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg.flac /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg-decoded.s32le
+/usr/bin/flac -f --silent --force-raw-format --endian=little --sign=signed --channels=2 --bps=16 --sample-rate=48000 -o /tmp/rustmpeg-bench-atpj1j8q/audio/libflac.flac /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg.flac.raw
+/usr/bin/flac -d -f --silent --force-raw-format --endian=little --sign=signed -o /tmp/rustmpeg-bench-atpj1j8q/audio/libflac-decoded.s16le /tmp/rustmpeg-bench-atpj1j8q/audio/libflac.flac
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -f lavfi -i sine=frequency=997:sample_rate=48000:duration=2.0 -f lavfi -i anoisesrc=color=pink:sample_rate=48000:duration=2.0:seed=1234:amplitude=0.05 -filter_complex '[0:a][1:a]amix=inputs=2:duration=shortest:normalize=0,volume=0.8' -ac 1 -ar 48000 -c:a pcm_s16le /tmp/rustmpeg-bench-atpj1j8q/audio/source.wav
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/audio/source.wav -f s16le -acodec pcm_s16le /tmp/rustmpeg-bench-atpj1j8q/audio/source.s16le
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/lc3_encode /tmp/rustmpeg-bench-atpj1j8q/audio/source.s16le /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg-32k.lc3 48000 10000 1 40
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/lc3_decode /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg-32k.lc3 /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg-32k.s16le
+/home/runner/work/_temp/bench-oracles/bin/elc3 -b 32000 -m 10 /tmp/rustmpeg-bench-atpj1j8q/audio/source.wav /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-32k.lc3
+/home/runner/work/_temp/bench-oracles/bin/dlc3 /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-32k.lc3 /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-32k.wav
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-32k.wav -f s16le -acodec pcm_s16le /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-32k.s16le
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/lc3_encode /tmp/rustmpeg-bench-atpj1j8q/audio/source.s16le /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg-64k.lc3 48000 10000 1 80
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/lc3_decode /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg-64k.lc3 /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg-64k.s16le
+/home/runner/work/_temp/bench-oracles/bin/elc3 -b 64000 -m 10 /tmp/rustmpeg-bench-atpj1j8q/audio/source.wav /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-64k.lc3
+/home/runner/work/_temp/bench-oracles/bin/dlc3 /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-64k.lc3 /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-64k.wav
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-64k.wav -f s16le -acodec pcm_s16le /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-64k.s16le
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/lc3_encode /tmp/rustmpeg-bench-atpj1j8q/audio/source.s16le /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg-96k.lc3 48000 10000 1 120
+/home/runner/work/rustmpeg-next/rustmpeg-next/target/release/examples/lc3_decode /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg-96k.lc3 /tmp/rustmpeg-bench-atpj1j8q/audio/rustmpeg-96k.s16le
+/home/runner/work/_temp/bench-oracles/bin/elc3 -b 96000 -m 10 /tmp/rustmpeg-bench-atpj1j8q/audio/source.wav /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-96k.lc3
+/home/runner/work/_temp/bench-oracles/bin/dlc3 /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-96k.lc3 /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-96k.wav
+/usr/bin/ffmpeg -nostdin -hide_banner -loglevel error -y -i /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-96k.wav -f s16le -acodec pcm_s16le /tmp/rustmpeg-bench-atpj1j8q/audio/liblc3-96k.s16le
+```
+
+</details>
+
+<!-- /BENCHMARK-TABLE -->
+
+## History
+
+<!-- BENCHMARK-HISTORY -->
+<!-- BENCH-ENTRY -->
+<details>
+<summary>2026-10-30 10:12 UTC - `full` profile</summary>
+
 ### 2026-10-30 10:12 UTC - `full` profile
 
 - Commit: `aa9a65066f09b8af4f924c9280bd7c2b79d9b93e` (clean)
@@ -247,11 +489,8 @@ $ORACLE/bin/dlc3 /tmp/rustmpeg-bench-1fmjxrtb/audio/liblc3-96k.lc3 /tmp/rustmpeg
 
 </details>
 
-<!-- /BENCHMARK-TABLE -->
+</details>
 
-## History
-
-<!-- BENCHMARK-HISTORY -->
 <!-- BENCH-ENTRY -->
 <details>
 <summary>2026-10-29 10:35 UTC - `smoke` profile</summary>
