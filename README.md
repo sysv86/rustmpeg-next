@@ -65,5 +65,5 @@ conformance data from dav2d (BSD-2-Clause), and the OpenEXR module from OpenEXR
 3.5.2 `OpenEXRCore` (BSD-3-Clause); see [`THIRD_PARTY.md`](THIRD_PARTY.md) and
 [`NOTICE`](NOTICE).
 
-<p align="center"><sub><!-- STATS:START -->Rust lines: 166,403 · workspace completion: 63% · unsafe: 0 · source tokens: ~1,582,400 (chars/4)<!-- STATS:END --></sub></p>
+<p align="center"><sub><!-- STATS:START -->Rust lines: 167,617 · workspace completion: 63% · unsafe: 0 · source tokens: ~1,593,652 (chars/4)<!-- STATS:END --></sub></p>
 
