@@ -36,9 +36,17 @@ the CLI flag say that AV2 v1.0.0 has no OBMC.
 
 - Removed the `Unsupported("warped motion")` gate.
 - Parses `is_warp`, `warp_mv`, the `warp_idx` loop, `warpmv_with_mvd`, and
-  `warp_inter_intra` in §5.20.7.6 order. `WARPMV` yields `DELTAWARP`; the
-  `WARP_NEWMV` path reads `use_extend_warp` / `use_local_warp` when the sequence
-  enables them and rejects those modes explicitly.
+  `warp_inter_intra` in §5.20.7.6 order. `WARPMV` yields `DELTAWARP`. The
+  `WARP_NEWMV` path reads `use_extend_warp` then, when it stays in
+  `DELTAWARP`, `use_local_warp`, using dav2d's `has_cs_ext` guard and
+  `warp_extend`/`warp_causal` contexts. `LOCALWARP` runs the normative
+  `find_warp_samples`/`warp_estimation` least-squares fit; `EXTENDWARP` runs
+  `extend_warp_estimation` from the matching neighbour matrix and the block MV.
+- Implements `INTERINTRA` (§5.20.7.15): `inter_intra`, `interintra_mode`
+  (`II_DC/V/H/SMOOTH_PRED`), `wedge_interintra` (rejected only when wedge
+  blending is selected), intra prediction saved before the inter prediction,
+  the §7.13.3.29 `Ii_Weights_1d` mask, and the §7.13.3.30 blend. Chroma uses
+  the per-plane mask dimensions.
 - Implements `read_warp_delta()` (§5.20.7.7): `warp_delta_precision`,
   `warp_delta_param_low`/`high`/`sign`, the 4-parameter
   `params[4] = -params[3], params[5] = params[2]` form, and the six-parameter
@@ -80,10 +88,14 @@ The baseline encoder chose `NEARMV`/`GLOBALMV` with a hard-coded
   counter. `tests/av2_warp.rs` asserts `warped_blocks > 0` on zooming content
   and then asserts decoder reconstruction equality.
 
-`WARPMV` decoding is implemented, but the encoder does not emit it: the
-in-tree reduced DRL/corner stack cannot yet reproduce the full normative
-`find_mv_stack` once bank and scan warp candidates are present. `WARP_NEWMV`
-carries the explicit model and is not affected by that stack.
+`WARPMV` is decoded and emitted; on the recorded matrix the encoder's
+`WarpParamStack` candidate is byte-exact against dav2d. The in-tree reduced
+DRL/corner stack still cannot reproduce the full normative
+`find_mv_stack`/`WarpParamStack` once strongly affine bank/scan candidates are
+present, so encoder `LOCALWARP`/`EXTENDWARP` (whose MVD predictor depends on
+that stack) remain unemitted and `WARPMV` on such content is a residual
+conformance risk. `WARP_NEWMV` carries the explicit model and is not affected
+by that stack.
 
 ## Verification
 
@@ -119,7 +131,14 @@ and **our decoder == encoder recon == dav2d**:
 `cargo test -p rustmpeg-video --test av2_warp` passes and asserts
 `warped_blocks > 0` plus decoder/encoder reconstruction equality.
 
-`python3 $ORACLE/check_av2.py quick` (warp off): 9/9 `OK`.
+Inter-intra and the three explicit motion-mode syntaxes were additionally
+verified with all `motion_modes` bits enabled on 64x64 and 256x192 I420 at
+QP 20/100/140 (3 frames) and on 10-bit/12-bit 256x192 at QP100:
+`encoder recon == our decoder == dav2d` on every frame, with
+`interintra_blocks` 5-22 per 256x192 run (0 on the 64x64 clip). Our streams
+code `use_extend_warp = 0`/`use_local_warp = 0`, so the AVM end-to-end check
+still stops on the unrelated chroma intra mode (`uv_idx=14`); exact AVM means
+were not obtained. `python3 $ORACLE/check_av2.py quick` (warp off): 9/9 `OK`.
 
 ### AVM attempt
 
@@ -179,15 +198,19 @@ $ORACLE/vvc-conf/run_conformance.sh                -> 25/25 cases green
   in-tree reduced `find_mv_stack` cannot yet reproduce normative bank/scan
   candidate ordering once warp sub-block MVs exist. `WARP_NEWMV` is emitted
   and byte-exact against dav2d.
-- `LOCALWARP` (local warp estimation) and `EXTENDWARP` are parsed and rejected
-  with `Unsupported`, not implemented. `warp_inter_intra` and six-parameter
-  warp deltas are parsed; the six-parameter encoder is not implemented.
+- `WARPMV`, `LOCALWARP`, `EXTENDWARP` and `INTERINTRA` are decoded and
+  predicted; the encoder emits `WARPMV` and `INTERINTRA` but not
+  `LOCALWARP`/`EXTENDWARP` (the reduced `find_mv_stack`/`WarpParamStack`
+  diverges from dav2d once strongly affine neighbours exist). `warp_inter_intra`
+  is decoded (non-wedge); six-parameter warp deltas are parsed but not
+  emitted.
 - The decoder's DRL is the pre-existing reduced spatial approximation. Warp
   streams avoid it by using `GLOBALMV` for non-warp blocks and explicit
-  `WARP_NEWMV` models.
-- AVM end-to-end comparison is blocked by the unrelated screen-content gate
-  (and by AVM's local/extended warp modes); exact flags and both reasons are
-  recorded above.
+  `WARP_NEWMV` models. This is the binding blocker for encoder `WARPMV`,
+  `LOCALWARP` and `EXTENDWARP`; it is a separate unit-sized change.
+- AVM end-to-end comparison is blocked by unrelated tool paths: the
+  screen-content gate and the chroma intra mode index (`uv_idx=14`); the
+  exact `avmenc` flags are recorded above.
 - The `av2_decode` example now takes an optional third argument for bit depth
   (for example `10`), because the decoder is generic over `u8`/`u16`.
 

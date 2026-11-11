@@ -48,7 +48,8 @@ use crate::av2::inter::{
 };
 use crate::av2::intops::iclip;
 use crate::av2::ipred::{
-    predict_filter_intra_block, predict_intra_block, prepare_intra_edges, prepare_intra_edges_mrl,
+    blend_interintra, interintra_intra_mode, interintra_mask, predict_filter_intra_block,
+    predict_intra_block, prepare_intra_edges, prepare_intra_edges_mrl,
 };
 use crate::av2::levels::{
     BlockPartition, BlockSize, CompInterType, FilterIntraMode, InterPredMode, MvXY, txtp,
@@ -74,9 +75,10 @@ use crate::av2::tables::{
 use crate::av2::transform::inv_txfm_add;
 use crate::av2::warp::{
     DEFAULT_WARP_PARAMS, MAX_WARP_REF_CANDIDATES, MV_BORDER, MV_LOW, MV_UPP, WARPEDMODEL_PREC_BITS,
-    WarpMiInfo, block_warp, build_warp_param_stack, generate_points_from_corners,
-    get_warp_translation, reduce_warp_model, round2_signed, setup_shear, warp_bank_insert,
-    warp_motion_vector, warp_mv_at,
+    WarpMiInfo, block_warp, build_warp_param_stack, extend_warp_params, find_warp_samples,
+    generate_points_from_corners, get_warp_translation, reduce_warp_model, round2_signed,
+    setup_shear, warp_bank_insert, warp_estimation, warp_has_ref_neighbour, warp_local_context,
+    warp_mode_context, warp_motion_vector, warp_mv_at,
 };
 use crate::av2::wedge::{
     WEDGE_ANGLE_DIST_TO_IDX, WEDGE_TABLES, compute_diff_wtd_mask_intermediate,
@@ -623,11 +625,6 @@ fn validate_tools(seq: &SequenceHeader, fh: &FrameHeader) -> Result<()> {
     }
     if fh.bawp != 0 {
         return unsupported("block-adaptive weighted prediction");
-    }
-    if fh.is_inter_or_switch() && (seq.motion_modes & ((1 << 1) | (1 << 2) | (1 << 4))) != 0 {
-        // `INTERINTRA`, `LOCALWARP` and `EXTENDWARP`: this decoder implements
-        // the `DELTAWARP`/`WARPMV`/`WARP_NEWMV` subset only.
-        return unsupported("inter-intra / local / extended warp motion modes");
     }
     if fh.warp_motion != 0 && (seq.motion_modes & (1 << 3)) == 0 {
         return Err(Av2Error::BitstreamError(
@@ -2439,6 +2436,11 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             let mut warp_mv = true;
             let mut ref_warp_idx = 0usize;
             let mut warpmv_with_mvd = false;
+            // `SIMPLE = 0`, `INTERINTRA = 1`, `LOCALWARP = 2`, `DELTAWARP = 3`,
+            // `EXTENDWARP = 4` (§7.3 `MOTION_MODES`).
+            let mut motion_mode = 0u8;
+            let mut inter_intra = false;
+            let mut inter_intra_mode = 0u8;
             if !forced_globalmv {
                 if warp_signalled {
                     let ctx = self.warp_mv_count(bx4, by4, bw4, bh4);
@@ -2450,37 +2452,79 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     } else {
                         self.msac.decode_bool_adapt(&mut self.cdf.m.warp_mv)? != 0
                     };
+                    motion_mode = 3;
                     if !warp_mv {
-                        // `read_motion_mode()` for `WARP_NEWMV`. This subset
-                        // enables only `DELTAWARP`; the other modes are read
-                        // (to keep the bit position) and then rejected.
-                        if (self.seq.motion_modes & (1 << 4)) != 0
-                            && self
-                                .msac
-                                .decode_bool_adapt(&mut self.cdf.m.use_extend_warp[0])?
-                                != 0
-                        {
-                            return Err(Av2Error::Unsupported("extended warp motion".to_string()));
-                        }
-                        if (self.seq.motion_modes & (1 << 2)) != 0
-                            && self
-                                .msac
-                                .decode_bool_adapt(&mut self.cdf.m.use_local_warp[0])?
-                                != 0
-                        {
-                            return Err(Av2Error::Unsupported("local warp motion".to_string()));
+                        // `read_motion_mode()` for `WARP_NEWMV`
+                        // (§5.20.7.14): `EXTENDWARP` when the block has a
+                        // neighbour with a matching reference, otherwise a
+                        // `LOCALWARP` symbol when both local and delta warp
+                        // are enabled (dav2d `decode.c` WARPNEWMV branch).
+                        let ext_ctx = warp_mode_context(
+                            &self.warp_mi,
+                            self.frame_mi_w,
+                            self.frame_mi_h,
+                            self.sb_step4,
+                            bx4,
+                            by4,
+                            bw4,
+                            bh4,
+                        );
+                        let has_ext = warp_has_ref_neighbour(
+                            &self.warp_mi,
+                            self.frame_mi_w,
+                            self.frame_mi_h,
+                            self.sb_step4,
+                            bx4,
+                            by4,
+                            bw4,
+                            bh4,
+                            ref_idx as i8,
+                        );
+                        if has_ext {
+                            if (self.seq.motion_modes & (1 << 4)) != 0
+                                && self
+                                    .msac
+                                    .decode_bool_adapt(&mut self.cdf.m.use_extend_warp[ext_ctx])?
+                                    != 0
+                            {
+                                motion_mode = 4;
+                            }
+                            if motion_mode == 3
+                                && (self.seq.motion_modes & ((1 << 2) | (1 << 3)))
+                                    == ((1 << 2) | (1 << 3))
+                            {
+                                let cs_ctx = warp_local_context(
+                                    &self.warp_mi,
+                                    self.frame_mi_w,
+                                    self.frame_mi_h,
+                                    self.sb_step4,
+                                    bx4,
+                                    by4,
+                                    bw4,
+                                    bh4,
+                                );
+                                if self
+                                    .msac
+                                    .decode_bool_adapt(&mut self.cdf.m.use_local_warp[cs_ctx])?
+                                    != 0
+                                {
+                                    motion_mode = 2;
+                                }
+                            }
                         }
                     }
-                    // `warp_idx` (§5.20.7.6).
-                    for idx in 0..MAX_WARP_REF_CANDIDATES - 1 {
-                        let more = self
-                            .msac
-                            .decode_symbol_adapt(&mut self.cdf.m.warp_idx[idx], 1)?;
-                        if more == 0 {
-                            ref_warp_idx = idx;
-                            break;
+                    if motion_mode == 3 {
+                        // `warp_idx` (§5.20.7.6).
+                        for idx in 0..MAX_WARP_REF_CANDIDATES - 1 {
+                            let more = self
+                                .msac
+                                .decode_symbol_adapt(&mut self.cdf.m.warp_idx[idx], 1)?;
+                            if more == 0 {
+                                ref_warp_idx = idx;
+                                break;
+                            }
+                            ref_warp_idx = idx + 1;
                         }
-                        ref_warp_idx = idx + 1;
                     }
                     if warp_mv && ref_warp_idx < 2 {
                         warpmv_with_mvd =
@@ -2507,6 +2551,38 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                         .msac
                         .decode_symbol_adapt(self.cdf.m.single_mode(sngl_ctx), 2)?;
                     mode = InterPredMode::NearMv as u8 + sym as u8;
+                    // `read_interintra_mode(0)` (§5.20.7.15) for
+                    // `NEARMV`/`GLOBALMV`/`NEWMV` blocks of at most 64x64
+                    // samples (dav2d `decode.c` inter-intra branch).
+                    if (self.seq.motion_modes & (1 << 1)) != 0
+                        && bw4 * bh4 > 2
+                        && bw4.max(bh4) <= 16
+                    {
+                        let size_group = SPEC_SIZE_GROUP[mi_size_index(bs)] as usize;
+                        if self
+                            .msac
+                            .decode_bool_adapt(&mut self.cdf.m.inter_intra[size_group])?
+                            != 0
+                        {
+                            motion_mode = 1;
+                            inter_intra = true;
+                            inter_intra_mode = self.msac.decode_symbol_adapt(
+                                &mut self.cdf.m.inter_intra_mode[size_group],
+                                3,
+                            )? as u8;
+                            if bw4.min(bh4) > 1
+                                && self
+                                    .msac
+                                    .decode_bool_adapt(&mut self.cdf.m.wedge_inter_intra)?
+                                    != 0
+                            {
+                                let _ = self.read_wedge_idx()?;
+                                return Err(Av2Error::Unsupported(
+                                    "inter-intra wedge blending".to_string(),
+                                ));
+                            }
+                        }
+                    }
                     if mode == InterPredMode::NearMv as u8 || mode == InterPredMode::NewMv as u8 {
                         let max_drl = self.fh.max_drl_bits.max(1) as usize;
                         let mut n = 0usize;
@@ -2572,31 +2648,81 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     m
                 };
                 mv = block_mv;
-                let mut matrix = params;
-                if !warp_mv {
-                    // `read_warp_delta()` (§5.20.7.7). Only `RefWarpIdx == 0`
-                    // is reachable without six-parameter warp delta.
-                    let six_param = self.seq.six_param_warp_delta && ref_warp_idx == 1;
-                    if six_param || ref_warp_idx == 0 {
-                        let high_prec = self
-                            .msac
-                            .decode_bool_adapt(&mut self.cdf.m.warp_precision[mi_size_index(bs)])?
-                            != 0;
-                        matrix[0] = 0;
-                        matrix[1] = 0;
-                        let d2 = self.read_warp_delta_param(2, high_prec)?;
-                        let d3 = self.read_warp_delta_param(3, high_prec)?;
-                        matrix[2] = matrix[2].wrapping_add(d2);
-                        matrix[3] = matrix[3].wrapping_add(d3);
-                        if six_param {
-                            let d4 = self.read_warp_delta_param(4, high_prec)?;
-                            let d5 = self.read_warp_delta_param(5, high_prec)?;
-                            matrix[4] = matrix[4].wrapping_add(d4);
-                            matrix[5] = matrix[5].wrapping_add(d5);
-                        } else {
-                            matrix[4] = matrix[3].wrapping_neg();
-                            matrix[5] = matrix[2];
+                let mut matrix;
+                match motion_mode {
+                    2 => {
+                        // `LOCALWARP`: `warp_estimation()` (§7.13.3.23).
+                        let (cands, num) = find_warp_samples(
+                            &self.warp_mi,
+                            self.frame_mi_w,
+                            self.frame_mi_h,
+                            self.sb_step4,
+                            self.tile_row_start4,
+                            self.tile_row_end4,
+                            self.tile_col_start4,
+                            self.tile_col_end4,
+                            bx4,
+                            by4,
+                            bw4,
+                            bh4,
+                            ref_idx as i8,
+                        );
+                        matrix = warp_estimation(&cands, num, bw4, bh4, bx4, by4, block_mv);
+                    }
+                    4 => {
+                        // `EXTENDWARP`: `extend_warp_estimation()` (§7.13.3.24).
+                        let row = cands.row_offsets.get(drl_idx).copied().unwrap_or(-1);
+                        let col = cands.col_offsets.get(drl_idx).copied().unwrap_or(-1);
+                        matrix = extend_warp_params(
+                            &self.warp_mi,
+                            self.frame_mi_w,
+                            self.frame_mi_h,
+                            self.sb_step4,
+                            bx4,
+                            by4,
+                            bw4,
+                            bh4,
+                            ref_idx as i8,
+                            row,
+                            col,
+                            block_mv,
+                        )
+                        .ok_or_else(|| {
+                            Av2Error::BitstreamError(
+                                "extended warp without a usable neighbour".to_string(),
+                            )
+                        })?;
+                    }
+                    _ => {
+                        // `DELTAWARP`: `read_warp_delta()` (§5.20.7.7).
+                        matrix = params;
+                        if !warp_mv {
+                            // Only `RefWarpIdx == 0` is reachable without
+                            // six-parameter warp delta.
+                            let six_param = self.seq.six_param_warp_delta && ref_warp_idx == 1;
+                            if six_param || ref_warp_idx == 0 {
+                                let high_prec = self.msac.decode_bool_adapt(
+                                    &mut self.cdf.m.warp_precision[mi_size_index(bs)],
+                                )? != 0;
+                                matrix[0] = 0;
+                                matrix[1] = 0;
+                                let d2 = self.read_warp_delta_param(2, high_prec)?;
+                                let d3 = self.read_warp_delta_param(3, high_prec)?;
+                                matrix[2] = matrix[2].wrapping_add(d2);
+                                matrix[3] = matrix[3].wrapping_add(d3);
+                                if six_param {
+                                    let d4 = self.read_warp_delta_param(4, high_prec)?;
+                                    let d5 = self.read_warp_delta_param(5, high_prec)?;
+                                    matrix[4] = matrix[4].wrapping_add(d4);
+                                    matrix[5] = matrix[5].wrapping_add(d5);
+                                } else {
+                                    matrix[4] = matrix[3].wrapping_neg();
+                                    matrix[5] = matrix[2];
+                                }
+                            }
                         }
+                        reduce_warp_model(&mut matrix);
+                        get_warp_translation(&mut matrix, bw4, bh4, bx4, by4, mv);
                     }
                 }
                 if warp_mv && w <= 64 && h <= 64 {
@@ -2606,22 +2732,32 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                         .msac
                         .decode_bool_adapt(&mut self.cdf.m.warp_inter_intra[size_group])?;
                     if warp_ii != 0 {
-                        return Err(Av2Error::Unsupported(
-                            "warp inter-intra prediction".to_string(),
-                        ));
+                        inter_intra = true;
+                        inter_intra_mode = self
+                            .msac
+                            .decode_symbol_adapt(&mut self.cdf.m.inter_intra_mode[size_group], 3)?
+                            as u8;
+                        if self
+                            .msac
+                            .decode_bool_adapt(&mut self.cdf.m.wedge_inter_intra)?
+                            != 0
+                        {
+                            let _ = self.read_wedge_idx()?;
+                            return Err(Av2Error::Unsupported(
+                                "warp inter-intra wedge blending".to_string(),
+                            ));
+                        }
                     }
                 }
-                reduce_warp_model(&mut matrix);
                 let abcd = setup_shear(&matrix).ok_or_else(|| {
                     Av2Error::BitstreamError("invalid warped-motion model".to_string())
                 })?;
-                get_warp_translation(&mut matrix, bw4, bh4, bx4, by4, mv);
                 warp_model = Some((matrix, abcd));
                 if !all_zero {
                     self.decode_tx_part_flag(bs, 0, 1)?;
                 }
                 flt = 0usize;
-                block_motion_mode = 3; // `DELTAWARP`
+                block_motion_mode = motion_mode;
                 block_warp_params = matrix;
             } else {
                 mv = match mode {
@@ -2664,6 +2800,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 } else {
                     self.fh.subpel_filter_mode as usize
                 };
+                block_motion_mode = motion_mode;
                 // `read_tx_partition()` follows the complete inter mode info
                 // (§5.20.6.2): the MVD and the switchable subpel filter come
                 // first, then the transform tree flag.
@@ -2675,6 +2812,48 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             let ref_frame = self.ref_frames[ref_idx].ok_or_else(|| {
                 Av2Error::BitstreamError("inter block references a missing frame".to_string())
             })?;
+
+            // Inter-intra: predict the intra half before the inter prediction
+            // overwrites the block (`read_interintra_mode`, §5.20.7.15).
+            let ii_saved = if inter_intra {
+                let iy = self.save_interintra_pred(
+                    0,
+                    px_x,
+                    px_y,
+                    w,
+                    h,
+                    have_left,
+                    have_top,
+                    inter_intra_mode,
+                );
+                if has_chroma {
+                    let iu = self.save_interintra_pred(
+                        1,
+                        cpx_x,
+                        cpx_y,
+                        cw,
+                        ch,
+                        have_left,
+                        have_top,
+                        inter_intra_mode,
+                    );
+                    let iv = self.save_interintra_pred(
+                        2,
+                        cpx_x,
+                        cpx_y,
+                        cw,
+                        ch,
+                        have_left,
+                        have_top,
+                        inter_intra_mode,
+                    );
+                    Some((iy, Some((iu, iv))))
+                } else {
+                    Some((iy, None))
+                }
+            } else {
+                None
+            };
 
             if let Some((matrix, abcd)) = warp_model {
                 {
@@ -2773,6 +2952,23 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                             flt,
                         );
                     }
+                }
+            }
+
+            if let Some((iy, chroma)) = ii_saved {
+                let mask = interintra_mask(inter_intra_mode, w, h);
+                let dp = &mut self.rec.planes[0];
+                let off = dp.offset(px_x, px_y);
+                blend_interintra(self.bd, &mut dp.data, off, dp.stride, &iy, &mask, w, h);
+                if let Some((iu, iv)) = chroma {
+                    let mask_u = interintra_mask(inter_intra_mode, cw, ch);
+                    let dp = &mut self.rec.planes[1];
+                    let off = dp.offset(cpx_x, cpx_y);
+                    blend_interintra(self.bd, &mut dp.data, off, dp.stride, &iu, &mask_u, cw, ch);
+                    let mask_v = interintra_mask(inter_intra_mode, cw, ch);
+                    let dp = &mut self.rec.planes[2];
+                    let off = dp.offset(cpx_x, cpx_y);
+                    blend_interintra(self.bd, &mut dp.data, off, dp.stride, &iv, &mask_v, cw, ch);
                 }
             }
 
@@ -3835,6 +4031,8 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         info.inter = true;
         info.ref0 = refs[0];
         info.mv = mvs[0];
+        info.ref1 = refs[1];
+        info.mv1 = mvs[1];
         info.motion_mode = motion_mode;
         info.warp = warp;
         let comp_info = CompoundMiInfo {
@@ -4634,6 +4832,53 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             rec_h,
         );
         edge
+    }
+
+    /// Returns the intra prediction for one plane of an inter-intra block
+    /// (`read_interintra_mode`, §5.20.7.15 / §5.20.7.22). The prediction is
+    /// written into the current frame, copied out, and later blended with the
+    /// inter prediction by [`blend_interintra`] (§7.13.3.30).
+    #[allow(clippy::too_many_arguments)]
+    fn save_interintra_pred(
+        &mut self,
+        plane: usize,
+        px_x: usize,
+        px_y: usize,
+        w: usize,
+        h: usize,
+        have_left: bool,
+        have_top: bool,
+        interintra_mode: u8,
+    ) -> Vec<BD::Pixel> {
+        let edge = self.edge_buffer(plane, px_x, px_y, w, h, have_left, have_top, 0);
+        let mode = interintra_intra_mode(interintra_mode);
+        {
+            let pl = &mut self.rec.planes[plane];
+            let off = pl.offset(px_x, px_y);
+            predict_intra_block(
+                self.bd,
+                &mut pl.data,
+                off,
+                pl.stride,
+                &edge,
+                256,
+                mode,
+                0,
+                w,
+                h,
+                have_left,
+                have_top,
+                plane,
+                0,
+            );
+        }
+        let pl = &self.rec.planes[plane];
+        let mut out = vec![BD::Pixel::default(); w * h];
+        for r in 0..h {
+            let off = pl.offset(px_x, px_y + r);
+            out[r * w..(r + 1) * w].copy_from_slice(&pl.data[off..off + w]);
+        }
+        out
     }
 }
 

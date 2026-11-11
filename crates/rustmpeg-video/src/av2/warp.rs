@@ -736,6 +736,10 @@ pub struct WarpMiInfo {
     pub ref0: i8,
     /// `Mvs[..][0]` list (1/8-pel).
     pub mv: MvXY,
+    /// `RefFrames[..][1]` list (frame slot index, or `-1`).
+    pub ref1: i8,
+    /// `Mvs[..][1]` list (1/8-pel).
+    pub mv1: MvXY,
     /// `MotionModes` value (0 = `SIMPLE`, 3 = `DELTAWARP`).
     pub motion_mode: u8,
     /// `WarpParams[..][0]` for warp blocks.
@@ -754,9 +758,23 @@ impl WarpMiInfo {
             inter: false,
             ref0: -1,
             mv: MvXY::default(),
+            ref1: -1,
+            mv1: MvXY::default(),
             motion_mode: 0,
             warp: DEFAULT_WARP_PARAMS,
         }
+    }
+
+    /// Motion vector for `list` (0 or 1).
+    #[inline]
+    pub fn list_mv(&self, list: usize) -> MvXY {
+        if list == 0 { self.mv } else { self.mv1 }
+    }
+
+    /// Reference frame for `list` (0 or 1).
+    #[inline]
+    pub fn list_ref(&self, list: usize) -> i8 {
+        if list == 0 { self.ref0 } else { self.ref1 }
     }
 }
 
@@ -918,6 +936,461 @@ pub fn generate_points_from_corners(
     wmmat[0] = wmmat0.clamp(-WARPEDMODEL_TRANS_CLAMP, hi) as i32;
     wmmat[1] = wmmat1.clamp(-WARPEDMODEL_TRANS_CLAMP, hi) as i32;
     Some(wmmat)
+}
+
+/// `LS_MV_MAX` (§7.3): largest motion-vector difference accepted by the
+/// local-warp least-squares fit.
+pub const LS_MV_MAX: i32 = 256;
+/// `LEAST_SQUARES_SAMPLES_MAX` (§7.3): maximum number of warp samples.
+pub const LEAST_SQUARES_SAMPLES_MAX: usize = 8;
+
+/// `find_warp_samples()` (§7.12.3) over a per-4x4 block map.
+///
+/// Returns `(CandList, NumSamples)` where each candidate is
+/// `[midY*8, midX*8, midY*8+mvY, midX*8+mvX]` in 1/8-pel units.
+#[allow(clippy::too_many_arguments)]
+pub fn find_warp_samples(
+    map: &[WarpMiInfo],
+    mi_cols: usize,
+    mi_rows: usize,
+    sb_h4: usize,
+    tile_row_start4: usize,
+    tile_row_end4: usize,
+    tile_col_start4: usize,
+    tile_col_end4: usize,
+    bx4: usize,
+    by4: usize,
+    bw4: usize,
+    bh4: usize,
+    ref_id: i8,
+) -> ([[i32; 4]; LEAST_SQUARES_SAMPLES_MAX], usize) {
+    let mut out = [[0i32; 4]; LEAST_SQUARES_SAMPLES_MAX];
+    let mut count = 0usize;
+    let sb_h4 = sb_h4.max(1);
+    let is_sb_border = by4.is_multiple_of(sb_h4);
+
+    let inside = |row: isize, col: isize| {
+        row >= tile_row_start4 as isize
+            && row < tile_row_end4 as isize
+            && col >= tile_col_start4 as isize
+            && col < tile_col_end4 as isize
+    };
+    let above_stored = |map: &[WarpMiInfo], delta_col: isize| -> bool {
+        let row = by4 as isize - 1;
+        let col = bx4 as isize + delta_col;
+        if !inside(row, col) {
+            return false;
+        }
+        if !is_sb_border {
+            return true;
+        }
+        if col.rem_euclid(2) == 0 {
+            return true;
+        }
+        let src_w4 = map[row as usize * mi_cols + col as usize].w4;
+        if src_w4 == 1 {
+            return false;
+        }
+        col + 1 < tile_col_end4 as isize
+    };
+    let mut add = |delta_row: isize, delta_col: isize| {
+        if count >= LEAST_SQUARES_SAMPLES_MAX {
+            return;
+        }
+        let mv_row = by4 as isize + delta_row;
+        let mv_col = bx4 as isize + delta_col;
+        if !inside(mv_row, mv_col) {
+            return;
+        }
+        let info = map[mv_row as usize * mi_cols + mv_col as usize];
+        if !info.written || !info.inter {
+            return;
+        }
+        for list in 0..2usize {
+            if info.list_ref(list) != ref_id {
+                continue;
+            }
+            let mid_y = info.origin_y4 as i32 * 4 + info.h4 as i32 * 2 - 1;
+            let mid_x = info.origin_x4 as i32 * 4 + info.w4 as i32 * 2 - 1;
+            let mv = info.list_mv(list);
+            out[count] = [
+                mid_y * 8,
+                mid_x * 8,
+                mid_y * 8 + mv.y as i32,
+                mid_x * 8 + mv.x as i32,
+            ];
+            count += 1;
+            if count >= LEAST_SQUARES_SAMPLES_MAX {
+                return;
+            }
+        }
+    };
+
+    let mut do_top_left = true;
+    let mut do_top_right = true;
+    if by4 > tile_row_start4 && by4 > 0 {
+        let above = map[(by4 - 1) * mi_cols + bx4];
+        let col_offset = above.origin_x4 as isize - bx4 as isize;
+        if col_offset < 0 {
+            do_top_left = false;
+        }
+        let limit = bw4.min(mi_cols - bx4) as isize;
+        let mut i = col_offset;
+        while i < limit {
+            let col = bx4 as isize + i;
+            if col >= mi_cols as isize {
+                break;
+            }
+            let src_w = map[(by4 - 1) * mi_cols + col as usize].w4 as isize;
+            if src_w <= 0 {
+                break;
+            }
+            if above_stored(map, i) {
+                add(-1, i);
+            }
+            i += src_w;
+        }
+        do_top_right = i == bw4 as isize && i < (mi_cols - bx4) as isize;
+    }
+    if bx4 > tile_col_start4 && bx4 > 0 {
+        let left = map[by4 * mi_cols + bx4 - 1];
+        let row_offset = left.origin_y4 as isize - by4 as isize;
+        if row_offset < 0 {
+            do_top_left = false;
+        }
+        let limit = bh4.min(mi_rows - by4) as isize;
+        let mut i = row_offset;
+        while i < limit {
+            let row = by4 as isize + i;
+            if row >= mi_rows as isize {
+                break;
+            }
+            let src_h = map[row as usize * mi_cols + bx4 - 1].h4 as isize;
+            if src_h <= 0 {
+                break;
+            }
+            add(i, -1);
+            i += src_h;
+        }
+    }
+    if do_top_left && above_stored(map, -1) {
+        add(-1, -1);
+    }
+    if do_top_right && bw4 <= 16 && above_stored(map, bw4 as isize) {
+        add(-1, bw4 as isize);
+    }
+    (out, count)
+}
+
+/// `warp_estimation()` (§7.13.3.23): least-squares fit of the local affine
+/// model from `CandList`, followed by `reduce_warp_model()` and
+/// `get_warp_translation()`.
+#[allow(clippy::too_many_arguments)]
+pub fn warp_estimation(
+    cands: &[[i32; 4]; LEAST_SQUARES_SAMPLES_MAX],
+    num_samples: usize,
+    bw4: usize,
+    bh4: usize,
+    bx4: usize,
+    by4: usize,
+    mv: MvXY,
+) -> [i32; 6] {
+    let mut a = [[0i64; 2]; 2];
+    let mut bx = [0i64; 2];
+    let mut by = [0i64; 2];
+    let mid_y = by4 as i64 * 4 + bh4 as i64 * 2 - 1;
+    let mid_x = bx4 as i64 * 4 + bw4 as i64 * 2 - 1;
+    let suy = mid_y * 8;
+    let sux = mid_x * 8;
+    let duy = suy + mv.y as i64;
+    let dux = sux + mv.x as i64;
+    for cand in cands.iter().take(num_samples) {
+        let sy = cand[0] as i64 - suy;
+        let sx = cand[1] as i64 - sux;
+        let dy = cand[2] as i64 - duy;
+        let dx = cand[3] as i64 - dux;
+        if (sx - dx).abs() < LS_MV_MAX as i64 && (sy - dy).abs() < LS_MV_MAX as i64 {
+            a[0][0] += ((sx * sx) >> 2) + sx + sx + 8;
+            a[0][1] += ((sx * sy) >> 2) + sx + sy + 4;
+            a[1][1] += ((sy * sy) >> 2) + sy + sy + 8;
+            bx[0] += ((sx * dx) >> 2) + sx + dx + 8;
+            bx[1] += ((sy * dx) >> 2) + sy + dx + 4;
+            by[0] += ((sx * dy) >> 2) + sx + dy + 4;
+            by[1] += ((sy * dy) >> 2) + sy + dy + 8;
+        }
+    }
+    let det = a[0][0] * a[1][1] - a[0][1] * a[0][1];
+    if det == 0 {
+        let mut params = DEFAULT_WARP_PARAMS;
+        get_warp_translation(&mut params, bw4, bh4, bx4, by4, mv);
+        return params;
+    }
+    let (mut shift, factor) = resolve_divisor_64(det);
+    let mut factor = factor as i64;
+    if shift >= WARPEDMODEL_PREC_BITS {
+        shift -= WARPEDMODEL_PREC_BITS;
+    } else {
+        factor <<= WARPEDMODEL_PREC_BITS - shift;
+        shift = 0;
+    }
+    let diag = |v: i64| -> i32 {
+        round2_signed(v * factor, shift).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    };
+    let mut params = [0i32; 6];
+    params[2] = diag(a[1][1] * bx[0] - a[0][1] * bx[1]);
+    params[3] = diag(-a[0][1] * bx[0] + a[0][0] * bx[1]);
+    params[4] = diag(a[1][1] * by[0] - a[0][1] * by[1]);
+    params[5] = diag(-a[0][1] * by[0] + a[0][0] * by[1]);
+    reduce_warp_model(&mut params);
+    get_warp_translation(&mut params, bw4, bh4, bx4, by4, mv);
+    params
+}
+
+/// `true` when the block has a neighbour with a matching reference for
+/// `has_cs_ext` / `WarpSampleFound` (§7.11.4).
+#[allow(clippy::too_many_arguments)]
+pub fn warp_has_ref_neighbour(
+    map: &[WarpMiInfo],
+    mi_cols: usize,
+    mi_rows: usize,
+    sb_h4: usize,
+    bx4: usize,
+    by4: usize,
+    bw4: usize,
+    bh4: usize,
+    ref_id: i8,
+) -> bool {
+    let sb_h4 = sb_h4.max(1);
+    let is_sb_border = by4.is_multiple_of(sb_h4);
+    let check = |row: isize, col: isize| -> bool {
+        if row < 0 || col < 0 || row >= mi_rows as isize || col >= mi_cols as isize {
+            return false;
+        }
+        let info = map[row as usize * mi_cols + col as usize];
+        info.written && info.inter && (info.ref0 == ref_id || info.ref1 == ref_id)
+    };
+    let left = bx4 > 0 && check(by4 as isize, bx4 as isize - 1)
+        || (bx4 > 0
+            && by4 + bh4 <= mi_rows
+            && check(by4 as isize + bh4 as isize - 1, bx4 as isize - 1));
+    let above = if by4 == 0 {
+        false
+    } else if is_sb_border {
+        check(by4 as isize - 1, (bx4 & !1) as isize)
+            || ((bx4 + bw4 >= 2) && check(by4 as isize - 1, ((bx4 + bw4 - 2) & !1) as isize))
+    } else {
+        check(by4 as isize - 1, bx4 as isize)
+            || (bx4 + bw4 <= mi_cols && check(by4 as isize - 1, (bx4 + bw4 - 1) as isize))
+    };
+    left || above
+}
+
+/// CDF context for `use_extend_warp` / `use_local_warp` (§8.3.2): the number
+/// of left/above neighbours whose motion mode is `LOCALWARP` or greater.
+pub fn warp_mode_context(
+    map: &[WarpMiInfo],
+    mi_cols: usize,
+    mi_rows: usize,
+    sb_h4: usize,
+    bx4: usize,
+    by4: usize,
+    bw4: usize,
+    bh4: usize,
+) -> usize {
+    let sb_h4 = sb_h4.max(1);
+    let have_top_in_sb = !by4.is_multiple_of(sb_h4);
+    let mut ctx = 0usize;
+    let mut add = |row: isize, col: isize| {
+        if row < 0 || col < 0 || row >= mi_rows as isize || col >= mi_cols as isize {
+            return;
+        }
+        let info = map[row as usize * mi_cols + col as usize];
+        if info.written && info.inter && info.motion_mode >= 2 {
+            ctx += 1;
+        }
+    };
+    let mut n = 0usize;
+    if bx4 > 0 {
+        add(by4 as isize + bh4 as isize - 1, bx4 as isize - 1);
+        n += 1;
+    }
+    if have_top_in_sb {
+        add(by4 as isize - 1, bx4 as isize + bw4 as isize - 1);
+        n += 1;
+    }
+    if bx4 > 0 && n < 2 {
+        add(by4 as isize, bx4 as isize - 1);
+        n += 1;
+    }
+    if have_top_in_sb && n < 2 {
+        add(by4 as isize - 1, bx4 as isize);
+    }
+    ctx.min(2)
+}
+
+/// CDF context for `use_local_warp` (§8.3.2, dav2d `warp_causal[cs_ctx]`):
+/// `(ext_ctx > 0) + (left == LOCALWARP) + (above == LOCALWARP)`.
+pub fn warp_local_context(
+    map: &[WarpMiInfo],
+    mi_cols: usize,
+    mi_rows: usize,
+    sb_h4: usize,
+    bx4: usize,
+    by4: usize,
+    bw4: usize,
+    bh4: usize,
+) -> usize {
+    let sb_h4 = sb_h4.max(1);
+    let have_top_in_sb = !by4.is_multiple_of(sb_h4);
+    let mode_at = |row: isize, col: isize| -> u8 {
+        if row < 0 || col < 0 || row >= mi_rows as isize || col >= mi_cols as isize {
+            return 0;
+        }
+        let info = map[row as usize * mi_cols + col as usize];
+        if info.written && info.inter {
+            info.motion_mode
+        } else {
+            0
+        }
+    };
+    let mut modes = [0u8; 2];
+    let mut n = 0usize;
+    if bx4 > 0 {
+        modes[0] = mode_at(by4 as isize + bh4 as isize - 1, bx4 as isize - 1);
+        n = 1;
+    }
+    if have_top_in_sb && n < 2 {
+        modes[n] = mode_at(by4 as isize - 1, bx4 as isize + bw4 as isize - 1);
+        n += 1;
+    }
+    if bx4 > 0 && n < 2 {
+        modes[n] = mode_at(by4 as isize, bx4 as isize - 1);
+        n += 1;
+    }
+    if have_top_in_sb && n < 2 {
+        modes[n] = mode_at(by4 as isize - 1, bx4 as isize);
+    }
+    let ext_ctx = (modes[0] >= 2) as usize + (modes[1] >= 2) as usize;
+    (ext_ctx > 0) as usize + (modes[0] == 2) as usize + (modes[1] == 2) as usize
+}
+
+/// `extend_warp_estimation()` (§7.13.3.24) over the per-4x4 block map.
+///
+/// `stack_row` / `stack_col` are `RefStackRowOffset[RefMvIdx]` and
+/// `RefStackColOffset[RefMvIdx]`; when either is `-1`, the scan-point
+/// fallback of dav2d's `extend_warpmv` selects the neighbour instead.
+#[allow(clippy::too_many_arguments)]
+pub fn extend_warp_params(
+    map: &[WarpMiInfo],
+    mi_cols: usize,
+    mi_rows: usize,
+    sb_h4: usize,
+    bx4: usize,
+    by4: usize,
+    bw4: usize,
+    bh4: usize,
+    ref_id: i8,
+    stack_row: i16,
+    stack_col: i16,
+    mv: MvXY,
+) -> Option<[i32; 6]> {
+    let sb_h4 = sb_h4.max(1);
+    let is_sb_border = by4.is_multiple_of(sb_h4);
+    let has_ref = |row: isize, col: isize| -> bool {
+        if row < 0 || col < 0 || row >= mi_rows as isize || col >= mi_cols as isize {
+            return false;
+        }
+        let info = map[row as usize * mi_cols + col as usize];
+        info.written && info.inter && (info.ref0 == ref_id || info.ref1 == ref_id)
+    };
+    let mut delta_row = stack_row as isize;
+    let mut delta_col = stack_col as isize;
+    // dav2d uses the stack offsets when both are valid and otherwise falls
+    // back to the §7.11.4 scan points.
+    if delta_row == -1
+        || delta_col == -1
+        || !has_ref(by4 as isize + delta_row, bx4 as isize + delta_col)
+    {
+        let bh4i = bh4 as isize;
+        let bw4i = bw4 as isize;
+        if bx4 > 0 && has_ref(by4 as isize + bh4i - 1, bx4 as isize - 1) {
+            delta_row = bh4i - 1;
+            delta_col = -1;
+        } else if by4 > 0
+            && has_ref(
+                by4 as isize - 1,
+                bx4 as isize + bw4i - 1 - (is_sb_border as isize & (bx4 as isize & 1)),
+            )
+        {
+            delta_row = -1;
+            delta_col =
+                -(bx4 as isize & is_sb_border as isize) + bw4i - (1 + is_sb_border as isize);
+        } else if by4 > 0 && bx4 > 0 && has_ref(by4 as isize, bx4 as isize - 1) {
+            delta_row = 0;
+            delta_col = -1;
+        } else if by4 > 0 && has_ref(by4 as isize - 1, bx4 as isize) {
+            delta_row = -1;
+            delta_col = -(bx4 as isize & is_sb_border as isize);
+        } else {
+            return None;
+        }
+    }
+    let row = by4 as isize + delta_row;
+    let col = bx4 as isize + delta_col;
+    if row < 0 || col < 0 || row >= mi_rows as isize || col >= mi_cols as isize {
+        return None;
+    }
+    let info = map[row as usize * mi_cols + col as usize];
+    let list = if info.ref0 == ref_id {
+        0usize
+    } else if info.ref1 == ref_id {
+        1usize
+    } else {
+        return None;
+    };
+    let params = if info.motion_mode >= 2 {
+        info.warp
+    } else {
+        let mut p = DEFAULT_WARP_PARAMS;
+        let nmv = info.list_mv(list);
+        p[0] = (nmv.x as i32) << (WARPEDMODEL_PREC_BITS - 3);
+        p[1] = (nmv.y as i32) << (WARPEDMODEL_PREC_BITS - 3);
+        p
+    };
+    let mid_y = by4 as i64 * 4 + bh4 as i64 * 2 - 1;
+    let mid_x = bx4 as i64 * 4 + bw4 as i64 * 2 - 1;
+    let proj_mid_x =
+        (mid_x << WARPEDMODEL_PREC_BITS) + ((mv.x as i64) << (WARPEDMODEL_PREC_BITS - 3));
+    let proj_mid_y =
+        (mid_y << WARPEDMODEL_PREC_BITS) + ((mv.y as i64) << (WARPEDMODEL_PREC_BITS - 3));
+    let neighbor_is_above = delta_row == -1 && delta_col >= 0;
+    let mut ext = [0i32; 6];
+    if neighbor_is_above {
+        ext[2] = params[2];
+        ext[4] = params[4];
+        let above_x = mid_x;
+        let above_y = by4 as i64 * 4 - 1;
+        let proj_above_x =
+            params[2] as i64 * above_x + params[3] as i64 * above_y + params[0] as i64;
+        let proj_above_y =
+            params[4] as i64 * above_x + params[5] as i64 * above_y + params[1] as i64;
+        let shift = bh4.trailing_zeros() + 1;
+        ext[3] = round2_signed(proj_mid_x - proj_above_x, shift) as i32;
+        ext[5] = round2_signed(proj_mid_y - proj_above_y, shift) as i32;
+    } else {
+        ext[3] = params[3];
+        ext[5] = params[5];
+        let left_x = bx4 as i64 * 4 - 1;
+        let left_y = mid_y;
+        let proj_left_x = params[2] as i64 * left_x + params[3] as i64 * left_y + params[0] as i64;
+        let proj_left_y = params[4] as i64 * left_x + params[5] as i64 * left_y + params[1] as i64;
+        let shift = bw4.trailing_zeros() + 1;
+        ext[2] = round2_signed(proj_mid_x - proj_left_x, shift) as i32;
+        ext[4] = round2_signed(proj_mid_y - proj_left_y, shift) as i32;
+    }
+    reduce_warp_model(&mut ext);
+    get_warp_translation(&mut ext, bw4, bh4, bx4, by4, mv);
+    Some(ext)
 }
 
 /// `block_warp()` (§7.13.3.19): warps one plane of a block into `dst`.

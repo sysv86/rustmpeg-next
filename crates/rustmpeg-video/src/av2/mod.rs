@@ -265,11 +265,10 @@ impl<P: Pixel> Encoder<P> {
         seqhdr.film_grain_present = config.tools.enable_film_grain;
         if config.tools.enable_warped_motion {
             // `seq_enabled_motion_modes[]` indexes `INTERINTRA..EXTENDWARP`
-            // (§5.4.6). Only `DELTAWARP` is enabled: `allow_warpmv_mode` then
-            // becomes signallable in the frame header, and `WARP_NEWMV`
-            // blocks select `DELTAWARP` without coding the `use_local_warp`
-            // or `use_extend_warp` symbols.
-            seqhdr.motion_modes = 1 | (1 << 3);
+            // (§5.4.6). All five AV2 v1.0.0 modes are enabled: the encoder
+            // emits `INTERINTRA`, `WARPMV`/`WARP_NEWMV` + `DELTAWARP`,
+            // `LOCALWARP` and `EXTENDWARP`.
+            seqhdr.motion_modes = 1 | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4);
         }
         let rc = RateController::new(
             config.rate_control,

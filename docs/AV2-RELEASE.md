@@ -202,7 +202,8 @@ Supported and verified in this close-out:
   intra and single-reference inter.
 - Intra: DC/directional/smooth/Paeth/MRL/DIP/filter-intra/CfL/palette/IntraBC.
 - Inter: DRL/NEARMV/GLOBALMV, NEWMV, 8-tap subpel, switchable subpel syntax,
-  compound/wedge/CWP blending, and warped motion (`WARP_NEWMV`).
+  compound/wedge/CWP blending, warped motion (`WARP_NEWMV`), `INTERINTRA`,
+  and decoding/prediction of `WARPMV`, `LOCALWARP` and `EXTENDWARP`.
 - In-loop filters: deblock, CDEF, CCSO (including `sb_reuse_ccso`), GDF,
   PC/NS/switchable/chroma loop restoration.
 - Segmentation, per-segment `ALT_Q`/`SKIP`/`GLOBALMV`, delta-Q, VAQ, VBR rate
@@ -218,10 +219,11 @@ Rejected with a typed error (not silent misdecoding):
 - non-uniform tiles, CCSO parameter `reuse` (without block-map reuse), global
   motion, reference-frame MVs, OPFL/MV refinement, adaptive MVD, SDP/extended
   SDP, FSC, CCTX/MHCCP/IBP, TIP/BAWP/CWP-implicit-mask, IST/DDT, TCQ/parity
-  hiding, skip mode, global IntraBC, sub-pixel IntraBC,
-  `LOCALWARP`/`EXTENDWARP`/`INTERINTRA`, warp-inter-intra, six-parameter warp
-  deltas, inter lossless 4x4 WHT, lossless palette/DIP/CfL, transform
-  partitions other than `TX_PARTITION_NONE`, and per-unit NS filter banks.
+  hiding, skip mode, global IntraBC, sub-pixel IntraBC, wedge inter-intra,
+  six-parameter warp deltas, inter lossless 4x4 WHT, lossless palette/DIP/CfL,
+  transform partitions other than `TX_PARTITION_NONE`, and per-unit NS filter
+  banks. `WARPMV`/`LOCALWARP`/`EXTENDWARP` are no longer rejected by the
+  decoder; their encoder emission is the remaining unit-8 gap.
 
 ## Per-unit status
 
@@ -234,7 +236,7 @@ Rejected with a typed error (not silent misdecoding):
 | 5. Segmentation, delta-Q, VAQ, rate control | DONE | `... av2_segmentation_decoder_dav2d_byte_exact -- --ignored` and `... av2_segmentation_dav2d_byte_exact -- --ignored` → pass; 18 matrix cases | Mixed-lossless segmentation and temporal map prediction are not exercised |
 | 6. NEWMV + switchable subpel | DONE | `cargo test -p rustmpeg-video --lib test_encoder_newmv_and_switchable_stats` and `... test_decode_matches_encoder_recon_with_newmv...` → pass; 19-case recorded matrix | Subpel compound and `TxPartition::TxSplit` rejected; reduced DRL |
 | 7. Compound, wedge, mask blending | DONE | `... av2_compound_decoder_dav2d_byte_exact -- --ignored` → pass; 28 in-tree, 34 recorded | `JOINT_NEWMV` parsed but not emitted; subpel compound not emitted |
-| 8. Warped motion (OBMC N/A) | DONE WITH LIMITS | `cargo test -p rustmpeg-video --test av2_warp` → pass; 17-case recorded matrix; 12-bit 3/3 exact | OBMC does not exist in AV2 v1.0.0 (§7.3 `MOTION_MODES = 5`, §5.20.7.14), cited; `LOCALWARP`/`EXTENDWARP`/`INTERINTRA` rejected; `WARPMV` decoded but not emitted |
+| 8. Warped motion (OBMC N/A) | DONE WITH LIMITS | `cargo test -p rustmpeg-video --test av2_warp` → pass; 17-case recorded matrix; 12-bit 3/3 exact; `INTERINTRA` + `WARPMV`/`WARP_NEWMV` matrix 64x64/256x192 QP20/100/140 + 10/12-bit 256x192 → `encoder recon == our decoder == dav2d`; counts 3–9 `WARPMV`, 5–22 `INTERINTRA` per 256x192 run | OBMC does not exist in AV2 v1.0.0 (§7.3 `MOTION_MODES = 5`, §5.20.7.14), cited. `INTERINTRA`, `LOCALWARP`, `EXTENDWARP` and `WARPMV` are parsed and predicted; the encoder emits `INTERINTRA`, `WARPMV` and `WARP_NEWMV`+`DELTAWARP`; `LOCALWARP`/`EXTENDWARP` emission remains blocked by the reduced `find_mv_stack`/`WarpParamStack`, which is also a residual `WARPMV` risk on strongly affine content; six-parameter warp deltas are not emitted |
 | 9. Transform types, lossless WHT, DPCM | DONE WITH LIMITS | `... av2_unit9_encoder_dav2d_byte_exact -- --ignored` and `... av2_unit9_decoder_dav2d_byte_exact -- --ignored` → pass; full sets 0–3 | Lossless is intra-only; encoder emits only `TX_PARTITION_NONE`; inter lossless CDF absent; lossless palette/DIP/CfL rejected |
 | 10. Extended partitions + partition RDO | DONE | `... av2_extended_partitions_decoder_dav2d_byte_exact -- --ignored` → pass; 37 decoder + 7 encoder cases | Non-square luma intra is DC-only; extended search at 64x64 only; `dav2d` SIGSEGV on some 4:2:2/4:4:4 cells is skipped |
 | 11. Palette, IntraBC, ISP | DONE | 30-case screen-content matrix in [`docs/av2/UNIT11_ENCODER.md`](av2/UNIT11_ENCODER.md); `check_av2.py full` with screen tools off → 84/84 | ISP does not exist in AV2 v1.0.0; sub-pixel/global IntraBC rejected; one IntraBC block per frame; palette cache not reused |

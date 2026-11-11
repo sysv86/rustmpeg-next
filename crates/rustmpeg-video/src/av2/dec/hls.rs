@@ -1106,13 +1106,17 @@ pub fn parse_frame_header(
                 _ => FilterMode::Bilinear,
             };
         }
-        fh.motion_modes = 1;
         if seq.frame_motion_modes_present {
+            fh.motion_modes = 1;
             for shift in [1, 2, 3, 4] {
                 if (seq.motion_modes & (1 << shift)) != 0 {
                     fh.motion_modes |= (br.get_bit()? as u8) << shift;
                 }
             }
+        } else {
+            // §5.18.7.6: when the frame-level modes are not signalled they are
+            // inherited from the sequence header (dav2d `obu.c`).
+            fh.motion_modes = seq.motion_modes;
         }
     }
 

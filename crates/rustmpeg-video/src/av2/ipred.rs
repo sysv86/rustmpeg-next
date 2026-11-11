@@ -1267,3 +1267,75 @@ pub fn select_best_intra_mode_uv<BD: BitDepth>(
 
     (best_mode, best_angle)
 }
+
+/// `Ii_Weights_1d[128]` (AV2 Specification v1.0.0 §7.13.3.29).
+pub static II_WEIGHTS_1D: [u8; 128] = [
+    60, 58, 56, 54, 52, 50, 48, 47, 45, 44, 42, 41, 39, 38, 37, 35, 34, 33, 32, 31, 30, 29, 28, 27,
+    26, 25, 24, 23, 22, 22, 21, 20, 19, 19, 18, 18, 17, 16, 16, 15, 15, 14, 14, 13, 13, 12, 12, 12,
+    11, 11, 10, 10, 10, 9, 9, 9, 8, 8, 8, 8, 7, 7, 7, 7, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4,
+    4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+];
+
+/// `interintra_mode` value for `II_DC_PRED` (AV2 §6.19.7.14, Table 6.24).
+pub const II_DC_PRED: u8 = 0;
+/// `interintra_mode` value for `II_V_PRED`.
+pub const II_V_PRED: u8 = 1;
+/// `interintra_mode` value for `II_H_PRED`.
+pub const II_H_PRED: u8 = 2;
+/// `interintra_mode` value for `II_SMOOTH_PRED`.
+pub const II_SMOOTH_PRED: u8 = 3;
+
+/// Intra prediction mode used by an `interintra_mode` (§5.20.7.22).
+pub fn interintra_intra_mode(mode: u8) -> u8 {
+    match mode {
+        II_V_PRED => 1,
+        II_H_PRED => 2,
+        II_SMOOTH_PRED => 9,
+        _ => 0,
+    }
+}
+
+/// `intra_mode_variant_mask()` (§7.13.3.29) for a `w` x `h` plane region.
+pub fn interintra_mask(mode: u8, w: usize, h: usize) -> Vec<u8> {
+    let mut mask = vec![32u8; w * h];
+    if mode == II_DC_PRED || w == 0 || h == 0 {
+        return mask;
+    }
+    let size_scale = 128 / w.max(h);
+    for i in 0..h {
+        for j in 0..w {
+            let idx = match mode {
+                II_V_PRED => i * size_scale,
+                II_H_PRED => j * size_scale,
+                II_SMOOTH_PRED => i.min(j) * size_scale,
+                _ => 0,
+            };
+            mask[i * w + j] = II_WEIGHTS_1D[idx.min(II_WEIGHTS_1D.len() - 1)];
+        }
+    }
+    mask
+}
+
+/// `mask_blend()` (§7.13.3.30) for an inter-intra block: blends the saved
+/// intra prediction `intra` with the inter prediction already in `dst`.
+pub fn blend_interintra<BD: BitDepth>(
+    bd: BD,
+    dst: &mut [BD::Pixel],
+    dst_off: usize,
+    dst_stride: usize,
+    intra: &[BD::Pixel],
+    mask: &[u8],
+    w: usize,
+    h: usize,
+) {
+    for y in 0..h {
+        for x in 0..w {
+            let m = mask[y * w + x] as i32;
+            let pred0 = intra[y * w + x].to_i32();
+            let pred1 = dst[dst_off + y * dst_stride + x].to_i32();
+            let v = (m * pred0 + (64 - m) * pred1 + 32) >> 6;
+            dst[dst_off + y * dst_stride + x] = bd.clip_pixel(v);
+        }
+    }
+}

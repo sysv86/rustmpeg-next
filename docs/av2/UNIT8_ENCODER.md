@@ -86,7 +86,12 @@ python3 $WORK/cmpy4m.py REC.y4m DAV.y4m
 `cmpy4m.py` compares the frame payload bytes only (`C420jpeg` vs `C420`
 header spelling differs; samples are identical).
 
-Result: **17/17 cases byte-exact, encoder rc=0, dav2d rc=0**:
+Result with the current tree: `INTERINTRA` + `WARP_NEWMV` (`DELTAWARP`) are
+byte-exact for 64x64 and 256x192 I420 at QP 20/100/140 (3 frames), plus 10-bit
+and 12-bit 256x192 QP100 (`interintra_blocks` 5-22 per run; 0 on the 64x64
+zoom clip). Every case is `encoder recon == our decoder == dav2d`, all motion
+mode bits enabled, encoder/dav2d rc 0. The earlier 17-case matrix below was
+run before `INTERINTRA` was enabled and remains reproducible:
 
 | Case | QP | Warp | OBMC flag | Result |
 | :-- | :-- | :-- | :-- | :-- |
@@ -125,12 +130,28 @@ identity, and motion-vector derivation.
 
 ## Deliberate limits and remaining risks
 
-- **Warp is now emitted.** The decoder/selection half (see
-  `UNIT8_DECODER.md`) switched `NEARMV` to the real DRL predictor, uses
-  `GLOBALMV` for non-warp blocks while warped motion is on, and adds a
-  `WARP_NEWMV` four-parameter rotation/scale model estimated from four
-  half-block MVs by least squares. Warp-on streams now contain nonzero
-  `is_warp` blocks and are byte-exact against dav2d.
+- **Warp is emitted as `WARP_NEWMV` + `DELTAWARP`.** The decoder/selection
+  half (see `UNIT8_DECODER.md`) uses the real DRL predictor, `GLOBALMV` for
+  non-warp blocks while warped motion is on, and a four-parameter
+  rotation/scale model estimated from four half-block MVs by least squares.
+  Warp-on streams contain nonzero `is_warp` blocks and are byte-exact against
+  dav2d.
+- **`INTERINTRA` is emitted.** For single-reference non-warp blocks the encoder
+  evaluates all four `interintra_mode` values, blends them with the inter
+  prediction using the §7.13.3.29 mask, and signals `inter_intra`/
+  `interintra_mode`/`wedge_inter_intra` in dav2d order. Verified byte-exact.
+- **`WARPMV` is emitted** from `WarpParamStack` (§5.20.7.6): the model is
+  reduced, translated with `get_warp_motion_vector`, and selected when its
+  warped SAD beats the translation prediction after rate. It is byte-exact
+  against dav2d on the recorded matrix (counts 3-9 on 256x192; 0 on the
+  64x64 zoom clip).
+- **`LOCALWARP`/`EXTENDWARP` encoder emission remains blocked.** The decoder
+  parses and predicts them, but the encoder's `find_mv_stack`/`WarpParamStack`
+  is the reduced in-tree approximation; once strongly affine neighbours exist
+  it does not reproduce dav2d's `RefStackMv`/bank candidates, so the coded MVD
+  (and hence the derived local/extend model) can diverge. Those selections are
+  therefore not emitted. The same reduced stack is a residual risk for
+  `WARPMV` on strongly affine content outside the recorded matrix.
 - **`WARP_NEWMV` explicit warp-delta coding is emitted** for the four-parameter
   model (`warp_delta_precision` 1, `params[4] = -params[3]`,
   `params[5] = params[2]`). Six-parameter deltas are parsed by the decoder but
