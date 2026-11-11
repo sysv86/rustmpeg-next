@@ -191,7 +191,11 @@ commands are in [`docs/AV2-RELEASE.md`](docs/AV2-RELEASE.md).
     implemented and verified;
   - sub-pixel and global IntraBC are rejected; the encoder emits at most one
     IntraBC block per frame;
-  - the decoder still uses a reduced DRL/`find_mv_stack` approximation;
+  - the encoder and decoder both use the full AV2 §7.12.2 `find_mv_stack`
+    (single/compound, derived and reference-bank candidates, sorting,
+    `WarpParamStack`, per-4x4 `Mvs`/`SubMvs`); the encoder emits `LOCALWARP`
+    and `EXTENDWARP` and the recorded warp/newmv matrix is byte-exact except
+    one out-of-matrix content case;
   - AVM inter frames differ from `dav2d` even with loop filters disabled; AVM
     4:2:2/4:4:4 and 10/12-bit streams are rejected by `dav2d` sequence headers.
     The multi-frame AVM key frame also carries the unrelated 1-LSB intra

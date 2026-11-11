@@ -179,3 +179,145 @@ identity, and motion-vector derivation.
   match the existing AV2/dav2d provenance.
 
 Nothing was committed.
+
+---
+
+## 2026-11-11 update — normative `find_mv_stack` and full warp modes
+
+This update replaces the reduced in-tree motion-vector stack with the full
+AV2 v1.0.0 §7.12.2 process and re-enables encoder emission of `LOCALWARP` and
+`EXTENDWARP`. The previous "blocked" statement in this report is superseded.
+
+### What changed
+
+- `av2/inter.rs` now implements the complete `find_mv_stack( isCompound )`:
+  - `RefStackMv[ idx ][ list ]`, `RefStackCwp`, `WeightStack`,
+    `RefStackRowOffset`, `RefStackColOffset`, `NumMvFound`, and a
+    `RefStackRefFrame` pair per candidate;
+  - the ordered spatial scan (§7.12.2.6), the scan-col process (§7.12.2.5) with
+    the `MiColBase` comparison, the `MAX_PR_NUM = 16` prune counter, the
+    §7.12.2.19 sorting for `DrlReorder = ALWAYS/CONSTRAINT`, and the
+    `max_drl_bits_minus_1 + 2` truncation of §7.12.2.21/.22;
+  - `single add derived` (§7.12.2.16) and `compound add derived`
+    (§7.12.2.14) with `FrameDistance` projection, `DerivedStackMv`,
+    `SingleRefFrame` / `SingleMv`, `MAX_DR_STACK_SIZE = 4` and
+    `MAX_DR_PR_NUM = 2`;
+  - `fill mvp from derived smvp` (single and compound) and
+    `fill mvp from ref mv bank` with a full `RefMvBank` (§7.12.3) and the
+    `RefMvBankHits` / `RefMvUnitHits` / `RefMvRemainHits` limits;
+  - the extra search (§7.12.2.20) with the global candidate, the `>32x32`
+    mixtures, and the warp-bank / global / default `WarpParamStack` tail;
+  - the clamping process (§7.12.2.23).
+- `WarpParamStack` is now built inside the same process: `generate points from
+  corners` (§7.12.2.3–4) for iteration 0 and 1, the per-scan-point
+  `add warp motion vector` (§7.12.2.9), and the §7.12.2.20 bank candidates.
+  The previous standalone `build_warp_param_stack()` path is gone.
+- The per-4x4 map stores both `Mvs` (block vector) and `SubMvs` (per-8x8
+  projected vector for a warped block, §7.13.3.19), `CwpIdxs`, `MotionModes`,
+  `WarpParams`, and the block origin/geometry. `Mvs` feeds `find_warp_samples`;
+  `SubMvs` feeds `get_mv` / the corner scan.
+- The warp and reference-MV banks are reset at every superblock row, matching
+  the reference decoder (`dav2d_refmvs_tile_sbrow_init`); a per-frame bank
+  produced different candidates and was the cause of the last observed
+  `WARPMV` divergence. The `MAX_WARP_SB_HITS = 64` bank-update limit is applied.
+- `WARPMV` derives `BlockMvs[0]` from the **raw** stack entry (§7.12.2.2) and
+  only reduces the prediction model.
+- The encoder no longer forces non-warp blocks to `GLOBALMV` when warped motion
+  is enabled; `NEARMV`/`NEWMV` use the normative predictor.
+- Encoder emission of `LOCALWARP` and `EXTENDWARP`:
+  - `LOCALWARP` runs `find_warp_samples` + `warp_estimation` (§7.13.3.23);
+  - `EXTENDWARP` runs `extend_warp_estimation` (§7.13.3.24), using the
+    `ExtendDeltaRow/Col` scan when the stack offsets are valid;
+  - `DELTAWARP` keeps the four-parameter least-squares fit, now coded as a
+    delta on `WarpParamStack[0]`;
+  - `is_warp`, `warp_mv`, `use_extend_warp`, `use_local_warp`, `warp_idx`,
+    `warpmv_with_mvd`, the DRL index, the MV residual and the warp delta are
+    emitted in §5.20.7.6 order;
+  - the coded MV residual is snapped onto the MVD lattice
+    (`snap_mv_to_precision`), so the reconstructed MV always equals the vector
+    used for model estimation.
+- `WARP_NEWMV` + `DELTAWARP` is always evaluated; `LOCALWARP`/`EXTENDWARP` are
+  evaluated only when `WarpSampleFound[0]` is set (`has_cs_ext`), matching
+  §5.20.7.14.
+- Removed the reduced `build_drl_candidates()` ranking and the unused
+  `select_best_inter_mode()` helper.
+
+### Verification (2026-11-11)
+
+Environment unchanged: `dav2d` revision `bff8e5c`
+(`/home/nitroarch/avm-bench/bin/dav2d`), one thread, `--threads 1
+--framedelay 1 --strict 1 -q`. Encoder invocation (all positional):
+
+```bash
+av2_encode OUT.ivf 3 W H QP 0 0 0 420 0 0 0 0 1 1 0 8 0 0 REC.y4m 0 1 0 IN.y4m
+```
+
+i.e. `newmv = 1`, `switchable = 1`, `warped_motion = 1`. Every case compares
+`encoder reconstruction == our decoder == dav2d` on all three frames.
+
+| Input | Size | QP | Warped | `LOCALWARP` | `EXTENDWARP` | Result |
+| :-- | :-- | --: | --: | --: | --: | :-- |
+| `u8/zoom.y4m` | 256x192 8-bit | 20 | 14 | 3 | 2 | exact |
+| `u8/zoom.y4m` | 256x192 8-bit | 100 | 6 | 0 | 0 | exact |
+| `u8/zoom.y4m` | 256x192 8-bit | 140 | 0 | 0 | 0 | exact |
+| synthetic affine | 256x192 8-bit | 20 | 48 | 2 | 1 | exact |
+| synthetic affine | 256x192 8-bit | 100 | 15 | 0 | 1 | exact |
+| synthetic affine | 256x192 8-bit | 140 | 23 | 0 | 0 | exact |
+| `u13/matrix/zoom_256x192_8.y4m` | 256x192 8-bit | 100 | 9 | 0 | 0 | exact |
+| `u13/matrix/zoom_256x192_8.y4m` | 256x192 8-bit | 140 | 14 | 2 | 0 | exact |
+| `u13/matrix/zoom_256x192_8.y4m` | 256x192 8-bit | 20 | 19 | 3 | 3 | **frame 1 differs** |
+| `u8/zoom64.y4m` | 64x64 8-bit | 20/100/140 | 1/1/0 | 0 | 0 | exact |
+| `u13/matrix/zoom_64x64_8.y4m` | 64x64 8-bit | 20/100/140 | 0/1/0 | 0 | 0 | exact |
+| `u8/zoom10.y4m` | 256x192 10-bit | 100 | 0 | 0 | 0 | exact |
+| `u8/zoom64_10.y4m` | 64x64 10-bit | 100 | 1 | 0 | 0 | exact |
+| `u13/matrix/zoom_64x64_12.y4m` | 64x64 12-bit | 100 | 1 | 0 | 0 | exact |
+| `u13/matrix/zoom_64x64_422.y4m` | 64x64 4:2:2 | 100 | 1 | 0 | 0 | exact |
+| `u13/matrix/zoom_64x64_444.y4m` | 64x64 4:4:4 | 100 | 1 | 0 | 0 | exact |
+
+Counts are summed over the three frames. The synthetic affine clip is a
+rotating 3-frame pattern with a 3% per-frame scale step; it is generated by a
+local script, not shipped in the tree.
+
+Only the `u13` 256x192 QP 20 case still differs, on frame 1: the differing
+region is the right half (x >= 128) and chroma matches exactly. `dav2d` and our
+decoder agree with each other and differ from the encoder reconstruction there,
+so the encoder's coded `LOCALWARP`/`EXTENDWARP` models for a group of blocks do
+not match the oracle's derivation on this clip. This case is outside the
+recorded matrix; the same clip is exact at QP 100/140 and at every other
+recorded resolution/bit depth.
+
+Regression baselines with the tools off:
+
+```text
+python3 check_av2.py quick   -> 9/9 OK
+python3 check_av2.py full    -> 84/84 OK
+```
+
+### AVM inter stream
+
+`avmenc` commit `e0e3aa8` with the recorded 87-flag tool set plus
+`--enable-warped-motion=1 --enable-warp-delta=1` encodes a 3-frame 256x192
+stream (`--ivf --limit=3 --cpu-used=9 --threads=1 --end-usage=cbr
+--target-bitrate=300 --min-qp=100 --max-qp=200 --aq-mode=3`, all other
+`enable-*` tools off as listed in `UNIT8_DECODER.md`). `dav2d` decodes all
+three frames (rc 0). Our decoder still stops on the first inter frame with
+`BitstreamError("chroma intra mode index out of range")`: the chroma intra mode
+index is outside the AV2 enumeration, an unrelated unit-8-independent syntax
+gap. The AVM inter stream is therefore recorded as blocked, not as a pass.
+
+### Residual limits
+
+- One out-of-matrix `LOCALWARP`/`EXTENDWARP` content case (above) is not
+  byte-exact.
+- The temporal motion-field scan (§7.12.2.7) is not implemented because it
+  consumes the TIP motion field (§7.10). `use_ref_frame_mvs` is 0 in every
+  stream this codec writes, and the decoder rejects a stream that signals it,
+  so the process is unreachable; `find_mv_stack` asserts this in debug builds.
+- TIP prediction and IntraBC keep their own paths (IntraBC uses the
+  `add_to_ref_bv` BVP stack of §7.12.2.20).
+- Global motion is not signalled; `GmType` is `IDENTITY` for every reference,
+  so the `GlobalMvs` branches of §7.12.2.1/.14 are unreachable and the identity
+  model is used.
+- Encoder warp RDO requires a single-tile frame and a luma/chroma block of at
+  least 8x8 samples.
+- Six-parameter warp deltas are parsed by the decoder but not emitted.

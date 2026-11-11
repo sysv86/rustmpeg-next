@@ -44,7 +44,7 @@ use crate::av2::headers::{
     AdaptiveBoolean, FilterMode, FrameHeader, MAX_SEGMENTS, PixelLayout, SequenceHeader, TxfmMode,
 };
 use crate::av2::inter::{
-    CompoundMiInfo, find_compound_mv_stack, find_mv_stack, scale_projected_mv,
+    MAX_RMB_SB_HITS, MvStackParams, RefMvBank, RefMvBankHits, find_mv_stack, scale_projected_mv,
 };
 use crate::av2::intops::iclip;
 use crate::av2::ipred::{
@@ -75,11 +75,11 @@ use crate::av2::tables::{
 };
 use crate::av2::transform::inv_txfm_add;
 use crate::av2::warp::{
-    DEFAULT_WARP_PARAMS, MAX_WARP_REF_CANDIDATES, MV_BORDER, MV_LOW, MV_UPP, WARPEDMODEL_PREC_BITS,
-    WarpMiInfo, block_warp, build_warp_param_stack, extend_warp_params, find_warp_samples,
-    generate_points_from_corners, get_warp_translation, reduce_warp_model, round2_signed,
-    setup_shear, warp_bank_insert, warp_estimation, warp_has_ref_neighbour, warp_local_context,
-    warp_mode_context, warp_motion_vector, warp_mv_at,
+    DEFAULT_WARP_PARAMS, MAX_WARP_REF_CANDIDATES, MAX_WARP_SB_HITS, MV_BORDER, MV_LOW, MV_UPP,
+    WARPEDMODEL_PREC_BITS, WarpMiInfo, block_warp, extend_warp_params, find_warp_samples,
+    get_warp_translation, reduce_warp_model, round2_signed, setup_shear, warp_bank_insert,
+    warp_estimation, warp_has_ref_neighbour, warp_local_context, warp_mode_context,
+    warp_motion_vector, warp_mv_at, warp_sub_mv,
 };
 use crate::av2::wedge::{
     WEDGE_ANGLE_DIST_TO_IDX, WEDGE_TABLES, compute_diff_wtd_mask_intermediate,
@@ -445,9 +445,14 @@ pub fn decode_frame<BD: BitDepth>(
             lr_cols,
             lr_rows,
             warp_mi: vec![WarpMiInfo::default(); f_bw4 * f_bh4],
-            comp_mi: vec![CompoundMiInfo::default(); f_bw4 * f_bh4],
-            ref_mi_scratch: vec![WarpMiInfo::default(); f_bw4 * f_bh4],
             warp_bank: (0..8).map(|_| Vec::with_capacity(4)).collect(),
+            warp_bank_hits: 0,
+            refmv_bank: RefMvBank::default(),
+            refmv_hits: RefMvBankHits::default(),
+            block_inter: false,
+            block_refs: [-1, -1],
+            block_mvs: [MvXY::default(); 2],
+            block_cwp: 8,
             warped_blocks: 0,
             palette_sizes: &mut palette_sizes,
             palette_colors: &mut palette_colors,
@@ -691,18 +696,26 @@ struct TileDecoder<'a, BD: BitDepth> {
     lr_types: &'a mut [Vec<u8>; 3],
     lr_cols: [usize; 3],
     lr_rows: [usize; 3],
-    /// Per-4x4 mode map used by `generate_points_from_corners` (§7.12.2.3).
+    /// Per-4x4 candidate map for `find_mv_stack` (§7.12.2).
     warp_mi: Vec<WarpMiInfo>,
-    /// Per-4x4 neighbour mode information for the compound `find_mv_stack`
-    /// branch (both reference lists, §7.12.2.13 / §7.12.2.14).
-    comp_mi: Vec<CompoundMiInfo>,
-    /// Scratch map used to evaluate the single-reference stack of a compound
-    /// block for one list (§7.12.2.10 `candList`).
-    ref_mi_scratch: Vec<WarpMiInfo>,
     /// Per-reference warp parameter bank (§7.12.3 `update_warp_param_bank`).
     warp_bank: Vec<Vec<[i32; 6]>>,
+    /// `RefMvBankParams` (§7.12.3), indexed by `get_rmb_list_index()`.
+    refmv_bank: RefMvBank,
+    /// `RefMvBankHits` / `RefMvUnitHits` / `RefMvRemainHits` (§7.12.3).
+    refmv_hits: RefMvBankHits,
+    /// Decoded mode of the current leaf, for `update_ref_mv_bank()`.
+    block_inter: bool,
+    /// `RefFrame[]` of the current leaf.
+    block_refs: [i8; 2],
+    /// `BlockMvs[]` of the current leaf.
+    block_mvs: [MvXY; 2],
+    /// `CwpIdx` of the current leaf.
+    block_cwp: u8,
     /// Number of `WARPMV` / `WARP_NEWMV` blocks decoded for this tile.
     warped_blocks: usize,
+    /// `WarpBankHits` for the current superblock row.
+    warp_bank_hits: usize,
     /// `PaletteSizes[MiRow][MiCol]` (§5.20.8.1 `get_palette_cache`).
     palette_sizes: &'a mut [u8],
     /// `PaletteColors[MiRow][MiCol]` (§5.20.8.1 `get_palette_cache`).
@@ -985,6 +998,16 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         while by4 < self.tile_row_end4 {
             reset_context(&mut self.l_ctx, self.fh.is_key_or_intra(), false);
             self.seg_pred_l = [0u8; 32];
+            // The reference decoder clears the warp and reference-MV banks at
+            // the start of every superblock row
+            // (`dav2d_refmvs_tile_sbrow_init`), so the encoder and decoder
+            // derive the same bank candidates from the same stream.
+            self.warp_bank_hits = 0;
+            for bank in self.warp_bank.iter_mut() {
+                bank.clear();
+            }
+            self.refmv_bank.clear();
+            self.refmv_hits = RefMvBankHits::default();
             let mut bx4 = self.tile_col_start4;
             while bx4 < self.tile_col_end4 {
                 self.decode_lr(bx4, by4)?;
@@ -1235,6 +1258,17 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
     }
 
     fn decode_leaf(&mut self, bs: BlockSize, bx4: usize, by4: usize) -> Result<()> {
+        let b_dim = BLOCK_DIMENSIONS[bs as usize];
+        let (bw4, bh4) = (b_dim[0] as usize, b_dim[1] as usize);
+        let end = bx4 < self.tile_col_end4 && by4 < self.tile_row_end4;
+        self.decode_leaf_inner(bs, bx4, by4)?;
+        if end {
+            self.note_refmv_bank(bw4, bh4, bx4, by4);
+        }
+        Ok(())
+    }
+
+    fn decode_leaf_inner(&mut self, bs: BlockSize, bx4: usize, by4: usize) -> Result<()> {
         if bx4 >= self.tile_col_end4 || by4 >= self.tile_row_end4 {
             return Ok(());
         }
@@ -2625,31 +2659,16 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             }
 
             // Normative `find_mv_stack` (AV2 Spec v1.0.0 §7.12.2) over the
-            // per-4x4 mode map, matching the encoder's single-reference stack
-            // (`use_ref_frame_mvs = 0`, no reference MV bank, no TIP).
-            let cands = find_mv_stack(
-                &self.warp_mi,
-                self.frame_mi_h,
-                self.frame_mi_w,
-                self.sb_step4,
-                self.tile_row_start4,
-                self.tile_row_end4,
-                self.tile_col_start4,
-                self.tile_col_end4,
-                by4,
-                bx4,
-                bw4,
-                bh4,
-                ref_idx as i8,
-            );
+            // per-4x4 candidate map.
+            let cands = self.mv_stack(bx4, by4, bw4, bh4, [ref_idx as i8, -1]);
             let pred_mv = cands.get(drl_idx);
 
             let mut warp_model: Option<([i32; 6], [i32; 4])> = None;
             let mv;
             let flt;
             if is_warp {
-                let stack = self.warp_param_stack(ref_idx, bx4, by4, bw4, bh4);
-                let params = stack[ref_warp_idx.min(MAX_WARP_REF_CANDIDATES - 1)];
+                let stack = &cands;
+                let params = stack.warp[ref_warp_idx.min(MAX_WARP_REF_CANDIDATES - 1)];
                 let block_mv = {
                     let mut m = if warp_mv {
                         self.warp_mv_precision(&params, bw4, bh4, bx4, by4, !warpmv_with_mvd)
@@ -2926,8 +2945,13 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     }
                 }
                 self.warped_blocks += 1;
-                let bank_pos = ref_idx.min(self.warp_bank.len() - 1);
-                warp_bank_insert(&mut self.warp_bank[bank_pos], &matrix);
+                // `dav2d_refmvs_warp_add` stops updating the bank after
+                // `MAX_WARP_SB_HITS` calls in the superblock row (§7.3).
+                if self.warp_bank_hits < MAX_WARP_SB_HITS as usize {
+                    self.warp_bank_hits += 1;
+                    let bank_pos = ref_idx.min(self.warp_bank.len() - 1);
+                    warp_bank_insert(&mut self.warp_bank[bank_pos], &matrix);
+                }
             } else {
                 let mv_y_q16 = mv.y as i32 * 2;
                 let mv_x_q16 = mv.x as i32 * 2;
@@ -3148,102 +3172,12 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             // every other compound mode uses the compound stack and
             // `RefStackMv[RefMvIdx]` for both lists.
             let (pred_mv0, pred_mv1) = if compound_mode <= 19 {
-                // `candList` 0..1 of §7.12.2.10: a compound neighbour also
-                // contributes its second-list MV to the stack of that list.
-                let mut ref_mi = core::mem::take(&mut self.ref_mi_scratch);
-                for (dst, cand) in ref_mi.iter_mut().zip(self.comp_mi.iter()) {
-                    let list = if cand.refs[0] == comp_ref0 as i8 {
-                        0
-                    } else if cand.refs[1] == comp_ref0 as i8 {
-                        1
-                    } else {
-                        -1
-                    };
-                    *dst = WarpMiInfo {
-                        origin_x4: cand.origin_x4,
-                        written: true,
-                        inter: cand.inter,
-                        ref0: if list >= 0 { comp_ref0 as i8 } else { -1 },
-                        mv: if list >= 0 {
-                            cand.mvs[list as usize]
-                        } else {
-                            MvXY::default()
-                        },
-                        ..WarpMiInfo::default()
-                    };
-                }
-                let s0 = find_mv_stack(
-                    &ref_mi,
-                    self.frame_mi_h,
-                    self.frame_mi_w,
-                    self.sb_step4,
-                    self.tile_row_start4,
-                    self.tile_row_end4,
-                    self.tile_col_start4,
-                    self.tile_col_end4,
-                    by4,
-                    bx4,
-                    bw4,
-                    bh4,
-                    comp_ref0 as i8,
-                );
-                for (dst, cand) in ref_mi.iter_mut().zip(self.comp_mi.iter()) {
-                    let list = if cand.refs[0] == comp_ref1 as i8 {
-                        0
-                    } else if cand.refs[1] == comp_ref1 as i8 {
-                        1
-                    } else {
-                        -1
-                    };
-                    *dst = WarpMiInfo {
-                        origin_x4: cand.origin_x4,
-                        written: true,
-                        inter: cand.inter,
-                        ref0: if list >= 0 { comp_ref1 as i8 } else { -1 },
-                        mv: if list >= 0 {
-                            cand.mvs[list as usize]
-                        } else {
-                            MvXY::default()
-                        },
-                        ..WarpMiInfo::default()
-                    };
-                }
-                let s1 = find_mv_stack(
-                    &ref_mi,
-                    self.frame_mi_h,
-                    self.frame_mi_w,
-                    self.sb_step4,
-                    self.tile_row_start4,
-                    self.tile_row_end4,
-                    self.tile_col_start4,
-                    self.tile_col_end4,
-                    by4,
-                    bx4,
-                    bw4,
-                    bh4,
-                    comp_ref1 as i8,
-                );
-                self.ref_mi_scratch = ref_mi;
+                let s0 = self.mv_stack(bx4, by4, bw4, bh4, [comp_ref0 as i8, -1]);
+                let s1 = self.mv_stack(bx4, by4, bw4, bh4, [comp_ref1 as i8, -1]);
                 (s0.get(drl_idx[0]), s1.get(drl_idx[1]))
             } else {
-                let stack = find_compound_mv_stack(
-                    &self.comp_mi,
-                    self.frame_mi_h,
-                    self.frame_mi_w,
-                    self.sb_step4,
-                    self.tile_row_start4,
-                    self.tile_row_end4,
-                    self.tile_col_start4,
-                    self.tile_col_end4,
-                    by4,
-                    bx4,
-                    bw4,
-                    bh4,
-                    comp_ref0 as i8,
-                    comp_ref1 as i8,
-                    self.fh.max_drl_bits.max(1) as usize,
-                );
-                let pair = stack.get(drl_idx[0]);
+                let stack = self.mv_stack(bx4, by4, bw4, bh4, [comp_ref0 as i8, comp_ref1 as i8]);
+                let pair = stack.get_pair(drl_idx[0]);
                 (pair[0], pair[1])
             };
 
@@ -4166,16 +4100,33 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     break;
                 }
                 self.warp_mi[row * self.frame_mi_w + col] = info;
-                self.comp_mi[row * self.frame_mi_w + col] = CompoundMiInfo {
-                    origin_x4: bx4 as u16,
-                    ..CompoundMiInfo::default()
-                };
             }
+        }
+        self.block_inter = false;
+        self.block_refs = [-1, -1];
+        self.block_mvs = [MvXY::default(); 2];
+        self.block_cwp = 8;
+    }
+
+    /// `update_ref_mv_bank(..., fromWithinSb = 1)` / `update_ref_mv_count()`
+    /// for the leaf that was just decoded (§7.12.3).
+    fn note_refmv_bank(&mut self, bw4: usize, bh4: usize, bx4: usize, by4: usize) {
+        if !self.seq.refmv_bank || self.refmv_hits.bank_hits >= MAX_RMB_SB_HITS {
+            return;
+        }
+        let sb4 = self.sb_step4.max(1);
+        if self.block_inter {
+            if self.refmv_hits.allow_update(bw4, bh4, by4, bx4, sb4) {
+                self.refmv_bank
+                    .update(self.block_refs, self.block_mvs, self.block_cwp);
+            }
+        } else {
+            self.refmv_hits.update_count(bw4, bh4, by4, bx4, sb4);
         }
     }
 
-    /// Records the decoded inter mode for `generate_points_from_corners` and the
-    /// compound `find_mv_stack` branch (§7.12.2.3 / §7.12.2.10).
+    /// Records the decoded inter mode for the `find_mv_stack` candidate map
+    /// (§7.12.2.3 / §7.12.2.10).
     fn mark_mi_inter(
         &mut self,
         bs: BlockSize,
@@ -4198,13 +4149,11 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         info.mv1 = mvs[1];
         info.motion_mode = motion_mode;
         info.warp = warp;
-        let comp_info = CompoundMiInfo {
-            origin_x4: bx4 as u16,
-            inter: true,
-            refs,
-            mvs,
-            cwp,
-        };
+        info.cwp = cwp;
+        self.block_inter = true;
+        self.block_refs = refs;
+        self.block_mvs = mvs;
+        self.block_cwp = cwp;
         for y in 0..bh4 {
             let row = by4 + y;
             if row >= self.frame_mi_h {
@@ -4215,8 +4164,15 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 if col >= self.frame_mi_w {
                     break;
                 }
+                // `SubMvs` (§7.13.3.19): the projected vector of each 8x8
+                // section for a warped block, the block vector otherwise.
+                if motion_mode >= 2 {
+                    info.sub_mv = warp_sub_mv(&warp, bx4, by4, x, y);
+                } else {
+                    info.sub_mv = mvs[0];
+                }
+                info.sub_mv1 = mvs[1];
                 self.warp_mi[row * self.frame_mi_w + col] = info;
-                self.comp_mi[row * self.frame_mi_w + col] = comp_info;
             }
         }
     }
@@ -4261,45 +4217,42 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         count.min(4)
     }
 
-    /// Builds the `WarpParamStack` for the current block (§7.12.2): corner
-    /// candidate, warp bank, global motion (identity), then defaults.
-    fn warp_param_stack(
+    /// Runs the normative `find_mv_stack` for the current block (§7.12.2).
+    #[allow(clippy::too_many_arguments)]
+    fn mv_stack(
         &self,
-        ref_idx: usize,
         bx4: usize,
         by4: usize,
         bw4: usize,
         bh4: usize,
-    ) -> [[i32; 6]; 4] {
-        let sb = self.sb_step4.max(1);
-        let mut corner = generate_points_from_corners(
-            &self.warp_mi,
-            self.frame_mi_w,
-            self.frame_mi_h,
-            by4,
-            bx4,
+        refs: [i8; 2],
+    ) -> crate::av2::inter::RefMvStack {
+        let is_compound = refs[1] >= 0;
+        let derive_wrl = !is_compound && refs[0] >= 0 && bw4 * 4 >= 8 && bh4 * 4 >= 8;
+        find_mv_stack(&MvStackParams {
+            map: &self.warp_mi,
+            mi_rows: self.frame_mi_h,
+            mi_cols: self.frame_mi_w,
+            sb_h4: self.sb_step4.max(1),
+            tile_row_start4: self.tile_row_start4,
+            tile_row_end4: self.tile_row_end4,
+            tile_col_start4: self.tile_col_start4,
+            tile_col_end4: self.tile_col_end4,
+            mi_row: by4,
+            mi_col: bx4,
             bw4,
             bh4,
-            sb,
-            sb,
-            0,
-        );
-        if corner.is_none() && bw4 <= 16 {
-            corner = generate_points_from_corners(
-                &self.warp_mi,
-                self.frame_mi_w,
-                self.frame_mi_h,
-                by4,
-                bx4,
-                bw4,
-                bh4,
-                sb,
-                sb,
-                1,
-            );
-        }
-        let bank = &self.warp_bank[ref_idx.min(self.warp_bank.len() - 1)];
-        build_warp_param_stack(corner, bank, &DEFAULT_WARP_PARAMS)
+            refs,
+            is_compound,
+            derive_wrl,
+            use_ref_frame_mvs: self.fh.use_ref_frame_mvs != 0,
+            drl_reorder: self.seq.drl_reorder,
+            enable_refmvbank: self.seq.refmv_bank,
+            max_drl_bits: self.fh.max_drl_bits.max(1) as usize,
+            frame_distance: &self.refdist,
+            warp_bank: &self.warp_bank,
+            refmv_bank: self.seq.refmv_bank.then_some(&self.refmv_bank),
+        })
     }
 
     /// `get_warp_motion_vector` (§7.12.2.2) for an arbitrary precision; only

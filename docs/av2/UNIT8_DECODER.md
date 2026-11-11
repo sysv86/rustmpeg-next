@@ -216,3 +216,46 @@ $ORACLE/vvc-conf/run_conformance.sh                -> 25/25 cases green
 
 No `unsafe`, no new dependency, no native build step, and no third-party code
 was added. Nothing was committed.
+
+---
+
+## 2026-11-11 update — full §7.12.2 stack and warp-bank semantics
+
+The decoder half now shares the complete `find_mv_stack` with the encoder
+(`av2::inter::find_mv_stack`), so both sides build identical `RefStackMv`,
+`RefStackCwp`, `WeightStack`, `WarpParamStack`, and stack offsets.
+
+Changes in `dec/frame.rs`:
+
+- The single-reference, `has_second_drl`, and compound paths all call the same
+  `mv_stack()` helper; the temporary remapped single-ref maps used for
+  `NEAR_NEARMV`/`NEAR_NEWMV` and the separate `find_compound_mv_stack` /
+  `CompoundMiInfo` map are gone.
+- `mark_mi_inter` stores `Mvs`, `SubMvs` (per-8x8 projected vectors for
+  `motion_mode >= LOCALWARP`, §7.13.3.19), `CwpIdxs`, `MotionModes`, and
+  `WarpParams`; `find_warp_samples` reads `Mvs`, the DRL/corner scans read
+  `SubMvs`.
+- The warp and reference-MV banks are cleared at the start of every superblock
+  row, as the reference decoder does (`dav2d_refmvs_tile_sbrow_init`), and the
+  warp bank update stops after `MAX_WARP_SB_HITS = 64`. Without the per-row
+  reset the decoder built extra `WarpParamStack` candidates and diverged from
+  `dav2d` on `WARPMV` blocks in the second and later superblock rows.
+- `extend_warp_estimation` (§7.13.3.24) uses the stack offsets only when either
+  is `-1`; otherwise it uses the `ExtendDeltaRow/Col` first-match scan over the
+  §7.11.4 points, which is what the reference decoder does.
+- `WARPMV` projects `BlockMvs[0]` from the raw `WarpParamStack` entry
+  (§7.12.2.2) before reducing the prediction matrix.
+- The MV residual is decoded at `3 + FrameMvPrecision` and the reconstructed
+  vector is the one passed to `warp_estimation` / `extend_warp_estimation`.
+
+Verification: the same 21-case warp/newmv/switchable matrix recorded in
+[`UNIT8_ENCODER.md`](UNIT8_ENCODER.md) (2026-11-11 section) compares
+`encoder reconstruction == our decoder == dav2d`. 20 of 21 cases are exact,
+including `LOCALWARP` and `EXTENDWARP` blocks (`3` local and `2` extend on
+`u8/zoom.y4m` 256x192 QP 20); the `u13` 256x192 QP 20 case still differs on
+frame 1 as documented there. `check_av2.py quick` is 9/9 and `full` is 84/84,
+and `cargo test --workspace` passes.
+
+AVM inter streams remain blocked before the inter frames: our decoder stops
+with `BitstreamError("chroma intra mode index out of range")` (see the encoder
+report for the exact `avmenc` flags; `dav2d` decodes the same stream, rc 0).

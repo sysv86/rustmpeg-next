@@ -49,7 +49,7 @@ use crate::av2::headers::{
     AdaptiveBoolean, FilterMode, FrameHeader, FrameType, MAX_SEGMENTS, NUM_REF_FRAMES, ObuType,
     PRIMARY_REF_NONE, PixelLayout, RestorationType, SEG_LVL_GLOBALMV, SEG_LVL_SKIP, SequenceHeader,
 };
-use crate::av2::inter::{CompoundMiInfo, find_compound_mv_stack, find_mv_stack};
+use crate::av2::inter::{MAX_RMB_SB_HITS, MvStackParams, RefMvBank, RefMvBankHits, find_mv_stack};
 use crate::av2::intops::ulog2;
 use crate::av2::ipred::{
     blend_interintra, compute_sad, compute_sse, interintra_intra_mode, interintra_mask,
@@ -95,9 +95,9 @@ use crate::av2::txpart::{
 };
 use crate::av2::warp::{
     DEFAULT_WARP_PARAMS, MAX_WARP_SB_HITS, WARP_DELTA_NUM_SYMBOLS_LOW, WarpMiInfo, block_warp,
-    build_warp_param_stack, generate_points_from_corners, get_warp_translation, reduce_warp_model,
-    setup_shear, warp_bank_insert, warp_has_ref_neighbour, warp_local_context, warp_mode_context,
-    warp_motion_vector, warp_mv_at,
+    extend_warp_params, find_warp_samples, get_warp_translation, reduce_warp_model, setup_shear,
+    warp_bank_insert, warp_estimation, warp_has_ref_neighbour, warp_local_context,
+    warp_mode_context, warp_motion_vector, warp_mv_at, warp_sub_mv,
 };
 use crate::av2::wedge::{
     WEDGE_ANGLE_DIST_TO_IDX, WEDGE_IDX_TO_ANGLE_DIST, WEDGE_TABLES, WEDGE_TYPES,
@@ -827,17 +827,27 @@ struct TileEncodeState<'a, BD: BitDepth> {
     lambda_sad: u64,
     lambda_rdoq: u64,
     /// Per-reference warp parameter bank (AV2 Spec v1.0.0 §7.12.3
-    /// `update_warp_param_bank`), most recent entry first. The encoder only
-    /// signals `RefWarpIdx == 0`, so only list 0 is tracked.
-    warp_bank: Vec<[i32; 6]>,
+    /// `update_warp_param_bank`), most recent entry first.
+    warp_bank: Vec<Vec<[i32; 6]>>,
     /// `WarpBankHits` for the current superblock (§7.3 `MAX_WARP_SB_HITS`).
     warp_bank_hits: u32,
+    /// `RefMvBankParams` (§7.12.3), indexed by `get_rmb_list_index()`.
+    refmv_bank: RefMvBank,
+    /// `RefMvBankHits` / `RefMvUnitHits` / `RefMvRemainHits` (§7.12.3).
+    refmv_hits: RefMvBankHits,
+    /// Superblock row whose warp-bank models the encoder currently holds.
+    warp_bank_row: usize,
+    /// Coded mode of the leaf being written, for `update_ref_mv_bank()`.
+    block_inter: bool,
+    /// `RefFrame[]` of the leaf being written.
+    block_refs: [i8; 2],
+    /// `BlockMvs[]` of the leaf being written.
+    block_mvs: [MvXY; 2],
+    /// `CwpIdx` of the leaf being written.
+    block_cwp: u8,
     /// Per-4x4 mode information used to derive `WarpParamStack` and the
     /// `is_warp` context (§7.11.4 / §7.12.2.3 / §7.12.2.4).
     mi_map: Vec<WarpMiInfo>,
-    /// Per-4x4 neighbour mode information for the compound `find_mv_stack`
-    /// branch (both reference lists).
-    comp_mi: Vec<CompoundMiInfo>,
     intra_blocks: usize,
     inter_blocks: usize,
     newmv_blocks: usize,
@@ -990,11 +1000,28 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                     break;
                 }
                 self.mi_map[row * self.f_bw4 + col] = info;
-                self.comp_mi[row * self.f_bw4 + col] = CompoundMiInfo {
-                    origin_x4: bx4 as u16,
-                    ..CompoundMiInfo::default()
-                };
             }
+        }
+        self.block_inter = false;
+        self.block_refs = [-1, -1];
+        self.block_mvs = [MvXY::default(); 2];
+        self.block_cwp = 8;
+    }
+
+    /// `update_ref_mv_bank(..., fromWithinSb = 1)` / `update_ref_mv_count()`
+    /// for the leaf that was just written (§7.12.3).
+    fn note_refmv_bank(&mut self, bw4: usize, bh4: usize, bx4: usize, by4: usize) {
+        if !self.seqhdr.refmv_bank || self.refmv_hits.bank_hits >= MAX_RMB_SB_HITS {
+            return;
+        }
+        let sb4 = self.sb_step4.max(1);
+        if self.block_inter {
+            if self.refmv_hits.allow_update(bw4, bh4, by4, bx4, sb4) {
+                self.refmv_bank
+                    .update(self.block_refs, self.block_mvs, self.block_cwp);
+            }
+        } else {
+            self.refmv_hits.update_count(bw4, bh4, by4, bx4, sb4);
         }
     }
 
@@ -1021,15 +1048,13 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
         info.mv = mvs[0];
         info.ref1 = refs[1];
         info.mv1 = mvs[1];
+        info.cwp = cwp;
         info.motion_mode = motion_mode;
         info.warp = warp;
-        let comp_info = CompoundMiInfo {
-            origin_x4: bx4 as u16,
-            inter: true,
-            refs,
-            mvs,
-            cwp,
-        };
+        self.block_inter = true;
+        self.block_refs = refs;
+        self.block_mvs = mvs;
+        self.block_cwp = cwp;
         for y in 0..bh4 {
             let row = by4 + y;
             if row >= self.f_bh4 {
@@ -1040,8 +1065,15 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                 if col >= self.f_bw4 {
                     break;
                 }
+                // `SubMvs` (§7.13.3.19): a warped block stores the projected
+                // vector of each 8x8 section, other blocks the block vector.
+                if motion_mode >= 2 {
+                    info.sub_mv = warp_sub_mv(&warp, bx4, by4, x, y);
+                } else {
+                    info.sub_mv = mvs[0];
+                }
+                info.sub_mv1 = mvs[1];
                 self.mi_map[row * self.f_bw4 + col] = info;
-                self.comp_mi[row * self.f_bw4 + col] = comp_info;
             }
         }
     }
@@ -1087,38 +1119,42 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
         count.min(4)
     }
 
-    /// Builds the `WarpParamStack` for the current block (§7.12.2): corner
-    /// candidate, warp bank, global motion (identity), then defaults.
-    fn warp_param_stack(&self, bx4: usize, by4: usize, bw4: usize, bh4: usize) -> [[i32; 6]; 4] {
-        let sb_w4 = self.sb_step4.max(1);
-        let sb_h4 = self.sb_step4.max(1);
-        let mut corner = generate_points_from_corners(
-            &self.mi_map,
-            self.f_bw4,
-            self.f_bh4,
-            by4,
-            bx4,
+    /// Runs the normative `find_mv_stack` for the current block (§7.12.2).
+    #[allow(clippy::too_many_arguments)]
+    fn mv_stack(
+        &self,
+        bx4: usize,
+        by4: usize,
+        bw4: usize,
+        bh4: usize,
+        refs: [i8; 2],
+    ) -> crate::av2::inter::RefMvStack {
+        let is_compound = refs[1] >= 0;
+        let derive_wrl = !is_compound && refs[0] >= 0 && bw4 * 4 >= 8 && bh4 * 4 >= 8;
+        find_mv_stack(&MvStackParams {
+            map: &self.mi_map,
+            mi_rows: self.f_bh4,
+            mi_cols: self.f_bw4,
+            sb_h4: self.sb_step4.max(1),
+            tile_row_start4: self.tile_row_start4,
+            tile_row_end4: self.tile_row_end4,
+            tile_col_start4: self.tile_col_start4,
+            tile_col_end4: self.tile_col_end4,
+            mi_row: by4,
+            mi_col: bx4,
             bw4,
             bh4,
-            sb_w4,
-            sb_h4,
-            0,
-        );
-        if corner.is_none() && bw4 <= 16 {
-            corner = generate_points_from_corners(
-                &self.mi_map,
-                self.f_bw4,
-                self.f_bh4,
-                by4,
-                bx4,
-                bw4,
-                bh4,
-                sb_w4,
-                sb_h4,
-                1,
-            );
-        }
-        build_warp_param_stack(corner, &self.warp_bank, &DEFAULT_WARP_PARAMS)
+            refs,
+            is_compound,
+            derive_wrl,
+            use_ref_frame_mvs: self.frame_hdr.use_ref_frame_mvs != 0,
+            drl_reorder: self.seqhdr.drl_reorder,
+            enable_refmvbank: self.seqhdr.refmv_bank,
+            max_drl_bits: self.frame_hdr.max_drl_bits.max(1) as usize,
+            frame_distance: &self.refdist,
+            warp_bank: &self.warp_bank,
+            refmv_bank: self.seqhdr.refmv_bank.then_some(&self.refmv_bank),
+        })
     }
 
     /// Intra prediction for one plane of an inter-intra block
@@ -1239,13 +1275,42 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
         best
     }
 
-    /// Estimates a `WARP_NEWMV` model from four half-block motion vectors and
-    /// returns it when it beats the translation prediction (`WARP_NEWMV`,
-    /// §5.20.7.7 `read_warp_delta`). The stack is required to be the identity
-    /// model so the coded delta is independent of neighbour-derived warp
-    /// candidates.
+    /// Predicts a block with `matrix` and returns `(abcd, SAD)` against the
+    /// source (§7.13.3.19 `block_warp`).
     #[allow(clippy::too_many_arguments)]
-    fn select_warp_newmv(
+    fn eval_warp_model(
+        &self,
+        src_plane: &Plane<BD::Pixel>,
+        ref_plane: &Plane<BD::Pixel>,
+        px_x: usize,
+        px_y: usize,
+        w: usize,
+        h: usize,
+        matrix: &[i32; 6],
+    ) -> Option<([i32; 4], u64)> {
+        let abcd = setup_shear(matrix)?;
+        let mut buf = vec![BD::Pixel::default(); w * h];
+        block_warp(
+            self.bd, &mut buf, 0, w, ref_plane, px_x, px_y, w, h, 0, 0, matrix, &abcd,
+        );
+        let sad = compute_sad(
+            &src_plane.data,
+            src_plane.offset(px_x, px_y),
+            src_plane.stride,
+            &buf,
+            0,
+            w,
+            w,
+            h,
+        );
+        Some((abcd, sad))
+    }
+
+    /// Estimates a `WARP_NEWMV` + `DELTAWARP` model from four half-block
+    /// motion vectors and codes it as a delta on `WarpParamStack[0]`
+    /// (§5.20.7.7 `read_warp_delta`).
+    #[allow(clippy::too_many_arguments)]
+    fn select_warp_delta(
         &self,
         src_plane: &Plane<BD::Pixel>,
         ref_plane: &Plane<BD::Pixel>,
@@ -1257,15 +1322,8 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
         bh4: usize,
         trans_sad: u64,
         best_mv: MvXY,
-        mvp: MvXY,
+        stack: &crate::av2::inter::RefMvStack,
     ) -> Option<(WarpChoice, u64)> {
-        if !mvp.is_zero() {
-            return None;
-        }
-        let stack = self.warp_param_stack(bx4, by4, bw4, bh4);
-        if stack[0] != DEFAULT_WARP_PARAMS {
-            return None;
-        }
         let w = bw4 * 4;
         let h = bh4 * 4;
         let sub_w = w / 2;
@@ -1319,41 +1377,36 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
         if den == 0 {
             return None;
         }
-        let alpha = ((ra << 13) / den) as i32;
-        let beta = ((rb << 13) / den) as i32;
         // `warp_delta_precision = 1`: step is 2^(WARP_DELTA_STEP_BITS + 1 - 1).
         let step = 1i32 << 10;
         let max_v = 14 * step;
-        let d2 = (((alpha as f64) / step as f64).round() as i32 * step).clamp(-max_v, max_v);
-        let d3 = (((beta as f64) / step as f64).round() as i32 * step).clamp(-max_v, max_v);
+        let base = stack.warp[0];
+        // The four-parameter fit is relative to the identity model, while the
+        // coded deltas are offsets from `WarpParamStack[0]`.
+        let target2 = (1i32 << crate::av2::warp::WARPEDMODEL_PREC_BITS)
+            .wrapping_add(((ra << 13) / den) as i32);
+        let target3 = ((rb << 13) / den) as i32;
+        let d2 = (((target2.wrapping_sub(base[2])) as f64 / step as f64).round() as i32 * step)
+            .clamp(-max_v, max_v);
+        let d3 = (((target3.wrapping_sub(base[3])) as f64 / step as f64).round() as i32 * step)
+            .clamp(-max_v, max_v);
         if d2 == 0 && d3 == 0 {
             return None;
         }
-        let mut matrix = DEFAULT_WARP_PARAMS;
+        let mut matrix = base;
+        matrix[0] = 0;
+        matrix[1] = 0;
         matrix[2] = matrix[2].wrapping_add(d2);
         matrix[3] = matrix[3].wrapping_add(d3);
         matrix[4] = matrix[3].wrapping_neg();
         matrix[5] = matrix[2];
         reduce_warp_model(&mut matrix);
-        let abcd = setup_shear(&matrix)?;
+        let (abcd, sad) = self.eval_warp_model(src_plane, ref_plane, px_x, py_y, w, h, &matrix)?;
         get_warp_translation(&mut matrix, bw4, bh4, bx4, by4, best_mv);
-        let mut buf = vec![BD::Pixel::default(); w * h];
-        block_warp(
-            self.bd, &mut buf, 0, w, ref_plane, px_x, py_y, w, h, 0, 0, &matrix, &abcd,
-        );
-        let sad = compute_sad(
-            &src_plane.data,
-            src_plane.offset(px_x, py_y),
-            src_plane.stride,
-            &buf,
-            0,
-            w,
-            w,
-            h,
-        );
-        // `WARP_NEWMV` adds an MV residual plus the delta and mode symbols
-        // over a no-residual translation block.
-        let bits_q8 = crate::av2::me::estimate_mv_bits_q8(best_mv, mvp) + 16 * 256;
+        let pred_mv = stack.get(0);
+        // `is_warp`, `warp_mv`, `warp_idx`, the DRL bit, the MV residual, and
+        // the warp-delta precision/parameter symbols.
+        let bits_q8 = crate::av2::me::estimate_mv_bits_q8(best_mv, pred_mv) + 20 * 256;
         let cost = sad + ((self.lambda_sad * bits_q8) >> 8);
         if cost < trans_sad {
             Some((
@@ -1362,11 +1415,130 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                     matrix,
                     abcd,
                     mv: best_mv,
-                    pred_mv: mvp,
+                    pred_mv,
                     warp_mv: false,
                     motion_mode: 3,
                     delta: [d2, d3],
                     high_prec: true,
+                },
+                cost,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Estimates the `LOCALWARP` model with `warp_estimation()` (§7.13.3.23).
+    #[allow(clippy::too_many_arguments)]
+    fn select_local_warp(
+        &self,
+        src_plane: &Plane<BD::Pixel>,
+        ref_plane: &Plane<BD::Pixel>,
+        px_x: usize,
+        px_y: usize,
+        bx4: usize,
+        by4: usize,
+        bw4: usize,
+        bh4: usize,
+        trans_sad: u64,
+        best_mv: MvXY,
+        stack: &crate::av2::inter::RefMvStack,
+    ) -> Option<(WarpChoice, u64)> {
+        let (cands, num) = find_warp_samples(
+            &self.mi_map,
+            self.f_bw4,
+            self.f_bh4,
+            self.sb_step4.max(1),
+            self.tile_row_start4,
+            self.tile_row_end4,
+            self.tile_col_start4,
+            self.tile_col_end4,
+            bx4,
+            by4,
+            bw4,
+            bh4,
+            0,
+        );
+        if num == 0 {
+            return None;
+        }
+        let w = bw4 * 4;
+        let h = bh4 * 4;
+        let matrix = warp_estimation(&cands, num, bw4, bh4, bx4, by4, best_mv);
+        let (abcd, sad) = self.eval_warp_model(src_plane, ref_plane, px_x, px_y, w, h, &matrix)?;
+        // `is_warp`, `warp_mv = 0`, `use_extend_warp = 0`, `use_local_warp = 1`,
+        // the DRL bit, and the MV residual.
+        let rate = crate::av2::me::estimate_mv_bits_q8(best_mv, stack.get(0)) + 4 * 256;
+        let cost = sad + ((self.lambda_sad * rate) >> 8);
+        if cost < trans_sad {
+            Some((
+                WarpChoice {
+                    idx: 0,
+                    matrix,
+                    abcd,
+                    mv: best_mv,
+                    pred_mv: stack.get(0),
+                    warp_mv: false,
+                    motion_mode: 2,
+                    delta: [0, 0],
+                    high_prec: false,
+                },
+                cost,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Builds the `EXTENDWARP` model with `extend_warp_estimation()` (§7.13.3.24).
+    #[allow(clippy::too_many_arguments)]
+    fn select_extend_warp(
+        &self,
+        src_plane: &Plane<BD::Pixel>,
+        ref_plane: &Plane<BD::Pixel>,
+        px_x: usize,
+        py_y: usize,
+        bx4: usize,
+        by4: usize,
+        bw4: usize,
+        bh4: usize,
+        trans_sad: u64,
+        best_mv: MvXY,
+        stack: &crate::av2::inter::RefMvStack,
+    ) -> Option<(WarpChoice, u64)> {
+        let row = stack.row_offsets.first().copied().unwrap_or(-1);
+        let col = stack.col_offsets.first().copied().unwrap_or(-1);
+        let matrix = extend_warp_params(
+            &self.mi_map,
+            self.f_bw4,
+            self.f_bh4,
+            self.sb_step4.max(1),
+            bx4,
+            by4,
+            bw4,
+            bh4,
+            0,
+            row,
+            col,
+            best_mv,
+        )?;
+        let w = bw4 * 4;
+        let h = bh4 * 4;
+        let (abcd, sad) = self.eval_warp_model(src_plane, ref_plane, px_x, py_y, w, h, &matrix)?;
+        let rate = crate::av2::me::estimate_mv_bits_q8(best_mv, stack.get(0)) + 4 * 256;
+        let cost = sad + ((self.lambda_sad * rate) >> 8);
+        if cost < trans_sad {
+            Some((
+                WarpChoice {
+                    idx: 0,
+                    matrix,
+                    abcd,
+                    mv: best_mv,
+                    pred_mv: stack.get(0),
+                    warp_mv: false,
+                    motion_mode: 4,
+                    delta: [0, 0],
+                    high_prec: false,
                 },
                 cost,
             ))
@@ -1388,36 +1560,27 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
         bw4: usize,
         bh4: usize,
         trans_sad: u64,
+        stack: &crate::av2::inter::RefMvStack,
     ) -> Option<(WarpChoice, u64)> {
-        let stack = self.warp_param_stack(bx4, by4, bw4, bh4);
         let w = bw4 * 4;
         let h = bh4 * 4;
         let mut best: Option<(WarpChoice, u64)> = None;
-        for (idx, cand) in stack.iter().enumerate() {
-            if *cand == DEFAULT_WARP_PARAMS {
+        for idx in 0..stack.num_warp.min(stack.warp.len()) {
+            let cand = stack.warp[idx];
+            if cand == DEFAULT_WARP_PARAMS {
                 continue;
             }
-            let mut matrix = *cand;
+            // `BlockMvs[0]` is projected from the raw stack entry
+            // (§7.12.2.2); only the prediction model is reduced.
+            let mv = warp_motion_vector(&cand, bw4, bh4, bx4, by4, self.f_bw4, self.f_bh4);
+            let mut matrix = cand;
             reduce_warp_model(&mut matrix);
-            let Some(abcd) = setup_shear(&matrix) else {
+            get_warp_translation(&mut matrix, bw4, bh4, bx4, by4, mv);
+            let Some((abcd, sad)) =
+                self.eval_warp_model(src_plane, ref_plane, px_x, py_y, w, h, &matrix)
+            else {
                 continue;
             };
-            let mv = warp_motion_vector(&matrix, bw4, bh4, bx4, by4, self.f_bw4, self.f_bh4);
-            get_warp_translation(&mut matrix, bw4, bh4, bx4, by4, mv);
-            let mut buf = vec![BD::Pixel::default(); w * h];
-            block_warp(
-                self.bd, &mut buf, 0, w, ref_plane, px_x, py_y, w, h, 0, 0, &matrix, &abcd,
-            );
-            let sad = compute_sad(
-                &src_plane.data,
-                src_plane.offset(px_x, py_y),
-                src_plane.stride,
-                &buf,
-                0,
-                w,
-                w,
-                h,
-            );
             let rate_q8 = 4 * 256 + 4 * idx as u64 * 256;
             let cost = sad + ((self.lambda_sad * rate_q8) >> 8);
             if cost < trans_sad && best.as_ref().is_none_or(|(_, c)| cost < *c) {
@@ -1506,8 +1669,20 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
     /// Starts a superblock: selects the per-superblock quantizer and queues the
     /// `read_delta_qindex()` symbol for the first coded block.
     fn begin_superblock(&mut self, bx4: usize, by4: usize) {
-        // `WarpBankHits` is reset per superblock (§7.3 `MAX_WARP_SB_HITS`).
-        self.warp_bank_hits = 0;
+        // The warp and reference-MV banks are per superblock row in the
+        // reference decoder (`dav2d_refmvs_tile_sbrow_init` clears them and
+        // `dav2d_refmvs_warp_add` / `bank_update` stop at the hit limit), and
+        // the encoder matches that here so both sides derive the same
+        // `WarpParamStack` / `RefStackMv` bank candidates.
+        if by4 != self.warp_bank_row {
+            self.warp_bank_row = by4;
+            self.warp_bank_hits = 0;
+            for b in self.warp_bank.iter_mut() {
+                b.clear();
+            }
+            self.refmv_bank.clear();
+            self.refmv_hits = RefMvBankHits::default();
+        }
         if self.frame_hdr.delta.q.present == 0 {
             return;
         }
@@ -3282,7 +3457,19 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
         self.record_deblock(bx4, by4, bw4, bh4, t_dim, uv_tdim, has_chroma, false, true);
     }
 
+    /// Encodes one leaf block and applies the §7.12.3 reference-motion-vector
+    /// bank update for it.
     fn encode_leaf_block(&mut self, bs: BlockSize, bx4: usize, by4: usize) {
+        let b_dim = BLOCK_DIMENSIONS[bs as usize];
+        let (bw4, bh4) = (b_dim[0] as usize, b_dim[1] as usize);
+        let end = bx4 < self.tile_col_end4 && by4 < self.tile_row_end4;
+        self.encode_leaf_block_inner(bs, bx4, by4);
+        if end {
+            self.note_refmv_bank(bw4, bh4, bx4, by4);
+        }
+    }
+
+    fn encode_leaf_block_inner(&mut self, bs: BlockSize, bx4: usize, by4: usize) {
         if bx4 >= self.tile_col_end4 || by4 >= self.tile_row_end4 {
             return;
         }
@@ -3318,21 +3505,7 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                 let rec_y = &self.rec.planes[0];
                 let r0_y = &r0.planes[0];
                 let src_off = src_y.offset(px_x, px_y);
-                let cands = find_mv_stack(
-                    &self.mi_map,
-                    self.f_bh4,
-                    self.f_bw4,
-                    self.sb_step4,
-                    self.tile_row_start4,
-                    self.tile_row_end4,
-                    self.tile_col_start4,
-                    self.tile_col_end4,
-                    by4,
-                    bx4,
-                    bw4,
-                    bh4,
-                    0,
-                );
+                let cands = self.mv_stack(bx4, by4, bw4, bh4, [0, -1]);
                 let mvp = cands.get(0);
                 let (near_filter, near_sad) = if self.tools.enable_switchable_interp {
                     select_best_subpel_filter(
@@ -3533,21 +3706,7 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
             let rec_y = &self.rec.planes[0];
             let r0_y = &r0.planes[0];
             let src_off = src_y.offset(px_x, px_y);
-            let cands = find_mv_stack(
-                &self.mi_map,
-                self.f_bh4,
-                self.f_bw4,
-                self.sb_step4,
-                self.tile_row_start4,
-                self.tile_row_end4,
-                self.tile_col_start4,
-                self.tile_col_end4,
-                by4,
-                bx4,
-                bw4,
-                bh4,
-                0,
-            );
+            let cands = self.mv_stack(bx4, by4, bw4, bh4, [0, -1]);
             let mvp = cands.get(0);
 
             let (best_mode, best_mv, best_filter, best_inter_cost) =
@@ -3712,24 +3871,8 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                 // Compound branch of `find_mv_stack` (AV2 Spec §7.12.2,
                 // `isCompound = 1`). Candidate 0 is the predictor for the
                 // `NEW_NEWMV` residuals.
-                let comp_stack = find_compound_mv_stack(
-                    &self.comp_mi,
-                    self.f_bh4,
-                    self.f_bw4,
-                    self.sb_step4,
-                    self.tile_row_start4,
-                    self.tile_row_end4,
-                    self.tile_col_start4,
-                    self.tile_col_end4,
-                    by4,
-                    bx4,
-                    bw4,
-                    bh4,
-                    0,
-                    1,
-                    self.frame_hdr.max_drl_bits as usize,
-                );
-                let comp_pred = comp_stack.get(0);
+                let comp_stack = self.mv_stack(bx4, by4, bw4, bh4, [0, 1]);
+                let comp_pred = comp_stack.get_pair(0);
                 let (me_mv1, _, _) = search_motion_vector(
                     self.bd,
                     &src_y.data,
@@ -5562,10 +5705,12 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
             }
         }
 
-        // Warped motion: `WARPMV` + `DELTAWARP` (AV2 Spec v1.0.0 §5.20.7.6
-        // `inter_block_mode_info`, §7.12.2 `find_mv_stack`, §7.13.3.19
-        // `block_warp`). AV2 v1.0.0 has no OBMC symbol; the former
-        // non-normative OBMC blending is removed.
+        // Warped motion (AV2 Spec v1.0.0 §5.20.7.6 `inter_block_mode_info`,
+        // §5.20.7.14 `read_motion_mode`, §7.12.2 `find_mv_stack`,
+        // §7.13.3.19 `block_warp`). AV2 v1.0.0 has no OBMC symbol. The
+        // `WarpParamStack` and the DRL predictor are both derived here from
+        // the same normative stack the decoder uses, so `WARPMV`, `LOCALWARP`,
+        // `EXTENDWARP` and `DELTAWARP` all code against identical inputs.
         let mut warp_choice: Option<WarpChoice> = None;
         if !dec.is_compound
             && self.tools.enable_warped_motion
@@ -5588,9 +5733,8 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
             && h >= 8
             && (w >> ss_x) >= 8
             && (h >> ss_y) >= 8
-            // `generate_points_from_corners` (§7.12.2.3) needs the whole
-            // neighbour map, which the encoder keeps only for single-tile
-            // frames.
+            // The candidate maps are kept per tile, so warp RDO requires a
+            // single-tile frame.
             && self.tile_col_start4 == 0
             && self.tile_row_start4 == 0
             && self.tile_col_end4 >= self.f_bw4
@@ -5601,6 +5745,15 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
             } else {
                 r0
             };
+            let warp_ref = dec.ref_slot_idx as i8;
+            let stack = self.mv_stack(bx4, by4, bw4, bh4, [warp_ref, -1]);
+            // The coded MV residual is quantised to the MVD lattice, so the
+            // model estimation and reconstruction use the snapped vector.
+            let warp_mv = crate::av2::me::snap_mv_to_precision(
+                dec.mv[0],
+                stack.get(0),
+                3 + self.frame_hdr.mv_precision as usize,
+            );
             let trans_sad = compute_sad(
                 &self.src.planes[0].data,
                 self.src.planes[0].offset(px_x, px_y),
@@ -5611,7 +5764,7 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                 w,
                 h,
             );
-            let warpmv = self.select_warpmv(
+            let mut best = self.select_warpmv(
                 &self.src.planes[0],
                 &active_r.planes[0],
                 px_x,
@@ -5621,27 +5774,85 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                 bw4,
                 bh4,
                 trans_sad,
+                &stack,
             );
-            let warp_newmv = self.select_warp_newmv(
-                &self.src.planes[0],
-                &active_r.planes[0],
-                px_x,
-                px_y,
+            // `LOCALWARP` / `EXTENDWARP` are only signalled when
+            // `WarpSampleFound[0]` is set (§5.20.7.14 `motion_mode_allowed`).
+            let local_extend_allowed = warp_has_ref_neighbour(
+                &self.mi_map,
+                self.f_bw4,
+                self.f_bh4,
+                self.sb_step4,
                 bx4,
                 by4,
                 bw4,
                 bh4,
-                trans_sad,
-                dec.mv[0],
-                dec.ref_mv[0],
+                warp_ref,
             );
-            let chosen = match (warpmv, warp_newmv) {
-                (Some((a, ca)), Some((b, cb))) => Some(if ca <= cb { a } else { b }),
-                (Some((a, _)), None) => Some(a),
-                (None, Some((b, _))) => Some(b),
-                (None, None) => None,
-            };
-            if let Some(choice) = chosen {
+            {
+                let consider =
+                    |cand: Option<(WarpChoice, u64)>, best: &mut Option<(WarpChoice, u64)>| {
+                        if let Some((c, cost)) = cand
+                            && best.as_ref().is_none_or(|(_, bc)| cost < *bc)
+                        {
+                            *best = Some((c, cost));
+                        }
+                    };
+                // `DELTAWARP` is always allowed for `WARP_NEWMV`
+                // (§5.20.7.14); `LOCALWARP` and `EXTENDWARP` additionally
+                // require `WarpSampleFound[0]`.
+                if local_extend_allowed {
+                    consider(
+                        self.select_local_warp(
+                            &self.src.planes[0],
+                            &active_r.planes[0],
+                            px_x,
+                            px_y,
+                            bx4,
+                            by4,
+                            bw4,
+                            bh4,
+                            trans_sad,
+                            warp_mv,
+                            &stack,
+                        ),
+                        &mut best,
+                    );
+                    consider(
+                        self.select_extend_warp(
+                            &self.src.planes[0],
+                            &active_r.planes[0],
+                            px_x,
+                            px_y,
+                            bx4,
+                            by4,
+                            bw4,
+                            bh4,
+                            trans_sad,
+                            warp_mv,
+                            &stack,
+                        ),
+                        &mut best,
+                    );
+                }
+                consider(
+                    self.select_warp_delta(
+                        &self.src.planes[0],
+                        &active_r.planes[0],
+                        px_x,
+                        px_y,
+                        bx4,
+                        by4,
+                        bw4,
+                        bh4,
+                        trans_sad,
+                        warp_mv,
+                        &stack,
+                    ),
+                    &mut best,
+                );
+            }
+            if let Some((choice, _)) = best {
                 let rec_y = &mut self.rec.planes[0];
                 let rec_off = rec_y.offset(px_x, px_y);
                 block_warp(
@@ -5667,8 +5878,11 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                 } else if choice.motion_mode == 4 {
                     self.extendwarp_blocks += 1;
                 }
+                // `update_warp_param_bank()` (§7.12.3).
+                if let Some(bank) = self.warp_bank.get_mut(warp_ref as usize) {
+                    warp_bank_insert(bank, &choice.matrix);
+                }
                 self.warp_bank_hits += 1;
-                warp_bank_insert(&mut self.warp_bank, &choice.matrix);
                 warp_choice = Some(choice);
             }
         }
@@ -6238,6 +6452,7 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                     }
                 } else {
                     // `warp_mv = 0` selects `YMode = WARP_NEWMV`.
+                    let warp_ref = dec.ref_slot_idx as i8;
                     self.msac.encode_bool_adapt(0, &mut self.cdf.m.warp_mv);
                     let ext_ctx = warp_mode_context(
                         &self.mi_map,
@@ -6258,7 +6473,7 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                         by4,
                         bw4,
                         bh4,
-                        0,
+                        warp_ref,
                     );
                     if has_ext {
                         if (self.seqhdr.motion_modes & (1 << 4)) != 0 {
@@ -6760,7 +6975,7 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
         let map_refs = if dec.is_compound {
             [r0_idx, r1_idx]
         } else {
-            [0, -1]
+            [r0_idx, -1]
         };
         self.mark_mi_inter(
             bs,
@@ -7627,10 +7842,16 @@ pub fn encode_frame<BD: BitDepth>(
             speed,
             lambda_sad,
             lambda_rdoq,
-            warp_bank: Vec::with_capacity(4),
+            warp_bank: (0..8).map(|_| Vec::with_capacity(4)).collect(),
             warp_bank_hits: 0,
+            refmv_bank: RefMvBank::default(),
+            refmv_hits: RefMvBankHits::default(),
+            warp_bank_row: usize::MAX,
+            block_inter: false,
+            block_refs: [-1, -1],
+            block_mvs: [MvXY::default(); 2],
+            block_cwp: 8,
             mi_map: vec![WarpMiInfo::default(); f_bw4 * f_bh4],
-            comp_mi: vec![CompoundMiInfo::default(); f_bw4 * f_bh4],
             intra_blocks: 0,
             inter_blocks: 0,
             newmv_blocks: 0,
@@ -7804,10 +8025,16 @@ pub fn encode_frame<BD: BitDepth>(
                 speed,
                 lambda_sad,
                 lambda_rdoq,
-                warp_bank: Vec::with_capacity(4),
+                warp_bank: (0..8).map(|_| Vec::with_capacity(4)).collect(),
                 warp_bank_hits: 0,
+                refmv_bank: RefMvBank::default(),
+                refmv_hits: RefMvBankHits::default(),
+                warp_bank_row: usize::MAX,
+                block_inter: false,
+                block_refs: [-1, -1],
+                block_mvs: [MvXY::default(); 2],
+                block_cwp: 8,
                 mi_map: vec![WarpMiInfo::default(); f_bw4 * f_bh4],
-                comp_mi: vec![CompoundMiInfo::default(); f_bw4 * f_bh4],
                 intra_blocks: 0,
                 inter_blocks: 0,
                 newmv_blocks: 0,

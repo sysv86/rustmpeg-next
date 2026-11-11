@@ -46,12 +46,17 @@ implemented explicitly instead of the previous size heuristics.
    `build_drl_candidates()` for compound predictors. It now keeps a parallel
    per-4x4 `CompoundMiInfo` map and calls the normative
    `find_compound_mv_stack()` for every non-`has_second_drl` compound mode.
+   (2026-11-11: both were replaced by the single §7.12.2 `find_mv_stack` and
+   `RefMvStack` of [`UNIT8_DECODER.md`](UNIT8_DECODER.md); `CompoundMiInfo` and
+   `find_compound_mv_stack` no longer exist.)
 4. **`has_second_drl` list selection.** `NEARMV_NEARMV` and `NEARMV_NEWMV`
    build one single-reference stack per list (§5.20.7.6). The previous
    single-reference stack only looked at the neighbour's list 0, so a compound
    neighbour never contributed its list-1 MV. The decoder now synthesises a
    per-list `WarpMiInfo` map from `CompoundMiInfo` (both lists, `candList`
    semantics of §7.12.2.10) and calls `find_mv_stack()` for each list.
+   (2026-11-11: the synthesis step is gone; `find_mv_stack` reads both lists
+   directly from the per-4x4 `RefFrames` map.)
 5. **Mask gating and type symbol.** `comp_group_idx` is now coded for every
    non-thin compound block, and `compound_type` only when `Wedge_Bits != 0`
    (§5.20.7.16). The previous `max_dim <= 16` heuristic is gone.

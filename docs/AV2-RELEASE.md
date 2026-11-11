@@ -12,10 +12,12 @@ skipped, never as passes.
 
 Units 1–12 are landed. Units 1–7 and 10–12 are **DONE** for their recorded
 matrices; units 8 and 9 are **DONE WITH LIMITS** because a small set of tools
-outside the recorded matrix is still absent (unit 9: intra and 4-way/5-way
-transform partitions, lossless palette/DIP/CfL). Unit 13 is **DONE** for AV2: the
-12 in-tree external-oracle tests pass, the baseline driver is 84/84, and the
-quick driver is 9/9.
+outside the recorded matrix is still absent (unit 8: one out-of-matrix
+`LOCALWARP`/`EXTENDWARP` content case, the unreachable temporal motion-field
+scan, six-parameter warp deltas, and the AVM chroma-intra blocker; unit 9:
+intra and 4-way/5-way transform partitions, lossless palette/DIP/CfL). Unit 13
+is **DONE** for AV2: the 12 in-tree external-oracle tests pass, the baseline
+driver is 84/84, and the quick driver is 9/9.
 
 The reproducible evidence is:
 
@@ -100,9 +102,9 @@ frame.
 | 3. CCSO/GDF decoder / encoder | 21 + 27 | pass |
 | 4. Loop restoration | 29 (28 in-tree) | pass |
 | 5. Segmentation, VAQ, delta-Q | 18 + 2 ignored | pass |
-| 6. NEWMV + switchable subpel | 19 | pass |
+| 6. NEWMV + switchable subpel | 19 + 6 re-run 2026-11-11 | pass |
 | 7. Compound/wedge/CWP | 34 (28 in-tree) | pass |
-| 8. Warped motion | 17 + 3 12-bit | pass |
+| 8. Warped motion | 17 + 3 12-bit + 21-case warp/newmv matrix 2026-11-11 | pass, one out-of-matrix content case differs |
 | 9. Transform sets, WHT, DPCM, inter lossless, transform partitions | full sets + ignored tests + 9-case partition matrix | pass |
 | 10. Extended partitions | 37 decoder + 7 encoder | pass |
 | 11. Palette + IntraBC | 30 | pass |
@@ -138,6 +140,31 @@ frames, QP 20/100/140, warp on, gives `encoder reconstruction == our decoder ==
 dav2d` on every frame, with a warped block selected at QP 20 and QP 100. The
 previous 12-bit warp failure is therefore not a current gap.
 
+### Warp / motion-vector stack re-verification (2026-11-11)
+
+The reduced in-tree `find_mv_stack` was replaced with the full AV2 v1.0.0
+§7.12.2 process (single and compound candidates, derived and reference-bank
+candidates, sorting/truncation, `WarpParamStack`, per-4x4 `Mvs`/`SubMvs`), and
+the encoder now emits `LOCALWARP` and `EXTENDWARP` in addition to `WARPMV` and
+`WARP_NEWMV`/`DELTAWARP`. See
+[`docs/av2/UNIT8_ENCODER.md`](av2/UNIT8_ENCODER.md) §"2026-11-11 update".
+
+| Command | Result |
+| :-- | :-- |
+| 21-case warp/newmv/switchable matrix (64x64/256x192 8-bit QP 20/100/140, 10/12-bit, 4:2:2/4:4:4) | 20/21 exact; one out-of-matrix 256x192 QP 20 content case differs on frame 1 |
+| `python3 $ORACLE/check_av2.py quick` | 9/9 OK |
+| `python3 $ORACLE/check_av2.py full` | 84/84 OK |
+| `cargo test --workspace --no-fail-fast` | all targets pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | rc 0 |
+| `python3 scripts/check-licenses.py` | license audit: OK |
+
+`LOCALWARP`/`EXTENDWARP` counts are non-zero on forced-affine content (3 local
++ 2 extend on `u8/zoom.y4m` 256x192 QP 20; 2 local + 1 extend on a synthetic
+rotating/zooming clip at QP 20) and those streams are byte-exact. A stock AVM
+warp stream is decoded by `dav2d` (rc 0, 3 frames); our decoder stops on the
+first inter frame with `BitstreamError("chroma intra mode index out of range")`,
+recorded as a blocker rather than a pass.
+
 ## Stock AVM streams
 
 The flag sets are the recorded ones in
@@ -150,7 +177,7 @@ segmentation, and `--film-grain-test=1` for grain.
 | Stream | Input / frames | `dav2d` | Our decoder | Exact result |
 | :-- | :-- | :-- | :-- | :-- |
 | AVM intra, 256x192 | synthetic, 1 | rc 0 | rc 0, 1 frame | **byte-exact** |
-| AVM warp, 256x192 | synthetic, 3 | rc 0 | rc 1 after key frame | key frame differs in 1011 samples (max 1); `BitstreamError("inter block references a missing frame")` |
+| AVM warp, 256x192 | synthetic, 3 | rc 0 | rc 1 on the first inter frame | `BitstreamError("chroma intra mode index out of range")` |
 | AVM segmentation (`--aq-mode=3`), 256x192 | synthetic, 3 | rc 0 | rc 1 after key frame | key frame differs in 1011 samples (max 1); same missing-reference error |
 | AVM film grain, 64x64 | horizontal gradient, 1 | rc 0 (grain on/off) | rc 0 (grain on/off) | **byte-exact** vs `dav2d --filmgrain 1` and `--filmgrain 0` |
 
@@ -158,8 +185,8 @@ The key-frame 1-LSB difference on the multi-frame AVM streams is the same
 intra/inter reconstruction difference already recorded in
 [`docs/av2/UNIT12_DECODER.md`](av2/UNIT12_DECODER.md); it is unrelated to loop
 filters and remains with the filters disabled. The inter frames are not
-decodable because the decoder has no reference for them, so they are not a
-conformance pass.
+decodable because the chroma intra mode index is outside the AV2 enumeration,
+so they are not a conformance pass.
 
 The earlier synthetic-checker film-grain row (`BitstreamError("decoded EOB 823
 outside the 512-coefficient block")`) was recorded on 2026-10-29 and was not
@@ -238,9 +265,9 @@ Rejected with a typed error (not silent misdecoding):
 | 3. CCSO + GDF | DONE | `... av2_unit3_decoder_dav2d_byte_exact -- --ignored` and `... av2_unit3_encoder_dav2d_byte_exact -- --ignored` → pass; 21 + 27 cases | CCSO parameter `reuse` rejected; AVM inter frames blocked |
 | 4. Loop restoration | DONE | `... av2_restoration_decoder_dav2d_byte_exact -- --ignored` → pass; 28 in-tree, 29 recorded | Per-unit NS filter banks and multi-class frame filters rejected |
 | 5. Segmentation, delta-Q, VAQ, rate control | DONE | `... av2_segmentation_decoder_dav2d_byte_exact -- --ignored` and `... av2_segmentation_dav2d_byte_exact -- --ignored` → pass; 18 matrix cases | Mixed-lossless segmentation and temporal map prediction are not exercised |
-| 6. NEWMV + switchable subpel | DONE | `cargo test -p rustmpeg-video --lib test_encoder_newmv_and_switchable_stats` and `... test_decode_matches_encoder_recon_with_newmv...` → pass; 19-case recorded matrix | Subpel compound and `TxPartition::TxSplit` rejected; reduced DRL |
+| 6. NEWMV + switchable subpel | DONE | `cargo test -p rustmpeg-video --lib test_encoder_newmv_and_switchable_stats` and `... test_decode_matches_encoder_recon_with_newmv...` → pass; 19-case recorded matrix; 6-case re-run 2026-11-11 with the full §7.12.2 stack | Subpel compound and `TxPartition::TxSplit` rejected |
 | 7. Compound, wedge, mask blending | DONE | `... av2_compound_decoder_dav2d_byte_exact -- --ignored` → pass; 28 in-tree, 34 recorded | `JOINT_NEWMV` parsed but not emitted; subpel compound not emitted |
-| 8. Warped motion (OBMC N/A) | DONE WITH LIMITS | `cargo test -p rustmpeg-video --test av2_warp` → pass; 17-case recorded matrix; 12-bit 3/3 exact; `INTERINTRA` + `WARPMV`/`WARP_NEWMV` matrix 64x64/256x192 QP20/100/140 + 10/12-bit 256x192 → `encoder recon == our decoder == dav2d`; counts 3–9 `WARPMV`, 5–22 `INTERINTRA` per 256x192 run | OBMC does not exist in AV2 v1.0.0 (§7.3 `MOTION_MODES = 5`, §5.20.7.14), cited. `INTERINTRA`, `LOCALWARP`, `EXTENDWARP` and `WARPMV` are parsed and predicted; the encoder emits `INTERINTRA`, `WARPMV` and `WARP_NEWMV`+`DELTAWARP`; `LOCALWARP`/`EXTENDWARP` emission remains blocked by the reduced `find_mv_stack`/`WarpParamStack`, which is also a residual `WARPMV` risk on strongly affine content; six-parameter warp deltas are not emitted |
+| 8. Warped motion (OBMC N/A) | DONE WITH LIMITS | `cargo test -p rustmpeg-video --test av2_warp` → pass; 17-case recorded matrix; 12-bit 3/3 exact; 21-case warp/newmv matrix 2026-11-11 (64x64/256x192 8-bit QP 20/100/140, 10/12-bit, 4:2:2/4:4:4) → 20/21 `encoder recon == our decoder == dav2d`, `LOCALWARP`/`EXTENDWARP` counts > 0 on affine content | OBMC does not exist in AV2 v1.0.0 (§7.3 `MOTION_MODES = 5`, §5.20.7.14), cited. `INTERINTRA`, `LOCALWARP`, `EXTENDWARP`, `WARPMV` and `WARP_NEWMV`/`DELTAWARP` are parsed, predicted and emitted; the full §7.12.2 `find_mv_stack` (single/compound, derived, reference-MV bank, sorting, `WarpParamStack`, per-4x4 `Mvs`/`SubMvs`) replaced the reduced path. Remaining: one out-of-matrix 256x192 QP 20 affine content case differs on frame 1; the §7.12.2.7 temporal motion-field scan is unreachable (`use_ref_frame_mvs = 0`, rejected otherwise); six-parameter warp deltas are not emitted; AVM inter streams stop on `chroma intra mode index out of range` |
 | 9. Transform types, lossless WHT, DPCM, inter lossless, partitions | DONE WITH LIMITS | `... av2_unit9_encoder_dav2d_byte_exact`, `... av2_unit9_decoder_dav2d_byte_exact`, `... av2_unit9_encoder_dav2d_tx_partition` → all pass; full sets 0–3; inter lossless and `SPLIT`/`HORZ`/`VERT` partitions byte-exact, counts > 0 | Intra and 4-way/5-way transform partitions, lossless palette/DIP/CfL rejected; long transform sets not emitted |
 | 10. Extended partitions + partition RDO | DONE | `... av2_extended_partitions_decoder_dav2d_byte_exact -- --ignored` → pass; 37 decoder + 7 encoder cases | Non-square luma intra is DC-only; extended search at 64x64 only; `dav2d` SIGSEGV on some 4:2:2/4:4:4 cells is skipped |
 | 11. Palette, IntraBC, ISP | DONE | 30-case screen-content matrix in [`docs/av2/UNIT11_ENCODER.md`](av2/UNIT11_ENCODER.md); `check_av2.py full` with screen tools off → 84/84 | ISP does not exist in AV2 v1.0.0; sub-pixel/global IntraBC rejected; one IntraBC block per frame; palette cache not reused |

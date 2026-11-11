@@ -288,7 +288,7 @@ fn write_packet<P: Pixel, W: std::io::Write>(
         y4m.write_frame(&packet.rec_frame.to_raw())?;
     }
     eprintln!(
-        "frame {}: {:?}, {} bytes, PSNR Y {:.2}, base qidx {}, avg qidx {}, warped {}, palette {}, intrabc {}, isp {}, newmv {}, subpel {}, compound {} (avg {}, wedge {}, diff {}, cwp {}) inter {} intra {}",
+        "frame {}: {:?}, {} bytes, PSNR Y {:.2}, base qidx {}, avg qidx {}, warped {} (warpmv {}, local {}, extend {}), palette {}, intrabc {}, isp {}, newmv {}, subpel {}, compound {} (avg {}, wedge {}, diff {}, cwp {}) inter {} intra {}",
         packet.pts,
         packet.frame_type,
         packet.data.len(),
@@ -296,6 +296,9 @@ fn write_packet<P: Pixel, W: std::io::Write>(
         packet.stats.qidx,
         packet.stats.avg_qidx,
         packet.stats.warped_blocks,
+        packet.stats.warpmv_blocks,
+        packet.stats.localwarp_blocks,
+        packet.stats.extendwarp_blocks,
         packet.stats.palette_blocks,
         packet.stats.intrabc_blocks,
         packet.stats.isp_blocks,

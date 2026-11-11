@@ -682,38 +682,6 @@ pub fn warp_bank_insert(bank: &mut Vec<[i32; 6]>, params: &[i32; 6]) {
     }
 }
 
-/// Builds the `WarpParamStack` of §7.12.2 for a single-reference block.
-///
-/// `corner` is the candidate produced by `generate_points_from_corners`
-/// (§7.12.2.3), `bank` the per-reference bank, and `gm` the derived global
-/// motion model (identity when `use_global_motion` is 0). The list order is
-/// the normative one: corner candidate, bank (most recent first), global
-/// motion, then two `Default_Warp_Params` entries.
-pub fn build_warp_param_stack(
-    corner: Option<[i32; 6]>,
-    bank: &[[i32; 6]],
-    gm: &[i32; 6],
-) -> [[i32; 6]; MAX_WARP_REF_CANDIDATES] {
-    let mut stack = [DEFAULT_WARP_PARAMS; MAX_WARP_REF_CANDIDATES];
-    let mut n = 0usize;
-    let mut push = |v: [i32; 6]| {
-        if n < MAX_WARP_REF_CANDIDATES {
-            stack[n] = v;
-            n += 1;
-        }
-    };
-    if let Some(c) = corner {
-        push(c);
-    }
-    for p in bank {
-        push(*p);
-    }
-    push(*gm);
-    push(DEFAULT_WARP_PARAMS);
-    push(DEFAULT_WARP_PARAMS);
-    stack
-}
-
 /// Per-4x4 mode information the encoder keeps to evaluate warp corners.
 ///
 /// AV2 §7.12.2.3 reads `MiSizes`, `MiColBase`, `MiRowBase`, `RefFrames`,
@@ -734,12 +702,19 @@ pub struct WarpMiInfo {
     pub inter: bool,
     /// `RefFrames[..][0]` list (frame slot index, or `-1`).
     pub ref0: i8,
-    /// `Mvs[..][0]` list (1/8-pel).
+    /// `Mvs[..][0]` list (the block motion vector, 1/8-pel).
     pub mv: MvXY,
     /// `RefFrames[..][1]` list (frame slot index, or `-1`).
     pub ref1: i8,
-    /// `Mvs[..][1]` list (1/8-pel).
+    /// `Mvs[..][1]` list (the block motion vector, 1/8-pel).
     pub mv1: MvXY,
+    /// `SubMvs[..][0]` at this 4x4 cell (1/8-pel). For a warped block this is
+    /// the projected sub-block vector of the enclosing 8x8 group (§7.13.3.19).
+    pub sub_mv: MvXY,
+    /// `SubMvs[..][1]` at this 4x4 cell (1/8-pel).
+    pub sub_mv1: MvXY,
+    /// `CwpIdxs[..]` (compound only, 8 = `CWP_EQUAL`).
+    pub cwp: u8,
     /// `MotionModes` value (0 = `SIMPLE`, 3 = `DELTAWARP`).
     pub motion_mode: u8,
     /// `WarpParams[..][0]` for warp blocks.
@@ -760,15 +735,24 @@ impl WarpMiInfo {
             mv: MvXY::default(),
             ref1: -1,
             mv1: MvXY::default(),
+            sub_mv: MvXY::default(),
+            sub_mv1: MvXY::default(),
+            cwp: 8,
             motion_mode: 0,
             warp: DEFAULT_WARP_PARAMS,
         }
     }
 
-    /// Motion vector for `list` (0 or 1).
+    /// Motion vector for `list` (0 or 1) from `Mvs` (the block vector).
     #[inline]
     pub fn list_mv(&self, list: usize) -> MvXY {
         if list == 0 { self.mv } else { self.mv1 }
+    }
+
+    /// Motion vector for `list` (0 or 1) from `SubMvs` (the per-4x4 vector).
+    #[inline]
+    pub fn sub_list_mv(&self, list: usize) -> MvXY {
+        if list == 0 { self.sub_mv } else { self.sub_mv1 }
     }
 
     /// Reference frame for `list` (0 or 1).
@@ -796,6 +780,39 @@ pub const MV_LOW: i32 = -(1 << 16);
 pub const MV_UPP: i32 = 1 << 16;
 /// `MV_BORDER` (§7.3).
 pub const MV_BORDER: i32 = 128;
+
+/// `SubMvs` entry for one 4x4 cell of a warped block (§7.13.3.19 `block_warp`).
+///
+/// The block-warp process projects the centre of each 8x8 section, so every
+/// 4x4 cell of the same 8x8 group receives the same motion vector. `local_x4`
+/// and `local_y4` are the 4x4 offsets inside the block.
+#[inline]
+pub fn warp_sub_mv(
+    params: &[i32; 6],
+    bx4: usize,
+    by4: usize,
+    local_x4: usize,
+    local_y4: usize,
+) -> MvXY {
+    let src_x = (bx4 * 4 + (local_x4 & !1) * 4 + 4) as i64;
+    let src_y = (by4 * 4 + (local_y4 & !1) * 4 + 4) as i64;
+    let dst_x = params[2] as i64 * src_x + params[3] as i64 * src_y + params[0] as i64;
+    let dst_y = params[4] as i64 * src_x + params[5] as i64 * src_y + params[1] as i64;
+    let mv_x = round2_signed(
+        dst_x - (src_x << WARPEDMODEL_PREC_BITS),
+        WARPEDMODEL_PREC_BITS - 3,
+    )
+    .clamp(MV_LOW as i64 + 1, MV_UPP as i64 - 1);
+    let mv_y = round2_signed(
+        dst_y - (src_y << WARPEDMODEL_PREC_BITS),
+        WARPEDMODEL_PREC_BITS - 3,
+    )
+    .clamp(MV_LOW as i64 + 1, MV_UPP as i64 - 1);
+    MvXY {
+        x: mv_x as i16,
+        y: mv_y as i16,
+    }
+}
 
 /// `get_warp_motion_vector(params, precision)` (§7.12.2.2) for `WARPMV`
 /// blocks, including the `clamp_mv_row()` / `clamp_mv_col()` border clamps of
@@ -832,7 +849,7 @@ pub fn warp_motion_vector(
     }
 }
 
-/// `generate_points_from_corners(iter)` (§7.12.2.3) for the encoder's map.
+/// `generate_points_from_corners(iter)` (§7.12.2.3) for a per-4x4 mode map.
 ///
 /// Returns the reduced warp candidate when three corners are available, all
 /// three motion vectors differ, and every reference point is non-negative.
@@ -848,6 +865,7 @@ pub fn generate_points_from_corners(
     _sb_w4: usize,
     sb_h4: usize,
     iter: usize,
+    ref_id: i8,
 ) -> Option<[i32; 6]> {
     let mut corner_pts = [[0i32; 2]; 3];
     let mut corner_mvs = [[0i32; 2]; 3];
@@ -880,17 +898,30 @@ pub fn generate_points_from_corners(
         if !info.written || !info.inter {
             return;
         }
-        // Single-reference: only list 0 can match RefFrame[0].
-        if info.ref0 != 0 {
+        // `RefFrames[..][ref]` for `ref = 0..1`: the first list that matches
+        // `RefFrame[0]` supplies the corner.
+        let list = if info.ref0 == ref_id {
+            0usize
+        } else if info.ref1 == ref_id {
+            1usize
+        } else {
             return;
-        }
+        };
         corner_pts[corners_found] = [((row + 1) * 4) as i32, ((col + 1) * 4) as i32];
         corner_mvs[corners_found] = if info.motion_mode >= 2 {
-            // `LOCALWARP` = 2 in the AV2 motion-mode enumeration.
+            // `LOCALWARP` = 2 in the AV2 motion-mode enumeration. The corner
+            // vector is warped from the corner position, not the 8x8 centre.
+            if list > 0 {
+                return;
+            }
             let mv = warp_mv_at(&info.warp, row + 1, col + 1);
-            [mv.y as i32, mv.x as i32]
+            [
+                crate::av2::inter::clamp_mv_row(mv.y as i32, mi_row, h4, mi_rows),
+                crate::av2::inter::clamp_mv_col(mv.x as i32, mi_col, w4, mi_cols),
+            ]
         } else {
-            [info.mv.y as i32, info.mv.x as i32]
+            let mv = info.sub_list_mv(list);
+            [mv.y as i32, mv.x as i32]
         };
         corners_found += 1;
     };
@@ -1274,11 +1305,13 @@ pub fn warp_local_context(
     (ext_ctx > 0) as usize + (modes[0] == 2) as usize + (modes[1] == 2) as usize
 }
 
-/// `extend_warp_estimation()` (§7.13.3.24) over the per-4x4 block map.
+/// `extend_warp_estimation()` (§7.13.3.24) over a per-4x4 block map.
 ///
 /// `stack_row` / `stack_col` are `RefStackRowOffset[RefMvIdx]` and
-/// `RefStackColOffset[RefMvIdx]`; when either is `-1`, the scan-point
-/// fallback of dav2d's `extend_warpmv` selects the neighbour instead.
+/// `RefStackColOffset[RefMvIdx]`. The specification keeps those offsets only
+/// when either is `-1`; otherwise it uses `ExtendDeltaRow` / `ExtendDeltaCol`,
+/// the first neighbour in the §7.11.4 scan-point order whose reference matches
+/// `RefFrame[0]`. This function performs that scan itself.
 #[allow(clippy::too_many_arguments)]
 pub fn extend_warp_params(
     map: &[WarpMiInfo],
@@ -1296,21 +1329,19 @@ pub fn extend_warp_params(
 ) -> Option<[i32; 6]> {
     let sb_h4 = sb_h4.max(1);
     let is_sb_border = by4.is_multiple_of(sb_h4);
+    let inside = |row: isize, col: isize| -> bool {
+        row >= 0 && col >= 0 && row < mi_rows as isize && col < mi_cols as isize
+    };
     let has_ref = |row: isize, col: isize| -> bool {
-        if row < 0 || col < 0 || row >= mi_rows as isize || col >= mi_cols as isize {
+        if !inside(row, col) {
             return false;
         }
         let info = map[row as usize * mi_cols + col as usize];
         info.written && info.inter && (info.ref0 == ref_id || info.ref1 == ref_id)
     };
-    let mut delta_row = stack_row as isize;
-    let mut delta_col = stack_col as isize;
-    // dav2d uses the stack offsets when both are valid and otherwise falls
-    // back to the §7.11.4 scan points.
-    if delta_row == -1
-        || delta_col == -1
-        || !has_ref(by4 as isize + delta_row, bx4 as isize + delta_col)
-    {
+    let (mut delta_row, mut delta_col) = (stack_row as isize, stack_col as isize);
+    if delta_row != -1 && delta_col != -1 {
+        // `ExtendDeltaRow` / `ExtendDeltaCol`: the first matching scan point.
         let bh4i = bh4 as isize;
         let bw4i = bw4 as isize;
         if bx4 > 0 && has_ref(by4 as isize + bh4i - 1, bx4 as isize - 1) {
@@ -1331,16 +1362,14 @@ pub fn extend_warp_params(
         } else if by4 > 0 && has_ref(by4 as isize - 1, bx4 as isize) {
             delta_row = -1;
             delta_col = -(bx4 as isize & is_sb_border as isize);
-        } else {
-            return None;
         }
     }
-    let row = by4 as isize + delta_row;
-    let col = bx4 as isize + delta_col;
-    if row < 0 || col < 0 || row >= mi_rows as isize || col >= mi_cols as isize {
+    if !inside(by4 as isize + delta_row, bx4 as isize + delta_col) {
         return None;
     }
-    let info = map[row as usize * mi_cols + col as usize];
+    let row = (by4 as isize + delta_row) as usize;
+    let col = (bx4 as isize + delta_col) as usize;
+    let info = map[row * mi_cols + col];
     let list = if info.ref0 == ref_id {
         0usize
     } else if info.ref1 == ref_id {
@@ -1548,9 +1577,10 @@ mod tests {
             info.inter = true;
             info.ref0 = 0;
             info.mv = mv;
+            info.sub_mv = mv;
             map[r * mi_cols + c] = info;
         }
-        let cand = generate_points_from_corners(&map, mi_cols, mi_rows, 4, 4, 4, 4, 8, 8, 0)
+        let cand = generate_points_from_corners(&map, mi_cols, mi_rows, 4, 4, 4, 4, 8, 8, 0, 0)
             .expect("three differing corner MVs must yield a warp candidate");
         assert_ne!(cand[2], 1 << WARPEDMODEL_PREC_BITS);
     }

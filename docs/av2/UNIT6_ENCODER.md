@@ -176,3 +176,21 @@ New unit tests:
 
 Nothing was committed. No `unsafe`, no new dependency, no native build step, and
 no third-party code was added.
+
+---
+
+## 2026-11-11 update — DRL now uses the full §7.12.2 stack
+
+The reduced `build_drl_candidates()` ranking described above has been removed.
+`NEWMV`/`NEARMV` now use `av2::inter::find_mv_stack()`, the complete AV2 v1.0.0
+§7.12.2 process (spatial scan, scan-col, derived candidates, reference-MV bank,
+sorting/truncation, extra search, clamping, and the `WarpParamStack`). See
+[`UNIT8_ENCODER.md`](UNIT8_ENCODER.md) §"2026-11-11 update" for the process and
+the shared verification matrix.
+
+The previously recorded unit-6 matrix remains reproducible: with `newmv = 1`
+and `switchable = 1` (warped motion off) at 64x64 and 256x192, QP 20/100/140,
+`encoder reconstruction == our decoder == dav2d` on every frame, and
+`check_av2.py quick` is 9/9. The encoder's coded MV residual is now snapped onto
+the MVD lattice before use, so a predictor with an odd component can no longer
+produce a reconstruction the decoder does not reproduce.

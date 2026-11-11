@@ -49,6 +49,24 @@ pub fn mv_clamp_to_integer(v: i32) -> i32 {
     }
 }
 
+/// Snaps `mv` onto the MVD lattice of `ref_mv` for `mv_prec`.
+///
+/// `encode_mv_magnitude()` codes `(mv - ref_mv) >> (6 - mv_prec)`, so a
+/// residual that is not a multiple of `1 << (6 - mv_prec)` would reconstruct a
+/// different vector. Encoder-side decisions must use the snapped vector.
+#[inline]
+pub fn snap_mv_to_precision(mv: MvXY, ref_mv: MvXY, mv_prec: usize) -> MvXY {
+    let shift = 6usize.saturating_sub(mv_prec.min(6));
+    let snap = |v: i16, r: i16| -> i16 {
+        let d = (v as i32 - r as i32) >> shift;
+        (r as i32 + (d << shift)) as i16
+    };
+    MvXY {
+        x: snap(mv.x, ref_mv.x),
+        y: snap(mv.y, ref_mv.y),
+    }
+}
+
 /// Decodes the magnitude of a 2D motion vector difference `mvd` from `msac` using Joint Shell syntax.
 pub fn read_mv_magnitude(
     msac: &mut MsacDecoder,

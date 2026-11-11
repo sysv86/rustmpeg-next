@@ -134,3 +134,17 @@ AVM stream. They are unchanged by this unit.
 
 Nothing was committed. No `unsafe`, no new dependency, no native build step, and
 no third-party code was added.
+
+---
+
+## 2026-11-11 update — full §7.12.2 stack
+
+The decoder's DRL is now the same complete `find_mv_stack()` the encoder uses;
+the reduced spatial approximation and the compound remapping workaround are
+removed. The single-reference, `has_second_drl`, and compound DRL paths share
+one candidate map and one stack process, including the reference-MV bank and
+the per-superblock-row bank reset. See
+[`UNIT8_DECODER.md`](UNIT8_DECODER.md) §"2026-11-11 update" and
+[`UNIT8_ENCODER.md`](UNIT8_ENCODER.md) for the verification matrix; the unit-6
+NEWMV/switchable matrix remains byte-exact against `dav2d`, and the full
+workspace test suite passes.
