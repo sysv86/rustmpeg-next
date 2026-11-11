@@ -1883,6 +1883,48 @@ impl CdfModeContext {
     pub fn tx_do_partition(&mut self, fsc: usize, is_inter: usize, grp: usize) -> &mut [u16; 3] {
         &mut self.tx_do_partition[fsc.min(1)][is_inter.min(1)][grp.min(8)]
     }
+
+    /// `tx_partition_type` CDF for a block whose transform can be split both
+    /// horizontally and vertically (AV2 Spec v1.0.0 §8, Table 8.61).
+    #[inline]
+    pub fn tx_partition_type(
+        &mut self,
+        fsc: usize,
+        is_inter: usize,
+        grp: usize,
+        reduced: bool,
+    ) -> &mut [u16; 8] {
+        if reduced {
+            &mut self.tx_partition_type_reduced[fsc.min(1)][is_inter.min(1)][grp.min(13)]
+        } else {
+            &mut self.tx_partition_type[fsc.min(1)][is_inter.min(1)][grp.min(13)]
+        }
+    }
+
+    /// `tx_2or3_partition_type` CDF (only `HORZ`/`VERT` and their 4-way forms
+    /// are reachable for 4-sample-thin blocks).
+    #[inline]
+    pub fn tx_2or3_partition_type(
+        &mut self,
+        fsc: usize,
+        is_inter: usize,
+        grp: usize,
+    ) -> &mut [u16; 3] {
+        &mut self.tx_2or3_partition_type[fsc.min(1)][is_inter.min(1)][grp.min(1)]
+    }
+
+    /// `lossless_tx_size` CDF (§5.20.6.1: `Size_Group[MiSize]`, `is_inter`).
+    #[inline]
+    pub fn lossless_tx_size(&mut self, size_group: usize, is_inter: usize) -> &mut [u16; 3] {
+        &mut self.lossless_tx_size[size_group.min(3)][is_inter.min(1)]
+    }
+
+    /// `lossless_inter_tx_type` CDF (`txtp_lossless`: `WHT_WHT` vs `IDTX` for a
+    /// 4x4 inter transform at lossless).
+    #[inline]
+    pub fn lossless_inter_tx_type(&mut self) -> &mut [u16; 3] {
+        &mut self.lossless_inter_tx_type
+    }
 }
 #[derive(Clone, Copy)]
 pub struct CdfMvContext {

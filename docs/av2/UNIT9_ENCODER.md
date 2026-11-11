@@ -1,13 +1,12 @@
 # AV2 release unit 9 — encoder/shared half (transform types, lossless WHT, DPCM)
 
-Date: 2026-10-29
+Date: 2026-10-29, updated 2026-11-11
 Scope: AV2 v1.0.0 normative transform-type signalling (`get_tx_set`,
 `transform_type`, reduced sets 0–3), the lossless 4x4 WHT path at quantizer
-index 0, DPCM intra prediction (`use_dpcm_y` / `use_dpcm_uv`), and the
-transform-partition signalling on the encoder/shared side. External
-verification is byte-exact against `dav2d`. The decoder
-(`crates/rustmpeg-video/src/av2/dec/*`) is agent 2's half and is not modified
-here.
+index 0 (intra **and** inter, `lossless_tx_size`, `txtp_lossless`), DPCM intra
+prediction (`use_dpcm_y` / `use_dpcm_uv`), and the transform-partition
+signalling and RDO (`TX_PARTITION_SPLIT`/`HORZ`/`VERT`). External verification
+is byte-exact against `dav2d`.
 
 ## Normative findings
 
@@ -25,6 +24,12 @@ here.
 | DPCM reconstruction | §7.15.4 cumulative sum over `Residual` (`V_PRED` vertical, else horizontal) | `itx_tmpl.c` `residual_add` cases 1/2 |
 | Lossless intra prediction per transform block | §5.20.7.24 `make_intra_prediction` (`x > 0`, `y > 0`, `allowCorners`) | `decode.c` / `recon_tmpl.c` |
 | Transform-partition flag presence | §5.20.6.1/§5.20.6.3 (`MiSize > 4x4`, `TxMode == TX_MODE_SELECT`, block ≤ 64x64) | `decode.c` `read_tx_partition` |
+| Partition type symbol | §5.20.6.3 `tx_partition_type` (6-way, `txPartition = symbol + 1`); `tx_2or3_partition_type` for 4-sample-thin blocks | `decode.c` `read_tx_part` (`size_to_tx_type_group_vh_lookup`) |
+| `lossless_tx_size` | §5.20.6.1: coded when `MiSize != 4x4`, inter (or `fsc`), and not skipped; `1` selects `find_tx_size(Min(32,BW), Min(32,BH))` | `recon_tmpl.c` `read_tx_part` (`tx_size_ll`) |
+| `txtp_lossless` | §5.20.8.2: 4x4 inter luma at lossless codes `WHT_WHT` vs `IDTX`; larger inter transforms infer `IDTX` | `recon_tmpl.c` `decode_cf` |
+| Lossless `IDTX` reconstruction | §7.15.4: `Residual = Dequant >> (3 - shift)`, `shift = (pels > 256) + (pels > 1024)` | `itx_tmpl.c` |
+| Lossless chroma transform size | §5.20.7.23: `txSz = Lossless ? TX_4X4 : ...` (chroma is always 4x4 at lossless) | `recon_tmpl.c` `read_coef_blocks` |
+| QP 0 is lossless for every frame type | §5.18.1 `LosslessArray` per segment | `read_frame_header` |
 
 Two details differ between the specification text and the reference decoder and
 are resolved in favour of the oracle, because the acceptance criterion is
@@ -127,6 +132,73 @@ byte-exactness with `dav2d`:
 - `examples/av2_encode.rs`: new trailing arguments `tx_type_rdo`,
   `reduced_txtp_set` (0–3) and `dpcm`, plus a per-frame counter line.
 
+Update 2026-11-11 (inter lossless and transform partitions):
+
+- `frame.rs`
+  - `EncTxUnit` carries the geometry, kernel, EOB and quantized/dequantized
+    levels of one transform unit; the inter residual is built into per-unit
+    buffers before the block syntax and coded unit by unit, so the transform
+    partition symbol precedes the coefficient blocks and every unit updates
+    its own rate contexts.
+  - `encode_inter_lossless_leaf` logic inside `encode_inter_leaf`: 4x4
+    WHT/`IDTX` units with `txtp_lossless`, the optional full-block `IDTX`
+    (`lossless_tx_size = 1`), chroma 4x4 units inheriting the co-located luma
+    kernel, and the §7.14.4 `8 * q` dequantization.
+  - The lossless inter/intra decision in `encode_leaf_block` (SATD of the
+    selected intra mode against the inter predictor) so quantizer-index-0
+    frames can code inter blocks.
+  - `record_deblock_inter` records the per-unit transform sizes for the
+    deblock/CDEF grid.
+  - `FrameStats::tx_partition_counts` reports the partition decisions.
+- `ratectrl.rs`: a constant quantizer of 0 is kept at 0 for every frame type.
+- `txpart.rs`: `select_best_tx_partition` evaluates `NONE`/`SPLIT`/`HORZ`/
+  `VERT` with the same cost; `encode_tx_partition_syntax` writes
+  `tx_do_partition` plus `tx_partition_type` (6-way) or
+  `tx_2or3_partition_type`, and `find_tx_size` / `tx_partition_is_signallable`
+  gate the search.
+- `transform.rs`: `inv_txfm_add_lossless_idtx` implements the §7.15.4
+  `Residual = Dequant >> (3 - shift)` pass-through.
+- `tables.rs`: `TX_PART_TYPE_GROUP_VH` (`Size_To_Tx_Type_Group_Vert_And_Horz`).
+- `cdf.rs`: accessors for `tx_partition_type`, `tx_2or3_partition_type`,
+  `lossless_tx_size` and `lossless_inter_tx_type`.
+- `entropy.rs`: `encode_lossless_tx_size`, the `txtp_lossless` symbol, and the
+  lossless chroma kernel masking.
+- `mod.rs`: the quantizer-index-0 `keyint = 1` forcing is removed; the new
+  external-oracle and in-tree transform-partition tests are added.
+
+Update 2026-11-11 (inter lossless and transform partitions):
+
+8. **Quantizer index 0 was not lossless on inter frames.** `RateControlMode::
+   ConstantQp` shifted key frames by −8 and inter frames by +4, so a "QP 0"
+   stream coded its inter frames at quantizer index 4 plus the GOP offset
+   (observed `yac = 6`). A quantizer index of 0 is lossless for every frame
+   (§5.18.1), so the offset is now bypassed when `base_qidx == 0`.
+9. **Inter lossless was not modelled.** `mod.rs` forced `keyint = 1` at
+   quantizer index 0. Inter blocks now code `lossless_tx_size` in the
+   transform-tree position and one 4x4 WHT (or `IDTX`, `txtp_lossless`) per
+   transform unit, reusing the per-transform-block residual coding of the
+   intra path. Blocks up to 16x16 may instead pick the single full-block
+   `IDTX` (`lossless_tx_size = 1`, §7.15.4 shift 0); larger blocks always use
+   4x4 units. Chroma is coded as 4x4 units whose kernel is inherited from the
+   co-located luma unit (§5.20.7.23).
+10. **The decoder overwrote the per-unit coefficient contexts.** Its inter
+   neighbour bookkeeping wrote one `res_ctx` over the whole block footprint
+   after the coefficient loop, replacing the per-transform-unit contexts of
+   lossless blocks with the last unit's value (encoder/decoder desync at the
+   first TU of the next block). The footprint write now only runs for blocks
+   with a single transform unit per plane.
+11. **Only `TX_PARTITION_NONE` was emitted.** `select_best_tx_partition` only
+   compared `NONE` against `SPLIT` behind a quadrant-uniformity early return,
+   and `encode_tx_partition_flag` wrote the flag without the partition type
+   symbol. The RDO now evaluates `NONE`/`SPLIT`/`HORZ`/`VERT` with the same
+   Lagrangian metric, and the syntax writes `tx_partition_type`
+   (6-way) for every block that can split in both directions.
+12. **Inter coefficient coding with several transform units.** The encoder's
+   luma/chroma residual is computed into per-unit buffers (`EncTxUnit`) before
+   the block syntax, so the transform-partition symbol and the coefficient
+   blocks stay in the normative order, and the per-unit rate contexts are
+   updated at each unit's own position.
+
 ## Verification
 
 Environment: Linux, one thread, `dav2d` revision `bff8e5c`
@@ -194,6 +266,67 @@ cargo test -p rustmpeg-video --lib av2_unit9_encoder_dav2d_byte_exact -- --ignor
 # test result: ok. 1 passed
 ```
 
+### Inter lossless (quantizer index 0, inter frames)
+
+With the rate-control fix a quantizer index of 0 stays lossless on inter
+frames, so every frame after the first is an inter frame with a lossless
+residual. The QP 0 rows of the matrix below encode three frames with
+`keyint = 60` and are byte-exact against `dav2d`:
+
+| Resolution | Layout | Bit depth | Frames | Result |
+| :-- | :-- | --: | --: | :-- |
+| 64x64 | I420 | 8 | 3 | **exact** |
+| 256x192 | I420 | 8 | 3 | **exact** |
+| 256x192 | I420 | 10 | 3 | **exact** |
+
+Command:
+
+```bash
+DAV2D=$ORACLE/dav2d cargo test -p rustmpeg-video --lib \
+  av2_unit9_encoder_dav2d_byte_exact -- --ignored
+# test result: ok. 1 passed
+```
+
+The in-tree test `test_lossless_encoder_is_exact_and_selects_wht_and_dpcm`
+asserts that frame 0 is a key frame, frames 1 and 2 are inter frames, the
+reconstruction equals the source sample by sample on every plane, and the
+counters are non-zero. It reports `wht = 17`, `dpcm_y = 14`, `dpcm_uv = 17`
+and `inter = 1` for the three 64x64 frames.
+
+### Transform partitions
+
+`enable_tx_partition` selects between `TX_PARTITION_NONE`, `SPLIT`, `HORZ` and
+`VERT` for inter luma blocks with a base transform larger than 4x4 whose
+block can signal the 6-way `tx_partition_type` (min side ≥ 8 samples, block
+≤ 64x64). Each candidate transforms, quantizes, reconstructs and scans every
+sub-unit; the cost is `SSE + lambda * rate` with a fixed per-unit rate
+estimate. `speed >= 7` searches only `NONE`/`SPLIT`, `speed >= 8` emits
+`NONE`. The selected partition is written with `tx_do_partition` +
+`tx_partition_type` at the normative position and the sub-unit coefficient
+blocks follow in raster order; the deblocking grid records the sub-unit
+transform sizes.
+
+| Case | QP | Frames | Result |
+| :-- | :-- | --: | :-- |
+| 64x64 8-bit | 0, 20, 100, 140 | 3 | **4/4 exact** |
+| 256x192 8-bit | 0, 20, 100, 140 | 3 | **4/4 exact** |
+| 256x192 10-bit | 100 | 3 | **1/1 exact** |
+
+Command:
+
+```bash
+DAV2D=$ORACLE/dav2d cargo test -p rustmpeg-video --lib \
+  av2_unit9_encoder_dav2d_tx_partition -- --ignored
+# test result: ok. 1 passed
+```
+
+The test asserts `tx_partition_counts[SPLIT] > 0`, `[HORZ] > 0` and
+`[VERT] > 0` over the matrix. The in-tree
+`test_encoder_transform_partitions_round_trip` checks
+`encoder reconstruction == our decoder` for the same two sizes at QP
+0/20/100/140 and reports `[NONE, SPLIT, HORZ, VERT] = [63, 3, 3, 6]` over 75
+evaluated inter blocks.
+
 ### Baseline regression
 
 ```bash
@@ -202,8 +335,9 @@ python3 $ORACLE/check_av2.py full    # 84/84 OK, exit 0
 ```
 
 The default configuration is unchanged: `enable_tx_type_rdo = false`,
-`reduced_txtp_set = 2`, `enable_dpcm = false`, and the lossless path only
-affects quantizer index 0.
+`reduced_txtp_set = 2`, `enable_dpcm = false`, `enable_tx_partition = false`.
+The lossless path only affects quantizer index 0, and the transform-partition
+RDO is opt-in.
 
 ### RD and speed impact
 
@@ -233,9 +367,12 @@ the evaluation is skipped for transform blocks larger than 16x16 and at
 ```text
 cargo fmt --all -- --check                             -> rc 0
 cargo clippy --workspace --all-targets -- -D warnings  -> rc 0
-cargo test --workspace                                 -> 731 passed, 0 failed, 6 ignored
-cargo test -p rustmpeg-video av2                       -> 147 passed, 0 failed, 6 ignored
+cargo test --workspace                                 -> 800 passed, 0 failed, 13 ignored
+cargo test -p rustmpeg-video --lib av2                 -> 159 passed, 0 failed, 12 ignored
+cargo test -p rustmpeg-video --lib av2_ -- --ignored   -> 13 passed, 0 failed
 python3 scripts/check-licenses.py                      -> license audit: OK
+python3 $ORACLE/check_av2.py quick                     -> 9/9 OK, exit 0
+python3 $ORACLE/check_av2.py full                      -> 84/84 OK, exit 0
 cargo build --release -p rustmpeg-video --examples     -> rc 0
 ```
 
@@ -254,37 +391,50 @@ New unit tests:
 
 ## Deliberate limits and remaining risks
 
+- **Inter lossless is complete for square and rectangular inter blocks.**
+  `lossless_tx_size = 1` is only chosen for blocks up to 16x16 (256 samples,
+  where the §7.15.4 `IDTX` shift is 0); larger blocks code 4x4 WHT units.
+  Streams whose `lossless_tx_size = 1` block needs more than one 32x32
+  transform are rejected by the decoder with a typed error, and this encoder
+  never produces them.
+- **Intra transform partitions are not emitted.** Intra blocks stay
+  `TX_PARTITION_NONE`; per-transform-block intra prediction is not modelled.
+  The intra partition syntax is parsed so the decoder rejects it precisely.
+- **4-way and 5-way partitions are not emitted or decoded.** Only
+  `SPLIT`/`HORZ`/`VERT` are selected; `HORZ4`/`VERT4`/`HORZ5`/`VERT5` are
+  rejected with a typed error.
 - **`IDTX` is selectable and byte-exact.** The forward identity path is
   self-consistent with the normative inverse; the earlier V-plane difference
   with `IDTX` enabled was an inter-chroma bug (the encoder used the luma kernel
   even when the luma block quantized to all zero, while the reference infers
-  `DCT_DCT`). Fixed in `frame.rs`; 1920x1080 `testsrc2` QP 20/140 reduced set 2
-  is now exact with 1 and 9 `IDTX` inter luma blocks in frames 1 and 2.
-- **Non-DPCM lossless is byte-exact.** The former 22-sample 1-LSB difference in
-  frame 2 was a per-transform-block top-right/bottom-left availability
-  difference; the encoder now derives `n_tr`/`n_bl` from the per-4x4 `is_coded`
-  map exactly like the reference decoder.
-- **Lossless coding is intra-only.** Inter lossless would require
-  `lossless_tx_size` signalling and 4x4 WHT residual coding for inter blocks;
-  `mod.rs` forces key frames for quantizer index 0 instead.
-- **The encoder emits only `TX_PARTITION_NONE`.** The transform-tree flag is
-  coded at the normative position and suppressed for lossless frames and
-  `reduced_tx_part_set`, but sub-block transform splits are not selected
-  (`txpart.rs` RDO uses the default kernel).
+  `DCT_DCT`). Fixed in `frame.rs`.
+- **Non-DPCM lossless is byte-exact,** including frame 2; the per-transform
+  block top-right/bottom-left availability follows the reference decoder's
+  `n_tr`/`n_bl` derivation over a per-plane `is_coded` map. Inter blocks are
+  not entered into that map, which matches the decoder's behaviour for the
+  encoder's subset.
+- **Lossless palette / DIP / CfL are not selected** and are rejected by the
+  decoder with typed errors; their per-transform-block reconstruction is not
+  implemented.
 - **The long transform sets** (`TX_SET_WIDE_*` / `HIGH_*`) are implemented in
-  the symbol encoder, but the encoder only produces square coding blocks, so
-  those branches are exercised only by the decoder half.
+  the symbol encoder, but the encoder only produces square-or-rectangular
+  coding blocks whose base transform matches the block, so those branches are
+  exercised only by the decoder half.
 - **`TX_SET_INTER_1` / `INTER_2`** are only reachable for inter blocks of 16x16
   or smaller; the current partitioner emits those only for some content
   (16x16 frames, 1080p), which is why the inter symbols are verified with the
   16x16 and 1080p cases.
-- The decoder half applies the same §7.14.4 lossless dequantization (`8 * q`)
-  and the `EobU` rule; see [`UNIT9_DECODER.md`](UNIT9_DECODER.md).
 
 Update 2026-10-29 (decoder half): the decoder implements every transform set,
 lossless WHT/DPCM, and the `EobU` rule; `IDTX` is selectable and both encoder
 mismatches above are fixed. `cargo test -p rustmpeg-video --lib
 av2_unit9_decoder_dav2d_byte_exact -- --ignored` passes.
 
-Nothing was committed. No `unsafe`, no new dependency, no native build step, and
-no third-party code was added.
+Update 2026-11-11: inter lossless, `lossless_tx_size`, `txtp_lossless`, the
+lossless `IDTX` pass-through and the `SPLIT`/`HORZ`/`VERT` transform partitions
+are implemented on both sides and verified against `dav2d`. See
+[`UNIT9_DECODER.md`](UNIT9_DECODER.md) for the decoder half and the neighbour
+context fix.
+
+No `unsafe`, no new dependency, no native build step, and no third-party code
+was added.

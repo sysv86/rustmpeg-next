@@ -1217,6 +1217,51 @@ pub fn fwd_txfm_2d(res: &[i32], res_stride: usize, coeff_out: &mut [i32], txtp: 
     }
 }
 
+/// Inverse transform residual addition for the normative lossless `IDTX`
+/// case: AV2 Spec v1.0.0 §7.15.4 sets `Residual = Dequant >> (3 - shift)`
+/// with `shift = (pels > 256) + (pels > 1024)` over the adjusted transform
+/// size, instead of running the fixed-point identity kernel.
+pub fn inv_txfm_add_lossless_idtx<BD: BitDepth>(
+    bd: BD,
+    dst: &mut [BD::Pixel],
+    dst_off: usize,
+    stride: usize,
+    coeff: &mut [i32],
+    eob: i32,
+    tx: usize,
+) {
+    if eob < 0 {
+        return;
+    }
+    let t_dim = &TXFM_DIMENSIONS[tx];
+    let sw = (t_dim.w as usize * 4).min(32);
+    let sh = (t_dim.h as usize * 4).min(32);
+    let pels = sw * sh;
+    let shift = (pels > 256) as i32 + (pels > 1024) as i32;
+    let down = 3 - shift;
+    let mut tmp = [0i32; 32 * 32];
+    for y in 0..sh {
+        for x in 0..sw {
+            tmp[y * sw + x] = coeff[y + x * sh] >> down;
+        }
+    }
+    // The residual plane is `sw` x `sh` samples (the fixed-point kernels store
+    // the reduced grid for transforms larger than 32).
+    for y in 0..sh {
+        let row = dst_off + y * stride;
+        if row >= dst.len() {
+            break;
+        }
+        let n = sw.min(dst.len() - row);
+        for x in 0..n {
+            let p: i32 = dst[row + x].into();
+            dst[row + x] = bd.pixel_clip(p + tmp[y * sw + x]);
+        }
+    }
+    let nz = (sw * sh).min(coeff.len());
+    coeff[..nz].fill(0);
+}
+
 /// Residual addition helper for `inv_txfm_add`.
 pub fn residual_add<BD: BitDepth>(
     bd: BD,

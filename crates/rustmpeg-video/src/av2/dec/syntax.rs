@@ -452,10 +452,6 @@ pub fn decode_intra_uv_mode(
             }
         }
         if idx > 7 {
-            eprintln!(
-                "DEBUG uv_mode: uv_idx={} uv_mode_ctx={} luma_midx={} idx={}",
-                uv_idx, uv_mode_ctx, luma_midx, idx
-            );
             return Err(Av2Error::BitstreamError(
                 "chroma intra mode index out of range".to_string(),
             ));
@@ -786,12 +782,14 @@ fn derive_txtp(
                 return Ok(txtp::WHT_WHT as u16);
             }
             if t_dim.max == 0 {
-                // `txtp_lossless` (WHT vs IDTX for a 4x4 inter transform) is
-                // not part of this decoder's CDF context; the encoder is
-                // intra-only at quantizer index 0.
-                return Err(Av2Error::Unsupported(
-                    "inter lossless 4x4 transform type signalling".to_string(),
-                ));
+                // `txtp_lossless`: WHT_WHT vs IDTX for a 4x4 inter transform
+                // (AV2 Spec v1.0.0 §5.20.8.2; `dav2d` `decode_cf`).
+                let idtx = msac.decode_bool_adapt(cdf_m.lossless_inter_tx_type())? != 0;
+                return Ok(if idtx {
+                    txtp::IDTX as u16
+                } else {
+                    txtp::WHT_WHT as u16
+                });
             }
             return Ok(txtp::IDTX as u16);
         }
@@ -1266,6 +1264,90 @@ mod tests {
     use crate::av2::segment::{SegmentCoder, encode_delta_q, encode_segment_id};
 
     #[test]
+    fn coef_lossless_inter_luma_roundtrip() {
+        // A 4x4 inter luma transform block at lossless: the WHT levels are the
+        // residual samples, including values above the low-frequency token
+        // alphabet (so the high-range residual path is exercised).
+        use crate::av2::entropy::{CoefCodingParams, encode_coefs};
+        let levels = [31i32, -2, -2, 0, -25, 0, 0, 0, -1, 0, 0, 0, 1, 0, 0, 0];
+        let p_enc = CoefCodingParams {
+            tx: 0,
+            bs: BlockSize::Bs64x64 as usize,
+            plane: 0,
+            intra: false,
+            fsc: false,
+            lossless: true,
+            y_mode: 0,
+            y_angle: 0,
+            mrl_index: 0,
+            uv_mode: 0,
+            reduced_txtp_set: 2,
+            u_has_cf: 0,
+            dq_tbl: [0, 0],
+            bitdepth: 8,
+            qm: None,
+            ss_hor: true,
+            ss_ver: true,
+        };
+        let p_dec = CoefDecodeParams {
+            tx: 0,
+            bs: BlockSize::Bs64x64 as usize,
+            plane: 0,
+            intra: false,
+            fsc: false,
+            lossless: true,
+            uv_mode: 0,
+            y_mode: 0,
+            y_angle: 0,
+            mrl_index: 0,
+            y_txtp: 0,
+            reduced_txtp_set: 2,
+            u_has_cf: 0,
+            dq_tbl: [0, 0],
+            bitdepth: 8,
+            ss_hor: true,
+            ss_ver: true,
+            chroma_dctonly: false,
+        };
+        let a_enc = [0x40u8; 64];
+        let l_enc = [0x2Eu8; 64];
+        let mut msac_enc = MsacEncoder::new();
+        let mut cdf_enc = CdfContext::new(0);
+        let mut txtp_e = crate::av2::transform::WHT_WHT as u16;
+        let mut rc_e = 0u8;
+        let eob_e = encode_coefs(
+            &mut msac_enc,
+            &mut cdf_enc.coef,
+            &mut cdf_enc.m,
+            &a_enc,
+            &l_enc,
+            &p_enc,
+            &levels,
+            &mut txtp_e,
+            &mut rc_e,
+        );
+        let bytes = msac_enc.finalize();
+        let mut msac_dec = MsacDecoder::new(&bytes, true);
+        let mut cdf_dec = CdfContext::new(0);
+        let mut dq = [0i32; 32 * 32];
+        let res = decode_coefs(
+            &mut msac_dec,
+            &mut cdf_dec.coef,
+            &mut cdf_dec.m,
+            &a_enc,
+            &l_enc,
+            &p_dec,
+            &mut dq,
+        )
+        .unwrap();
+        let got: Vec<i32> = dq[..16].iter().map(|v| v / 8).collect();
+        assert_eq!(eob_e, res.eob);
+        assert_eq!(txtp_e, res.txtp);
+        assert_eq!(rc_e, res.res_ctx);
+        assert_eq!(got, levels);
+    }
+
+    #[test]
     fn partition_decision_roundtrip_all_types() {
         let mut a = BlockContext::default();
         let mut l = BlockContext::default();
@@ -1279,7 +1361,7 @@ mod tests {
         // Test Bs128x128 with Split and None
         for bp in [BlockPartition::None, BlockPartition::Split] {
             let mut msac_enc = MsacEncoder::new();
-            let mut cdf_enc = CdfContext::default();
+            let mut cdf_enc = CdfContext::new(0);
             encode_partition_decision(
                 &mut msac_enc,
                 &mut cdf_enc.m,
@@ -1293,7 +1375,7 @@ mod tests {
             );
             let bytes = msac_enc.finalize();
             let mut msac_dec = MsacDecoder::new(&bytes, true);
-            let mut cdf_dec = CdfContext::default();
+            let mut cdf_dec = CdfContext::new(0);
             let decoded = decode_partition_decision(
                 &mut msac_dec,
                 &mut cdf_dec.m,
@@ -1321,7 +1403,7 @@ mod tests {
             BlockPartition::V4B,
         ] {
             let mut msac_enc = MsacEncoder::new();
-            let mut cdf_enc = CdfContext::default();
+            let mut cdf_enc = CdfContext::new(0);
             encode_partition_decision(
                 &mut msac_enc,
                 &mut cdf_enc.m,
@@ -1335,7 +1417,7 @@ mod tests {
             );
             let bytes = msac_enc.finalize();
             let mut msac_dec = MsacDecoder::new(&bytes, true);
-            let mut cdf_dec = CdfContext::default();
+            let mut cdf_dec = CdfContext::new(0);
             let decoded = decode_partition_decision(
                 &mut msac_dec,
                 &mut cdf_dec.m,

@@ -338,15 +338,7 @@ impl<P: Pixel> Encoder<P> {
             false
         };
 
-        // Lossless coding is intra-only in this encoder: an inter frame would
-        // have to signal `lossless_tx_size` and code its residual as 4x4 WHT
-        // blocks, which the encoder does not model yet. Every frame of a
-        // quantizer-index-0 stream is therefore a key frame.
-        let lossless = matches!(
-            self.config.rate_control,
-            RateControlMode::ConstantQp { base_qidx: 0 }
-        ) || self.config.base_qidx == 0;
-        let keyint = if lossless { 1 } else { self.config.keyint };
+        let keyint = self.config.keyint;
         let gop_plan = plan_gop_frame(
             frame_idx,
             keyint,
@@ -752,6 +744,155 @@ mod tests {
                 run_case!(u8, raw8_bytes, 16, 16, 8, 100, reduced, true, false);
             assert!(inter > 0, "no inter blocks at 16x16");
         }
+    }
+
+    /// External oracle for release unit 9: transform-partition selection.
+    ///
+    /// The encoder signals `TX_PARTITION_SPLIT`, `HORZ` and `VERT` for inter
+    /// luma blocks (AV2 Spec v1.0.0 §5.20.6.3); its reconstruction must match
+    /// `dav2d` byte for byte for every partition it selects.
+    ///
+    /// `DAV2D` overrides the reference decoder path. Ignored by default because
+    /// it needs the external binary.
+    #[test]
+    #[ignore = "requires the dav2d reference decoder"]
+    fn av2_unit9_encoder_dav2d_tx_partition() {
+        use std::process::Command;
+
+        use crate::av2::container::IvfWriter;
+
+        let Some(dav2d) = crate::av2::test_support::oracle_bin("DAV2D", "dav2d") else {
+            eprintln!("dav2d not found (set DAV2D or add it to PATH); skipping external test");
+            return;
+        };
+        let dir = std::env::temp_dir().join("rustmpeg-u9txpart");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        macro_rules! run_case {
+            ($p:ty, $ser:ident, $w:expr, $h:expr, $bd:expr, $q:expr) => {{
+                let (w, h, bd, q): (usize, usize, u8, u16) = ($w, $h, $bd, $q);
+                let tag = format!("u9tx_{w}x{h}_{bd}_{q}");
+                let cfg = EncoderConfig {
+                    width: w,
+                    height: h,
+                    bit_depth: bd,
+                    layout: PixelLayout::I420,
+                    base_qidx: q,
+                    rate_control: RateControlMode::ConstantQp { base_qidx: q },
+                    keyint: 60,
+                    tools: ToolConfig {
+                        enable_tx_partition: true,
+                        ..ToolConfig::default()
+                    },
+                    ..EncoderConfig::default()
+                };
+                let ivf = dir.join(format!("{tag}.ivf"));
+                let mut recon: Vec<Vec<u8>> = Vec::new();
+                let mut counts = [0usize; 4];
+                {
+                    let mut writer = IvfWriter::new(
+                        std::io::BufWriter::new(std::fs::File::create(&ivf).unwrap()),
+                        w as u16,
+                        h as u16,
+                        30,
+                        1,
+                        3,
+                    )
+                    .unwrap();
+                    let mut enc = Encoder::<$p>::new(cfg).unwrap();
+                    for idx in 0..3 {
+                        let raw =
+                            RawFrame::<$p>::generate_synthetic(w, h, bd, PixelLayout::I420, idx);
+                        let pkt = enc.encode_raw_frame(&raw).unwrap();
+                        writer.write_packet(pkt.pts, &pkt.data).unwrap();
+                        recon.push($ser(&pkt.rec_frame.to_raw()));
+                        for (total, count) in counts.iter_mut().zip(pkt.stats.tx_partition_counts) {
+                            *total += count;
+                        }
+                    }
+                    writer.flush().unwrap();
+                }
+                let out = dir.join(format!("{tag}.dav.y4m"));
+                let status = Command::new(&dav2d)
+                    .arg("-i")
+                    .arg(&ivf)
+                    .arg("-o")
+                    .arg(&out)
+                    .args(["--threads", "1", "--framedelay", "1", "--strict", "1", "-q"])
+                    .status()
+                    .expect("run dav2d");
+                assert!(status.success(), "dav2d failed for {tag}");
+                let dav = read_y4m_frames(&out);
+                assert_eq!(dav.len(), recon.len(), "{tag}: frame count");
+                for (i, (a, b)) in dav.iter().zip(recon.iter()).enumerate() {
+                    assert_eq!(a, b, "{tag} frame {i}: dav2d mismatch");
+                }
+                counts
+            }};
+        }
+
+        let mut total = [0usize; 4];
+        for q in [0u16, 20, 100, 140] {
+            for (w, h) in [(64usize, 64usize), (256, 192)] {
+                let counts = run_case!(u8, raw8_bytes, w, h, 8, q);
+                for (t, c) in total.iter_mut().zip(counts) {
+                    *t += c;
+                }
+            }
+        }
+        let counts = run_case!(u16, raw16_bytes, 256, 192, 10, 100);
+        for (t, c) in total.iter_mut().zip(counts) {
+            *t += c;
+        }
+        assert!(total[1] > 0, "no TX_PARTITION_SPLIT selected: {total:?}");
+        assert!(total[2] > 0, "no TX_PARTITION_HORZ selected: {total:?}");
+        assert!(total[3] > 0, "no TX_PARTITION_VERT selected: {total:?}");
+    }
+
+    /// In-tree transform-partition round trip: the encoder must select
+    /// `SPLIT`/`HORZ`/`VERT` and our decoder must reproduce its reconstruction
+    /// (AV2 Spec v1.0.0 §5.20.6.3).
+    #[test]
+    fn test_encoder_transform_partitions_round_trip() {
+        let mut total = [0usize; 4];
+        for (w, h) in [(64usize, 64usize), (256, 192)] {
+            for q in [0u16, 20, 100, 140] {
+                let cfg = EncoderConfig {
+                    width: w,
+                    height: h,
+                    bit_depth: 8,
+                    layout: PixelLayout::I420,
+                    base_qidx: q,
+                    rate_control: RateControlMode::ConstantQp { base_qidx: q },
+                    keyint: 60,
+                    tools: ToolConfig {
+                        enable_tx_partition: true,
+                        ..ToolConfig::default()
+                    },
+                    ..EncoderConfig::default()
+                };
+                let mut enc = Encoder::<u8>::new(cfg).unwrap();
+                let mut dec = crate::av2::dec::Decoder::<u8>::new();
+                for idx in 0..3 {
+                    let raw = RawFrame::generate_synthetic(w, h, 8, PixelLayout::I420, idx);
+                    let pkt = enc.encode_raw_frame(&raw).unwrap();
+                    for (t, c) in total.iter_mut().zip(pkt.stats.tx_partition_counts) {
+                        *t += c;
+                    }
+                    let decoded = dec.decode_packet(&pkt.data).unwrap().unwrap();
+                    let reference = pkt.rec_frame.to_raw();
+                    assert_eq!(
+                        decoded.frame.y, reference.y,
+                        "{w}x{h} q{q} frame {idx}: luma mismatch"
+                    );
+                    assert_eq!(decoded.frame.u, reference.u);
+                    assert_eq!(decoded.frame.v, reference.v);
+                }
+            }
+        }
+        assert!(total[1] > 0, "no TX_PARTITION_SPLIT: {total:?}");
+        assert!(total[2] > 0, "no TX_PARTITION_HORZ: {total:?}");
+        assert!(total[3] > 0, "no TX_PARTITION_VERT: {total:?}");
     }
 
     /// External oracle for release unit 3: CCSO (band and edge offsets, `sb_reuse`)
@@ -1469,10 +1610,19 @@ mod tests {
         let mut wht = 0usize;
         let mut dpcm_y = 0usize;
         let mut dpcm_uv = 0usize;
+        let mut inter = 0usize;
         for idx in 0..3 {
             let raw = RawFrame::generate_synthetic(64, 64, 8, PixelLayout::I420, idx);
             let pkt = enc.encode_raw_frame(&raw).unwrap();
-            assert_eq!(pkt.frame_type, FrameType::Key);
+            // Quantizer index 0 no longer forces key frames: inter lossless is
+            // coded with the 4x4 WHT and `lossless_tx_size` (§5.20.6.1).
+            let expected = if idx == 0 {
+                FrameType::Key
+            } else {
+                FrameType::Inter
+            };
+            assert_eq!(pkt.frame_type, expected);
+            inter += pkt.stats.inter_blocks;
             for pl in 0..3 {
                 let rec = &pkt.rec_frame.planes[pl];
                 let src = raw_plane(&raw, pl);
@@ -1492,6 +1642,7 @@ mod tests {
         assert!(wht > 0, "expected lossless WHT blocks, got {wht}");
         assert!(dpcm_y > 0, "expected luma DPCM blocks, got {dpcm_y}");
         assert!(dpcm_uv > 0, "expected chroma DPCM blocks, got {dpcm_uv}");
+        assert!(inter > 0, "expected inter lossless blocks, got {inter}");
     }
 
     #[test]

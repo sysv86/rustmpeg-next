@@ -204,6 +204,44 @@ pub static TX_PART_GROUP: [u8; N_BS_SIZES] = [
     0, // Bs2x2
 ];
 
+/// `Size_To_Tx_Type_Group_Vert_And_Horz` context of the `tx_partition_type`
+/// symbol (AV2 Spec v1.0.0 §9 / §6.19.6.3). `BLOCK_INVALID` entries are stored
+/// as 8, which the symbol is never read for: those blocks cannot split in both
+/// directions.
+pub static TX_PART_TYPE_GROUP_VH: [u8; N_BS_SIZES] = [
+    8,  // Bs128x128 (block > 64x64: no transform partition syntax)
+    8,  // Bs128x64
+    8,  // Bs64x128
+    9,  // Bs64x64
+    8,  // Bs64x32
+    7,  // Bs32x64
+    6,  // Bs32x32
+    5,  // Bs32x16
+    4,  // Bs16x32
+    3,  // Bs16x16
+    2,  // Bs16x8
+    1,  // Bs8x16
+    0,  // Bs8x8
+    8,  // Bs8x4 (thin: `tx_2or3_partition_type`)
+    8,  // Bs4x8
+    8,  // Bs4x4 (no split flag)
+    13, // Bs64x16
+    12, // Bs16x64
+    11, // Bs32x8
+    10, // Bs8x32
+    8,  // Bs16x4
+    8,  // Bs4x16
+    8,  // Bs128x32
+    8,  // Bs32x128
+    11, // Bs64x8
+    10, // Bs8x64
+    8,  // Bs32x4
+    8,  // Bs4x32
+    8,  // Bs64x4
+    8,  // Bs4x64
+    8,  // Bs2x2
+];
+
 /// Nominal angles (in degrees) for the 8 primary directional intra modes (`Vert..VertLeft`).
 pub static MODE_TO_ANGLE_MAP: [u8; 8] = [90, 180, 45, 135, 113, 157, 203, 67];
 

@@ -1,13 +1,13 @@
 # AV2 release unit 9 — decoder half (transform types, lossless WHT, DPCM)
 
-Date: 2026-10-29
+Date: 2026-10-29, updated 2026-11-11
 Scope: AV2 v1.0.0 transform-type signalling and kernels for every transform
-set (full and reduced 0–3), the lossless 4x4 WHT path at quantizer index 0,
-DPCM intra prediction (`use_dpcm_y` / `use_dpcm_uv`), and the `EobU` V-plane
-context. The decoder lives in `crates/rustmpeg-video/src/av2/dec/*`; the
-encoder fixes for the two unit-9 mismatches are in
-`crates/rustmpeg-video/src/av2/{transform,frame}.rs`. External verification is
-byte-exact against `dav2d`.
+set (full and reduced 0–3), the lossless 4x4 WHT path at quantizer index 0
+(intra and inter, `lossless_tx_size`, `txtp_lossless`, lossless `IDTX`),
+DPCM intra prediction (`use_dpcm_y` / `use_dpcm_uv`), the `EobU` V-plane
+context, and the `TX_PARTITION_SPLIT`/`HORZ`/`VERT` transform partitions. The
+decoder lives in `crates/rustmpeg-video/src/av2/dec/*`. External verification
+is byte-exact against `dav2d`.
 
 ## Normative findings
 
@@ -24,6 +24,11 @@ byte-exact against `dav2d`.
 | DPCM reconstruction | §7.15.4 cumulative sum over `Residual` (`V_PRED` vertical, else horizontal) | `itx_tmpl.c` `residual_add` cases 1/2 |
 | Lossless intra prediction per transform block | §5.20.7.24 `make_intra_prediction` (`x > 0`, `y > 0`, `allowCorners`) | `recon_tmpl.c` per-4x4 `prepare_intra_edges` |
 | `EobU` for the V plane | §5.20.7.27 sets `EobU` when the U plane is parsed | `recon_tmpl.c` `if (!pl) t->u_has_cf = eob >= 0` |
+| `lossless_tx_size` | §5.20.6.1 (inter, `MiSize != 4x4`, not skipped) | `decode.c` `read_tx_part` |
+| `txtp_lossless` | §5.20.8.2 (4x4 inter luma: `WHT_WHT` vs `IDTX`; larger infers `IDTX`) | `recon_tmpl.c` `decode_cf` |
+| Lossless `IDTX` residual | §7.15.4 `Residual = Dequant >> (3 - shift)` | `itx_tmpl.c` |
+| Lossless chroma transform size | §5.20.7.23 (`TX_4X4` at lossless) | `recon_tmpl.c` `read_coef_blocks` |
+| Transform partition syntax | §5.20.6.3 `tx_do_partition`, `tx_partition_type`, `tx_2or3_partition_type` | `decode.c` `read_tx_part` |
 
 Two details resolve in favour of the oracle because the acceptance criterion is
 byte-exactness with `dav2d`:
@@ -96,6 +101,34 @@ byte-exactness with `dav2d`:
   `IDTX` is now selectable (it was excluded from the inter candidate lists).
   `select_best_tx_type` keeps `DCT_DCT` as the tie-break default.
 
+Update 2026-11-11 (inter lossless, partitions, neighbour context):
+
+- `dec/frame.rs`
+  - `decode_lossless_inter_block` logic inside `decode_inter_block`: the luma
+    transform units are the 4x4 units of `lossless_tx_size == 0` (or the single
+    full-block `IDTX` of `lossless_tx_size == 1`), decoded per unit with their
+    own coefficient contexts; chroma is always coded as 4x4 units whose kernel
+    is inherited from the co-located luma unit (§5.20.7.23, `txtp_map`).
+  - The neighbour context bookkeeping no longer writes one `res_ctx` over the
+    whole block footprint when the block has more than one transform unit.
+    That write clobbered the per-unit contexts of lossless blocks and made the
+    encoder and decoder disagree at the first transform unit of the following
+    block.
+  - `decode_tx_partition` reads the full transform-tree syntax: the
+    `tx_do_partition` flag, the 6-way `tx_partition_type` symbol when the block
+    can split in both directions, `tx_2or3_partition_type` for 4-sample-thin
+    blocks, and the implied `HORZ`/`VERT` of `4x8`/`8x4`. `SPLIT`, `HORZ` and
+    `VERT` are reconstructed per sub-unit; the 4-way and 5-way variants and
+    every intra partition are rejected with typed errors.
+- `dec/syntax.rs`
+  - `derive_txtp` decodes `txtp_lossless` for 4x4 inter luma blocks, infers
+    `IDTX` above 4x4, and applies the lossless chroma inheritance
+    (`IDTX_INV -> IDTX`).
+  - `decode_coefs` keeps the §7.14.4 `8 * q` lossless dequantization.
+- `av2/transform.rs`: `inv_txfm_add_lossless_idtx` implements the §7.15.4
+  lossless `IDTX` pass-through (`Dequant >> (3 - shift)`), used by the inter
+  luma and chroma reconstruction.
+
 ## Verification
 
 Environment: Linux, one thread, `dav2d` revision `bff8e5c`
@@ -139,14 +172,32 @@ in frame 1 and 9 in frame 2 (`tx non-DCT` counter; reduced set 2 codes only
 previously differed from `dav2d` in the V plane (64/59 samples, max 44); it is
 now exact for our decoder and for the encoder reconstruction.
 
+### Inter lossless and transform partitions (3 frames, byte-exact vs `dav2d`)
+
+| Case | QP | Bit depth | Result |
+| :-- | :-- | --: | :-- |
+| 64x64 I420 | 0 | 8 | **exact** |
+| 256x192 I420 | 0 | 8 | **exact** |
+| 256x192 I420 | 0 | 10 | **exact** |
+| 64x64 / 256x192, partitions on | 0, 20, 100, 140 | 8 | **8/8 exact** |
+| 256x192, partitions on | 100 | 10 | **exact** |
+
+The QP 0 rows code inter frames (`keyint = 60`) with lossless residuals; the
+partition rows assert `tx_partition_counts[SPLIT/HORZ/VERT] > 0`. The decoder
+output equals the encoder reconstruction and `dav2d` on every frame.
+
 ### In-tree tests
 
 ```bash
 cargo test -p rustmpeg-video --lib test_decoder_unit9_lossless_and_transform_sets
 # test result: ok. 1 passed
+cargo test -p rustmpeg-video --lib test_encoder_transform_partitions_round_trip
+# test result: ok. 1 passed
 cargo test -p rustmpeg-video --lib av2_unit9_decoder_dav2d_byte_exact -- --ignored
 # test result: ok. 1 passed
 cargo test -p rustmpeg-video --lib av2_unit9_encoder_dav2d_byte_exact -- --ignored
+# test result: ok. 1 passed
+cargo test -p rustmpeg-video --lib av2_unit9_encoder_dav2d_tx_partition -- --ignored
 # test result: ok. 1 passed
 ```
 
@@ -167,10 +218,12 @@ python3 $ORACLE/check_av2.py full    # 84/84 OK, exit 0
 ```text
 cargo fmt --all -- --check                             -> rc 0
 cargo clippy --workspace --all-targets -- -D warnings  -> rc 0
-cargo test --workspace                                 -> 732 passed, 0 failed, 7 ignored
-cargo test -p rustmpeg-video av2                       -> 148 passed, 0 failed, 7 ignored
+cargo test --workspace                                 -> 800 passed, 0 failed, 13 ignored
+cargo test -p rustmpeg-video --lib av2                 -> 159 passed, 0 failed, 12 ignored
+cargo test -p rustmpeg-video --lib av2_ -- --ignored   -> 13 passed, 0 failed
 python3 scripts/check-licenses.py                      -> license audit: OK
-$ORACLE/vvc-conf/run_conformance.sh            -> rc 0, 25/25 cases OK (VTM and VVdeC)
+python3 $ORACLE/check_av2.py quick                     -> 9/9 OK, exit 0
+python3 $ORACLE/check_av2.py full                      -> 84/84 OK, exit 0
 ```
 
 The ignored tests are the external-oracle tests that need `dav2d`; the two
@@ -178,25 +231,25 @@ unit-9 tests were run for this report and passed.
 
 ## Remaining gaps
 
-- **Lossless coding is intra-only.** `mod.rs` forces key frames at quantizer
-  index 0. Inter lossless would need `lossless_tx_size` signalling and 4x4 WHT
-  residual coding for inter blocks. The decoder implements the non-4x4 inter
-  lossless `IDTX` inference but rejects the 4x4 `txtp_lossless` symbol because
-  that CDF is not part of this decoder's context.
-- **Only `TX_PARTITION_NONE` is emitted.** The transform-tree flag is parsed at
-  the normative position and sub-block transforms are still rejected.
-- **Lossless palette / DIP / CfL are rejected** with typed errors. The encoder
-  never selects them at quantizer index 0; their per-transform-block
-  reconstruction is not implemented.
+- **Intra transform partitions are rejected.** Per-transform-block intra
+  prediction is not implemented, so `TX_PARTITION_SPLIT`/`HORZ`/`VERT` on
+  intra blocks returns a typed error. Inter partitions are decoded.
+- **4-way and 5-way partitions are rejected.** `HORZ4`/`VERT4`/`HORZ5`/
+  `VERT5` return a typed error; only `SPLIT`/`HORZ`/`VERT` are reconstructed.
+- **Inter lossless blocks whose `lossless_tx_size == 1` needs more than one
+  32x32 transform** (blocks larger than 32x32) are rejected with a typed
+  error; the encoder never produces them.
+- **Lossless palette / DIP / CfL are rejected** with typed errors.
 - **The long transform sets** (`TX_SET_WIDE_*` / `HIGH_*`) are decoded, but the
-  encoder only produces square coding blocks, so the long paths are exercised
-  by the decoder's unit tests and the reference tables, not by an encoder
-  stream.
+  encoder only produces blocks whose base transform matches the block, so the
+  long paths are exercised by the decoder's unit tests and the reference
+  tables, not by an encoder stream.
 - **`TX_SET_INTER_1` / `INTER_2`** are reachable only for 16x16-or-smaller
   inter blocks; they are verified at 16x16 and at 1080p reduced set 0.
 - The decoder's full inter-set symbol order follows `dav2d`; `TX_SET_INTER_2`
   has one inverse-table entry (`FLIPADST_ADST`, index 11) that the encoder's
   `symbol2 = idx % 8` cannot express. It is not selected by the encoder.
+- Inter blocks are not entered into the per-plane `is_coded` map used for the
+  lossless per-transform-block edge derivation; the encoder matches that
+  behaviour, so streams agree, but the map is only complete for intra blocks.
 
-Nothing was committed. No `unsafe`, no new dependency, no native build step, and
-no third-party code was added.

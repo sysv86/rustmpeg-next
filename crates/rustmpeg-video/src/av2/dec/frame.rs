@@ -52,7 +52,8 @@ use crate::av2::ipred::{
     predict_intra_block, prepare_intra_edges, prepare_intra_edges_mrl,
 };
 use crate::av2::levels::{
-    BlockPartition, BlockSize, CompInterType, FilterIntraMode, InterPredMode, MvXY, txtp,
+    BlockPartition, BlockSize, CompInterType, FilterIntraMode, InterPredMode, MvXY, TxPartition,
+    txtp,
 };
 use crate::av2::me::{
     blend_compound_prep, mc_predict_block, mc_predict_block_prep, mv_clamp_to_integer,
@@ -1912,8 +1913,15 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             }
         }
 
-        // Transform partition flag (always `TxNone` for the encoder subset).
-        self.decode_tx_part_flag(bs, 0, 0)?;
+        // Transform partition. Intra transform partitions (per-transform-block
+        // intra prediction) are not implemented; the syntax is still parsed so
+        // the rejection is precise.
+        let (intra_tx_part, _) = self.decode_tx_partition(bs, 0, 0, false, seg_lossless)?;
+        if intra_tx_part != TxPartition::TxNone {
+            return Err(Av2Error::Unsupported(
+                "intra transform partitioning".to_string(),
+            ));
+        }
 
         if seg_lossless {
             if palette.is_some() {
@@ -2376,10 +2384,23 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         } else {
             bs as usize
         };
-        let uvtx = MAX_TXFM_SIZE_FOR_BS[uv_bs_idx] as usize;
+        // Lossless segments always code 4x4 chroma transforms
+        // (§5.20.7.23 `txSz = Lossless ? TX_4X4 : get_tx_size(plane, TX_4X4)`),
+        // while the prediction covers the whole plane block.
+        let uvtx = if seg_lossless {
+            0
+        } else {
+            MAX_TXFM_SIZE_FOR_BS[uv_bs_idx] as usize
+        };
         let uv_tdim = &TXFM_DIMENSIONS[uvtx];
-        let cw = uv_tdim.w as usize * 4;
-        let ch = uv_tdim.h as usize * 4;
+        // The chroma prediction covers the whole plane block; a lossless
+        // segment codes 4x4 transforms inside it, everything else a single
+        // transform of the plane block size.
+        let (cw, ch) = if seg_lossless {
+            ((bw4 >> ss_x).max(1) * 4, (bh4 >> ss_y).max(1) * 4)
+        } else {
+            (uv_tdim.w as usize * 4, uv_tdim.h as usize * 4)
+        };
         let cpx_x = px_x >> ss_x;
         let cpx_y = px_y >> ss_y;
 
@@ -2393,6 +2414,8 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         };
 
         let (r0_idx, r1_idx, comp_type_idx, saved_mode, mv0, mv1, filter);
+        let mut tx_part = TxPartition::TxNone;
+        let mut tx_part_ll_full = false;
         let mut block_motion_mode = 0u8;
         let mut block_warp_params = DEFAULT_WARP_PARAMS;
         let mut cwp_map = 8u8;
@@ -2754,7 +2777,9 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 })?;
                 warp_model = Some((matrix, abcd));
                 if !all_zero {
-                    self.decode_tx_part_flag(bs, 0, 1)?;
+                    let (p, full) = self.decode_tx_partition(bs, 0, 1, all_zero, seg_lossless)?;
+                    tx_part = p;
+                    tx_part_ll_full = full;
                 }
                 flt = 0usize;
                 block_motion_mode = motion_mode;
@@ -2805,7 +2830,9 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 // (§5.20.6.2): the MVD and the switchable subpel filter come
                 // first, then the transform tree flag.
                 if !all_zero {
-                    self.decode_tx_part_flag(bs, 0, 1)?;
+                    let (p, full) = self.decode_tx_partition(bs, 0, 1, all_zero, seg_lossless)?;
+                    tx_part = p;
+                    tx_part_ll_full = full;
                 }
             }
 
@@ -3406,7 +3433,9 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             };
 
             if !all_zero {
-                self.decode_tx_part_flag(bs, 0, 1)?;
+                let (p, full) = self.decode_tx_partition(bs, 0, 1, all_zero, seg_lossless)?;
+                tx_part = p;
+                tx_part_ll_full = full;
             }
 
             let r0 = self.ref_frames[comp_ref0].ok_or_else(|| {
@@ -3693,9 +3722,49 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         };
         let mut u_res_ctx = 0x40u8;
         let mut v_res_ctx = 0x40u8;
+        // Residual syntax. Lossless segments code one 4x4 WHT/`IDTX` unit per
+        // transform (or a single inferred-`IDTX` unit when `lossless_tx_size`
+        // is 1); lossy blocks follow their `tx_part` layout (§5.20.6.3).
+        let mut luma_tus: Vec<(usize, usize, usize)> = Vec::new();
         if !all_zero {
-            let y_params = CoefDecodeParams {
-                tx,
+            if seg_lossless {
+                if tx_part_ll_full {
+                    let base_tx = MAX_TXFM_SIZE_FOR_BS[bs as usize] as usize;
+                    let d = &TXFM_DIMENSIONS[base_tx];
+                    if d.w > 8 || d.h > 8 {
+                        return Err(Av2Error::Unsupported(
+                            "multi-chunk inter lossless_tx_size block".to_string(),
+                        ));
+                    }
+                    luma_tus.push((base_tx, px_x, px_y));
+                } else {
+                    for y4 in 0..bh4 {
+                        for x4 in 0..bw4 {
+                            luma_tus.push((0, px_x + x4 * 4, px_y + y4 * 4));
+                        }
+                    }
+                }
+            } else {
+                match tx_part {
+                    TxPartition::TxNone => luma_tus.push((tx, px_x, px_y)),
+                    _ => {
+                        let base = crate::av2::levels::RectTxfmSize::from_usize(tx)
+                            .unwrap_or(crate::av2::levels::RectTxfmSize::Tx4x4);
+                        for u in crate::av2::txpart::expand_tx_partition(base, tx_part).0 {
+                            luma_tus.push((u.tx as usize, px_x + u.x_px, px_y + u.y_px));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut y_txtp_map: Vec<u16> = vec![0u16; bw4 * bh4];
+        for (i, &(tx_u, x_u, y_u)) in luma_tus.iter().enumerate() {
+            let ux4 = (x_u - px_x) / 4;
+            let uy4 = (y_u - px_y) / 4;
+            let td = &TXFM_DIMENSIONS[tx_u];
+            let params = CoefDecodeParams {
+                tx: tx_u,
                 bs: bs as usize,
                 plane: 0,
                 intra: false,
@@ -3714,118 +3783,200 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 ss_ver: ss_y != 0,
                 chroma_dctonly: self.seq.chroma_dctonly,
             };
-            y_res = decode_coefs(
+            let res = decode_coefs(
                 &mut self.msac,
                 &mut self.cdf.coef,
                 &mut self.cdf.m,
-                &self.a_cols[a_idx].lcoef[bx4_in_sb..],
-                &self.l_ctx.lcoef[by4_in_sb..],
-                &y_params,
+                &self.a_cols[a_idx].lcoef[bx4_in_sb + ux4..],
+                &self.l_ctx.lcoef[by4_in_sb + uy4..],
+                &params,
                 &mut self.dq_y,
             )?;
-            if y_res.eob >= 0 {
-                for y in 0..t_dim.h as usize {
-                    for x in 0..t_dim.w as usize {
-                        self.grid.set_lr_noskip(bx4 + x, by4 + y, true);
+            if i == 0 {
+                y_res.txtp = res.txtp;
+            }
+            y_res.res_ctx = res.res_ctx;
+            for dy in 0..td.h as usize {
+                for dx in 0..td.w as usize {
+                    let cx4 = ux4 + dx;
+                    let cy4 = uy4 + dy;
+                    if cx4 < bw4 && cy4 < bh4 {
+                        y_txtp_map[cy4 * bw4 + cx4] = res.txtp;
+                    }
+                }
+            }
+            for i4 in 0..(td.w as usize)
+                .min(32usize.saturating_sub(bx4_in_sb + ux4))
+                .min(self.frame_mi_w.saturating_sub(bx4 + ux4))
+            {
+                self.a_cols[a_idx].lcoef[bx4_in_sb + ux4 + i4] = res.res_ctx;
+            }
+            for i4 in 0..(td.h as usize)
+                .min(32usize.saturating_sub(by4_in_sb + uy4))
+                .min(self.frame_mi_h.saturating_sub(by4 + uy4))
+            {
+                self.l_ctx.lcoef[by4_in_sb + uy4 + i4] = res.res_ctx;
+            }
+            if res.eob >= 0 {
+                for y in 0..td.h as usize {
+                    for x in 0..td.w as usize {
+                        self.grid.set_lr_noskip(bx4 + ux4 + x, by4 + uy4 + y, true);
                     }
                 }
                 let dp = &mut self.rec.planes[0];
-                let off = dp.offset(px_x, px_y);
+                let off = dp.offset(x_u, y_u);
                 let stride = dp.stride;
-                inv_txfm_add(
-                    self.bd,
-                    &mut dp.data,
-                    off,
-                    stride,
-                    &mut self.dq_y,
-                    y_res.txtp as u32,
-                    y_res.eob,
-                    tx,
-                );
-            }
-
-            if has_chroma {
-                let u_params = CoefDecodeParams {
-                    tx: uvtx,
-                    bs: uv_bs_idx,
-                    plane: 1,
-                    intra: false,
-                    fsc: false,
-                    lossless: seg_lossless,
-                    uv_mode: 0,
-                    y_mode: 0,
-                    y_angle: 0,
-                    mrl_index: 0,
-                    y_txtp: y_res.txtp as u32,
-                    reduced_txtp_set: self.fh.reduced_txtp_set as i32,
-                    u_has_cf: 0,
-                    dq_tbl: self.dq[seg_id.min((MAX_SEGMENTS - 1) as u8) as usize][1],
-                    bitdepth: self.bd.bitdepth(),
-                    ss_hor: ss_x != 0,
-                    ss_ver: ss_y != 0,
-                    chroma_dctonly: self.seq.chroma_dctonly,
-                };
-                let u_res = decode_coefs(
-                    &mut self.msac,
-                    &mut self.cdf.coef,
-                    &mut self.cdf.m,
-                    &self.a_cols[a_idx].ccoef[0][(bx4_in_sb >> ss_x)..],
-                    &self.l_ctx.ccoef[0][(by4_in_sb >> ss_y)..],
-                    &u_params,
-                    &mut self.dq_u,
-                )?;
-                let eob_u = u_res.eob;
-                u_res_ctx = u_res.res_ctx;
-                if eob_u >= 0 {
-                    let dp = &mut self.rec.planes[1];
-                    let off = dp.offset(cpx_x, cpx_y);
-                    let stride = dp.stride;
-                    inv_txfm_add(
+                if seg_lossless && (res.txtp as u32 & 0xFF) == txtp::IDTX {
+                    crate::av2::transform::inv_txfm_add_lossless_idtx(
                         self.bd,
                         &mut dp.data,
                         off,
                         stride,
-                        &mut self.dq_u,
-                        u_res.txtp as u32,
-                        eob_u,
-                        uvtx,
+                        &mut self.dq_y,
+                        res.eob,
+                        tx_u,
                     );
-                }
-                let v_params = CoefDecodeParams {
-                    plane: 2,
-                    u_has_cf: (eob_u >= 0) as i32,
-                    dq_tbl: self.dq[seg_id.min((MAX_SEGMENTS - 1) as u8) as usize][2],
-                    ..u_params
-                };
-                let v_res = decode_coefs(
-                    &mut self.msac,
-                    &mut self.cdf.coef,
-                    &mut self.cdf.m,
-                    &self.a_cols[a_idx].ccoef[1][(bx4_in_sb >> ss_x)..],
-                    &self.l_ctx.ccoef[1][(by4_in_sb >> ss_y)..],
-                    &v_params,
-                    &mut self.dq_v,
-                )?;
-                let eob_v = v_res.eob;
-                v_res_ctx = v_res.res_ctx;
-                if eob_v >= 0 {
-                    let dp = &mut self.rec.planes[2];
-                    let off = dp.offset(cpx_x, cpx_y);
-                    let stride = dp.stride;
+                } else {
                     inv_txfm_add(
                         self.bd,
                         &mut dp.data,
                         off,
                         stride,
-                        &mut self.dq_v,
-                        v_res.txtp as u32,
-                        eob_v,
-                        uvtx,
+                        &mut self.dq_y,
+                        res.txtp as u32,
+                        res.eob,
+                        tx_u,
                     );
                 }
             }
         }
 
+        let mut chroma_multi_tu = false;
+        if has_chroma && !all_zero {
+            let mut u_has_cf = false;
+            for pl in 1..=2 {
+                // Chroma transform units: 4x4 in a lossless segment over the
+                // whole plane block, otherwise one unit of the plane's maximum
+                // transform size.
+                let mut c_tus: Vec<(usize, usize, usize)> = Vec::new();
+                if seg_lossless {
+                    for y4 in 0..(ch / 4) {
+                        for x4 in 0..(cw / 4) {
+                            c_tus.push((0, cpx_x + x4 * 4, cpx_y + y4 * 4));
+                        }
+                    }
+                } else {
+                    c_tus.push((uvtx, cpx_x, cpx_y));
+                }
+                chroma_multi_tu |= c_tus.len() > 1;
+                let mut last_ctx = 0x40u8;
+                for (tx_u, x_u, y_u) in c_tus {
+                    let ux4 = (x_u - cpx_x) / 4;
+                    let uy4 = (y_u - cpx_y) / 4;
+                    let td = &TXFM_DIMENSIONS[tx_u];
+                    // A lossless chroma unit inherits the co-located luma
+                    // kernel; otherwise the plane inherits the luma type of the
+                    // first luma unit (`get_tx_set`, plane != 0).
+                    let y_txtp = if seg_lossless {
+                        let lx4 = (ux4 << ss_x).min(bw4 - 1);
+                        let ly4 = (uy4 << ss_y).min(bh4 - 1);
+                        y_txtp_map[ly4 * bw4 + lx4] as u32
+                    } else {
+                        y_res.txtp as u32
+                    };
+                    let params = CoefDecodeParams {
+                        tx: tx_u,
+                        bs: uv_bs_idx,
+                        plane: pl as i32,
+                        intra: false,
+                        fsc: false,
+                        lossless: seg_lossless,
+                        uv_mode: 0,
+                        y_mode: 0,
+                        y_angle: 0,
+                        mrl_index: 0,
+                        y_txtp,
+                        reduced_txtp_set: self.fh.reduced_txtp_set as i32,
+                        u_has_cf: if pl == 2 { u_has_cf as i32 } else { 0 },
+                        dq_tbl: self.dq[seg_id.min((MAX_SEGMENTS - 1) as u8) as usize][pl],
+                        bitdepth: self.bd.bitdepth(),
+                        ss_hor: ss_x != 0,
+                        ss_ver: ss_y != 0,
+                        chroma_dctonly: self.seq.chroma_dctonly,
+                    };
+                    let res = {
+                        let dq_buf = if pl == 1 {
+                            &mut self.dq_u
+                        } else {
+                            &mut self.dq_v
+                        };
+                        decode_coefs(
+                            &mut self.msac,
+                            &mut self.cdf.coef,
+                            &mut self.cdf.m,
+                            &self.a_cols[a_idx].ccoef[pl - 1][(bx4_in_sb >> ss_x) + ux4..],
+                            &self.l_ctx.ccoef[pl - 1][(by4_in_sb >> ss_y) + uy4..],
+                            &params,
+                            dq_buf,
+                        )?
+                    };
+                    last_ctx = res.res_ctx;
+                    for i4 in 0..(td.w as usize)
+                        .min(32usize.saturating_sub((bx4_in_sb >> ss_x) + ux4))
+                        .min((self.frame_mi_w >> ss_x).saturating_sub((bx4 >> ss_x) + ux4))
+                    {
+                        self.a_cols[a_idx].ccoef[pl - 1][(bx4_in_sb >> ss_x) + ux4 + i4] =
+                            res.res_ctx;
+                    }
+                    for i4 in 0..(td.h as usize)
+                        .min(32usize.saturating_sub((by4_in_sb >> ss_y) + uy4))
+                        .min((self.frame_mi_h >> ss_y).saturating_sub((by4 >> ss_y) + uy4))
+                    {
+                        self.l_ctx.ccoef[pl - 1][(by4_in_sb >> ss_y) + uy4 + i4] = res.res_ctx;
+                    }
+                    if pl == 1 {
+                        u_has_cf = res.eob >= 0;
+                    }
+                    if res.eob >= 0 {
+                        let dp = &mut self.rec.planes[pl];
+                        let off = dp.offset(x_u, y_u);
+                        let stride = dp.stride;
+                        let dq_buf = if pl == 1 {
+                            &mut self.dq_u
+                        } else {
+                            &mut self.dq_v
+                        };
+                        if seg_lossless && (res.txtp as u32 & 0xFF) == txtp::IDTX {
+                            crate::av2::transform::inv_txfm_add_lossless_idtx(
+                                self.bd,
+                                &mut dp.data,
+                                off,
+                                stride,
+                                dq_buf,
+                                res.eob,
+                                tx_u,
+                            );
+                        } else {
+                            inv_txfm_add(
+                                self.bd,
+                                &mut dp.data,
+                                off,
+                                stride,
+                                dq_buf,
+                                res.txtp as u32,
+                                res.eob,
+                                tx_u,
+                            );
+                        }
+                    }
+                }
+                if pl == 1 {
+                    u_res_ctx = last_ctx;
+                } else {
+                    v_res_ctx = last_ctx;
+                }
+            }
+        }
         // Neighbour context bookkeeping (mirrors the encoder).
         for i in 0..bw4
             .min(32 - bx4_in_sb)
@@ -3848,7 +3999,12 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             self.a_cols[a_idx].mode[bx4_in_sb + i] = saved_mode;
             self.a_cols[a_idx].filter[0][bx4_in_sb + i] = filter as u8;
             self.a_cols[a_idx].filter[1][bx4_in_sb + i] = filter as u8;
-            self.a_cols[a_idx].lcoef[bx4_in_sb + i] = y_res.res_ctx;
+            // With more than one transform unit the coefficient contexts are
+            // already written per unit above; writing one value over the whole
+            // footprint would overwrite them.
+            if luma_tus.len() <= 1 {
+                self.a_cols[a_idx].lcoef[bx4_in_sb + i] = y_res.res_ctx;
+            }
         }
         for i in 0..bh4
             .min(32 - by4_in_sb)
@@ -3871,24 +4027,31 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             self.l_ctx.mode[by4_in_sb + i] = saved_mode;
             self.l_ctx.filter[0][by4_in_sb + i] = filter as u8;
             self.l_ctx.filter[1][by4_in_sb + i] = filter as u8;
-            self.l_ctx.lcoef[by4_in_sb + i] = y_res.res_ctx;
+            if luma_tus.len() <= 1 {
+                self.l_ctx.lcoef[by4_in_sb + i] = y_res.res_ctx;
+            }
         }
         if has_chroma {
             let cbx4 = bx4_in_sb >> ss_x;
             let cby4 = by4_in_sb >> ss_y;
+            let single_chroma_unit = !chroma_multi_tu;
             for i in 0..(uv_tdim.w as usize)
                 .min(32 - cbx4)
                 .min((self.frame_mi_w >> ss_x).saturating_sub(bx4 >> ss_x))
             {
-                self.a_cols[a_idx].ccoef[0][cbx4 + i] = u_res_ctx;
-                self.a_cols[a_idx].ccoef[1][cbx4 + i] = v_res_ctx;
+                if single_chroma_unit {
+                    self.a_cols[a_idx].ccoef[0][cbx4 + i] = u_res_ctx;
+                    self.a_cols[a_idx].ccoef[1][cbx4 + i] = v_res_ctx;
+                }
             }
             for i in 0..(uv_tdim.h as usize)
                 .min(32 - cby4)
                 .min((self.frame_mi_h >> ss_y).saturating_sub(by4 >> ss_y))
             {
-                self.l_ctx.ccoef[0][cby4 + i] = u_res_ctx;
-                self.l_ctx.ccoef[1][cby4 + i] = v_res_ctx;
+                if single_chroma_unit {
+                    self.l_ctx.ccoef[0][cby4 + i] = u_res_ctx;
+                    self.l_ctx.ccoef[1][cby4 + i] = v_res_ctx;
+                }
             }
         }
 
@@ -4549,7 +4712,12 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         if !skip_txfm {
             let tx = MAX_TXFM_SIZE_FOR_BS[bs as usize] as usize;
             let t_dim = &TXFM_DIMENSIONS[tx];
-            self.decode_tx_part_flag(bs, 0, 1)?;
+            let (ibc_tx_part, _) = self.decode_tx_partition(bs, 0, 1, false, seg_lossless)?;
+            if ibc_tx_part != TxPartition::TxNone {
+                return Err(Av2Error::Unsupported(
+                    "IntraBC transform partitioning".to_string(),
+                ));
+            }
             let y_params = CoefDecodeParams {
                 tx,
                 bs: bs as usize,
@@ -4754,33 +4922,107 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         Ok(())
     }
 
-    fn decode_tx_part_flag(&mut self, bs: BlockSize, fsc: usize, inter: usize) -> Result<()> {
+    /// Reads `read_tx_partition()` for one coding block (AV2 Spec v1.0.0
+    /// §5.20.6.3) and returns the partition plus the `lossless_tx_size` flag.
+    ///
+    /// In a lossless segment the position carries `lossless_tx_size` instead
+    /// (§5.20.6.1) and only for inter blocks that carry a residual. `SPLIT`,
+    /// `HORZ` and `VERT` are reconstructed; the 4-way and 5-way variants are
+    /// rejected with a typed error because their sub-transform layouts are not
+    /// implemented.
+    fn decode_tx_partition(
+        &mut self,
+        bs: BlockSize,
+        fsc: usize,
+        inter: usize,
+        skip: bool,
+        lossless: bool,
+    ) -> Result<(TxPartition, bool)> {
+        if lossless {
+            if bs == BlockSize::Bs4x4 || skip || inter == 0 {
+                return Ok((TxPartition::TxNone, false));
+            }
+            let group = SPEC_SIZE_GROUP[mi_size_index(bs)] as usize;
+            let full = self
+                .msac
+                .decode_bool_adapt(self.cdf.m.lossless_tx_size(group, inter))?;
+            return Ok((TxPartition::TxNone, full != 0));
+        }
         // `read_tx_partition()` is only present when `TxMode == TX_MODE_SELECT`
         // (`read_tx_size()`, AV2 Spec v1.0.0 §5.20.6.1).
         if self.fh.txfm_mode != TxfmMode::Switchable {
-            return Ok(());
-        }
-        if self.seq.reduced_tx_part_set {
-            return Ok(());
+            return Ok((TxPartition::TxNone, false));
         }
         let base_tx_idx = MAX_TXFM_SIZE_FOR_BS[bs as usize] as usize;
         if base_tx_idx == 0 || bs == BlockSize::Bs4x4 {
-            return Ok(());
+            return Ok((TxPartition::TxNone, false));
         }
         let b_dim = BLOCK_DIMENSIONS[bs as usize];
-        if (b_dim[0].max(b_dim[1]) as usize) > 16 {
-            return Ok(());
+        let (bw4, bh4) = (b_dim[0] as usize, b_dim[1] as usize);
+        if bw4.max(bh4) > 16 {
+            return Ok((TxPartition::TxNone, false));
         }
         let grp = TX_PART_GROUP[bs as usize] as usize;
         let split = self
             .msac
             .decode_bool_adapt(self.cdf.m.tx_do_partition(fsc, inter, grp))?;
-        if split != 0 {
-            return Err(Av2Error::Unsupported(
-                "sub-block transform partitioning".to_string(),
+
+        if split == 0 {
+            return Ok((TxPartition::TxNone, false));
+        }
+        if bw4.min(bh4) >= 2 {
+            let grp = crate::av2::tables::TX_PART_TYPE_GROUP_VH[bs as usize] as usize;
+            let sym = self.msac.decode_symbol_adapt(
+                self.cdf
+                    .m
+                    .tx_partition_type(fsc, inter, grp, self.seq.reduced_tx_part_set),
+                6,
+            )?;
+
+            let part = match sym {
+                0 => TxPartition::TxSplit,
+                1 => TxPartition::TxH,
+                2 => TxPartition::TxV,
+                _ => {
+                    return Err(Av2Error::Unsupported(format!(
+                        "transform partition type {} (4-way/5-way)",
+                        sym + 1
+                    )));
+                }
+            };
+            return Ok((part, false));
+        }
+        if bw4.max(bh4) >= 4 {
+            let ctx = (bw4 >= 4) as usize;
+            let four_way = if self.seq.reduced_tx_part_set {
+                0
+            } else {
+                self.msac
+                    .decode_bool_adapt(self.cdf.m.tx_2or3_partition_type(fsc, inter, ctx))?
+            };
+            if four_way != 0 {
+                return Err(Av2Error::Unsupported(
+                    "4-way transform partition type".to_string(),
+                ));
+            }
+            return Ok((
+                if bw4 >= 4 {
+                    TxPartition::TxV
+                } else {
+                    TxPartition::TxH
+                },
+                false,
             ));
         }
-        Ok(())
+        // `4x8`/`8x4` infer `HORZ`/`VERT`.
+        Ok((
+            if bs == BlockSize::Bs4x8 {
+                TxPartition::TxH
+            } else {
+                TxPartition::TxV
+            },
+            false,
+        ))
     }
 
     fn edge_buffer(

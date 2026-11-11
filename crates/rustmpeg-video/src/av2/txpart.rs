@@ -25,7 +25,9 @@ use crate::av2::levels::{BlockSize, RectTxfmSize, TxPartition, txtp};
 use crate::av2::msac::MsacEncoder;
 use crate::av2::pixel::{BitDepth, Pixel};
 use crate::av2::quantizer::{quantize_dequantize_block, quantize_rdoq_block};
-use crate::av2::tables::{MAX_TXFM_SIZE_FOR_BS, TXFM_DIMENSIONS};
+use crate::av2::tables::{
+    BLOCK_DIMENSIONS, MAX_TXFM_SIZE_FOR_BS, TX_PART_GROUP, TX_PART_TYPE_GROUP_VH, TXFM_DIMENSIONS,
+};
 use crate::av2::transform::{fwd_txfm_2d, inv_txfm_add};
 
 /// Geometry of a single transform sub-unit within a coding block.
@@ -241,9 +243,41 @@ pub fn expand_tx_partition(base_tx: RectTxfmSize, tx_part: TxPartition) -> (Vec<
     }
 }
 
+/// Finds the rectangular transform size whose coded extent is exactly
+/// `w` x `h` pixels (AV2 Spec v1.0.0 §5.20.6.3 `find_tx_size`).
+pub fn find_tx_size(w: usize, h: usize) -> Option<RectTxfmSize> {
+    for i in 0..crate::av2::levels::N_RECT_TX_SIZES {
+        let tx = RectTxfmSize::from_usize(i)?;
+        let d = &TXFM_DIMENSIONS[tx as usize];
+        if (d.w as usize) * 4 == w && (d.h as usize) * 4 == h {
+            return Some(tx);
+        }
+    }
+    None
+}
+
+/// Whether `bs` can carry the `tx_do_partition`/`tx_partition_type` syntax
+/// this encoder emits: the block is larger than 4x4, at most 64x64, and both a
+/// horizontal and a vertical half transform exist (the 6-way
+/// `tx_partition_type` branch).
+pub fn tx_partition_is_signallable(bs: BlockSize) -> bool {
+    let base_tx = MAX_TXFM_SIZE_FOR_BS[bs as usize] as usize;
+    if base_tx == 0 || bs == BlockSize::Bs4x4 {
+        return false;
+    }
+    let d = &BLOCK_DIMENSIONS[bs as usize];
+    let (bw4, bh4) = (d[0] as usize, d[1] as usize);
+    if bw4.max(bh4) > 16 || bw4.min(bh4) < 2 {
+        return false;
+    }
+    let t = &TXFM_DIMENSIONS[base_tx];
+    let (tw, th) = (t.w as usize * 4, t.h as usize * 4);
+    find_tx_size(tw, th / 2).is_some() && find_tx_size(tw / 2, th).is_some()
+}
+
 /// Evaluates the RDO cost of transforming, quantizing, and reconstructing a residual buffer
-/// `res` (`w x h`) under a given `TxPartition` (`TxNone` vs `TxSplit`), returning
-/// `(distortion_sse, non_zero_count, rate_bits_estimate)`.
+/// `res` (`w x h`) under a given `TxPartition`, returning the Lagrangian cost
+/// `distortion_sse + lambda * rate_estimate`.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_tx_partition_candidate<BD: BitDepth>(
     bd: BD,
@@ -283,9 +317,9 @@ fn evaluate_tx_partition_candidate<BD: BitDepth>(
             }
         }
 
-        // The sub-block transform RDO uses the default kernel: the transform
-        // type of the actual block is chosen separately by the frame encoder,
-        // and only `TX_PARTITION_NONE` is emitted by this encoder.
+        // The sub-block transform RDO uses `DCT_DCT` (and the lossless WHT at
+        // 4x4) as a proxy kernel; the frame encoder chooses the actual
+        // transform type per sub-unit and codes it normatively.
         let txtp_val = if lossless && utx == 0 {
             crate::av2::transform::WHT_WHT
         } else {
@@ -370,113 +404,128 @@ pub fn select_best_tx_partition<BD: BitDepth>(
     let base_tx_idx = MAX_TXFM_SIZE_FOR_BS[bs as usize] as usize;
     let base_tx = RectTxfmSize::from_usize(base_tx_idx).unwrap_or(RectTxfmSize::Tx4x4);
 
-    // 4x4 blocks cannot split further; lossless coding uses single transform unit
-    if base_tx == RectTxfmSize::Tx4x4 || lossless || speed >= 8 {
+    // 4x4 blocks cannot split further, lossless frames force 4x4 transforms,
+    // and the fastest presets skip the search.
+    if base_tx == RectTxfmSize::Tx4x4 || lossless || speed >= 8 || !tx_partition_is_signallable(bs)
+    {
         return (TxPartition::TxNone, base_tx);
     }
 
-    // Check quadrant energy variance: if residual energy is concentrated in one quadrant/half,
-    // evaluate `TxSplit` / `TxH` / `TxV`.
-    let t_dim = &TXFM_DIMENSIONS[base_tx_idx];
-    let w = (t_dim.w as usize) * 4;
-    let h = (t_dim.h as usize) * 4;
-    let hw = (w / 2).max(1);
-    let hh = (h / 2).max(1);
-
-    let mut q_energy = [0u64; 4];
-    for qy in 0..2 {
-        for qx in 0..2 {
-            let mut e = 0u64;
-            for r in 0..hh {
-                let row = (qy * hh + r) * res_stride + qx * hw;
-                for c in 0..hw {
-                    let v = res[row + c] as i64;
-                    e += (v * v) as u64;
-                }
-            }
-            q_energy[qy * 2 + qx] = e;
-        }
-    }
-    let max_e = *q_energy.iter().max().unwrap();
-    let min_e = *q_energy.iter().min().unwrap();
-    // If residual energy is uniform across quadrants, `TxNone` is optimal
-    if max_e <= (min_e + 64) * 3 {
-        return (TxPartition::TxNone, base_tx);
-    }
-
-    let cost_none = evaluate_tx_partition_candidate(
-        bd,
-        res,
-        res_stride,
-        base_tx,
-        TxPartition::TxNone,
-        dq_tbl,
-        is_intra,
-        lossless,
-        enable_rdoq,
-        lambda_rdoq,
-        speed,
-    );
-
-    let mut best_part = TxPartition::TxNone;
-    let mut best_tx = base_tx;
-    let mut best_cost = cost_none;
-
-    if let Some(sub_tx) = split_tx_quad(base_tx) {
-        let cost_split = evaluate_tx_partition_candidate(
+    let cost = |part: TxPartition, lambda: u64| {
+        evaluate_tx_partition_candidate(
             bd,
             res,
             res_stride,
             base_tx,
-            TxPartition::TxSplit,
+            part,
             dq_tbl,
             is_intra,
             lossless,
             enable_rdoq,
-            lambda_rdoq,
+            lambda,
             speed,
-        );
-        if cost_split < best_cost {
-            best_cost = cost_split;
+        )
+    };
+
+    let mut best_part = TxPartition::TxNone;
+    let mut best_tx = base_tx;
+    let mut best_cost = cost(TxPartition::TxNone, lambda_rdoq);
+    let _ = best_cost;
+
+    // The 4-way quad split is the general candidate; the 2-way `HORZ`/`VERT`
+    // splits are cheaper to signal and win when the residual correlates along
+    // one axis. Both are evaluated with the same Lagrangian metric, and the
+    // full candidate set is only searched at `speed < 7`.
+    if let Some(sub_tx) = split_tx_quad(base_tx) {
+        let c = cost(TxPartition::TxSplit, lambda_rdoq);
+        if c < best_cost {
+            best_cost = c;
             best_part = TxPartition::TxSplit;
             best_tx = sub_tx;
         }
     }
-
+    if speed < 7 {
+        if let Some(sub_tx) = split_tx_hor(base_tx) {
+            let c = cost(TxPartition::TxH, lambda_rdoq);
+            if c < best_cost {
+                best_cost = c;
+                best_part = TxPartition::TxH;
+                best_tx = sub_tx;
+            }
+        }
+        if let Some(sub_tx) = split_tx_ver(base_tx) {
+            let c = cost(TxPartition::TxV, lambda_rdoq);
+            if c < best_cost {
+                best_cost = c;
+                best_part = TxPartition::TxV;
+                best_tx = sub_tx;
+            }
+        }
+    }
     let _ = best_cost;
+
     (best_part, best_tx)
 }
 
-/// Encodes the `tx_split` flag for a coding block into `msac` (AV2 Spec §5.20.2 `read_tx_part`).
+/// Encodes the transform-partition syntax of one coding block
+/// (AV2 Spec v1.0.0 §5.20.6.3 `read_tx_partition`).
 ///
-/// The flag is present only when the block's base transform is not `4x4`, the block is no
-/// larger than `64x64` in either dimension, and the sequence does not use the reduced
-/// transform-partition set. `fsc` is the screen-content-tools flag and `inter` selects the
-/// inter CDF context.
-pub fn encode_tx_partition_flag(
+/// `tx_do_partition` is present for every block up to 64x64 whose base
+/// transform is larger than 4x4. When the block can split in both directions
+/// the partition is coded with the 6-way `tx_partition_type` symbol; 4-sample
+/// thin blocks use `tx_2or3_partition_type` (forced to 0 by
+/// `reduced_tx_part_set`).
+pub fn encode_tx_partition_syntax(
     msac: &mut MsacEncoder,
     cdf_m: &mut CdfModeContext,
     bs: BlockSize,
     tx_part: TxPartition,
     fsc: usize,
     inter: usize,
+    reduced_tx_part_set: bool,
 ) {
-    // AV2 Spec §5.20.2 `read_tx_partition`: the flag is present only when the
-    // coding block is at most 64x64 and its base transform is larger than 4x4.
+    if !tx_partition_is_signallable(bs) && tx_part != TxPartition::TxNone {
+        // Callers never select a partition that cannot be signalled.
+        debug_assert!(false, "tx partition is not signallable for this block");
+        return;
+    }
     let base_tx_idx = MAX_TXFM_SIZE_FOR_BS[bs as usize] as usize;
     if base_tx_idx == 0 || bs == BlockSize::Bs4x4 {
         return;
     }
-    let b_dim = crate::av2::tables::BLOCK_DIMENSIONS[bs as usize];
-    if (b_dim[0].max(b_dim[1]) as usize) > 16 {
+    let b_dim = BLOCK_DIMENSIONS[bs as usize];
+    let (bw4, bh4) = (b_dim[0] as usize, b_dim[1] as usize);
+    if bw4.max(bh4) > 16 {
         return;
     }
+    let grp = TX_PART_GROUP[bs as usize] as usize;
     let is_split = (tx_part != TxPartition::TxNone) as u32;
-    let grp = crate::av2::tables::TX_PART_GROUP[bs as usize] as usize;
     msac.encode_bool_adapt(
         is_split,
         cdf_m.tx_do_partition(fsc.min(1), inter.min(1), grp),
     );
+    if is_split == 0 {
+        return;
+    }
+
+    if bw4.min(bh4) >= 2 {
+        let grp = TX_PART_TYPE_GROUP_VH[bs as usize] as usize;
+        let sym = (tx_part as usize).saturating_sub(1);
+        msac.encode_symbol_adapt(
+            sym,
+            cdf_m.tx_partition_type(fsc.min(1), inter.min(1), grp, reduced_tx_part_set),
+            6,
+        );
+    } else if bw4.max(bh4) >= 4 {
+        let ctx = (bw4 >= 4) as usize;
+        let four_way = matches!(tx_part, TxPartition::TxH4 | TxPartition::TxV4) as usize;
+        let sym = if reduced_tx_part_set { 0 } else { four_way };
+        msac.encode_bool_adapt(
+            sym as u32,
+            cdf_m.tx_2or3_partition_type(fsc.min(1), inter.min(1), ctx),
+        );
+    }
+    // `4x8`/`8x4` blocks infer `HORZ`/`VERT` with no symbol.
 }
 
 #[cfg(test)]

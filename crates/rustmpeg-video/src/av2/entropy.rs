@@ -510,6 +510,26 @@ pub fn tx_type_is_coded(set: TxSet, is_inter: bool, lossless: bool, reduced_tx_s
     set != TxSet::DctOnly && !lossless && !(reduced_tx_set == 2 && !is_inter)
 }
 
+/// Encodes `lossless_tx_size` for one lossless coding block
+/// (AV2 Spec v1.0.0 §5.20.6.1).
+///
+/// The symbol is present when `MiSize != BLOCK_4X4`, the block is inter (or an
+/// intra block uses `fsc_mode`), and the block carries a residual. `1` selects
+/// the single full-block transform; `0` keeps `TX_4X4` for every unit.
+pub fn encode_lossless_tx_size(
+    msac: &mut MsacEncoder,
+    cdf_m: &mut CdfModeContext,
+    bs: BlockSize,
+    full_size: bool,
+    is_inter: usize,
+) {
+    if bs == BlockSize::Bs4x4 {
+        return;
+    }
+    let group = crate::av2::frame::SPEC_SIZE_GROUP[crate::av2::frame::mi_size_index(bs)] as usize;
+    msac.encode_bool_adapt(full_size as u32, cdf_m.lossless_tx_size(group, is_inter));
+}
+
 /// Context and square-size index (`ctx`, `sqrSz`) of the `inter_tx_type` symbol
 /// (AV2 Spec v1.0.0 §8 Table 8.3).
 ///
@@ -1132,7 +1152,29 @@ pub fn encode_coefs(
     // block is lossless, the intra block is DC-only (`eob == 1`), or the frame
     // uses `reduced_tx_set == 2` on an intra block. Chroma derives its type
     // from luma.
-    if !chroma && !p.lossless {
+    //
+    // Lossless luma inter blocks code `txtp_lossless` (WHT_WHT vs IDTX) when
+    // the transform is 4x4 and infer `IDTX` above that; lossless chroma
+    // inherits the masked luma kernel. Intra lossless blocks always use the
+    // WHT and code no type.
+    if p.lossless {
+        if !chroma && !p.intra {
+            if t_dim.max == 0 {
+                let is_idtx = (*txtp & 0xFF) as u32 == txtp::IDTX;
+                msac.encode_bool_adapt(is_idtx as u32, mode.lossless_inter_tx_type());
+                *txtp = if is_idtx {
+                    txtp::IDTX as u16
+                } else {
+                    crate::av2::transform::WHT_WHT as u16
+                };
+            } else {
+                *txtp = txtp::IDTX as u16;
+            }
+        } else if chroma {
+            // `IDTX_INV -> IDTX`; `WHT_WHT` and `IDTX` stay as inherited.
+            *txtp &= 0x00E7;
+        }
+    } else if !chroma {
         let set = get_tx_set(t_dim, !p.intra, p.reduced_txtp_set);
         let dc_only = p.intra && eob_idx == 0;
         if tx_type_is_coded(set, !p.intra, p.lossless, p.reduced_txtp_set) && !dc_only {

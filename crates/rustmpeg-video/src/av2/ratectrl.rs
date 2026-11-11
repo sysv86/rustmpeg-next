@@ -158,6 +158,10 @@ impl RateController {
             // ConstantQp is intentionally unchanged so enabling the rate
             // controller refactor cannot alter existing streams.
             RateControlMode::ConstantQp { base_qidx } => match frame_type {
+                // A quantizer index of 0 is lossless for every frame type
+                // (AV2 Spec v1.0.0 §5.18.1), so the key/inter offset must not
+                // lift an inter frame out of lossless.
+                _ if base_qidx == 0 => 0,
                 FrameType::Key | FrameType::Intra => base_qidx.saturating_sub(8),
                 FrameType::Inter | FrameType::Switch => (base_qidx + 4).min(255),
             },

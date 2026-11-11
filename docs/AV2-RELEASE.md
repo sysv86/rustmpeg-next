@@ -12,7 +12,8 @@ skipped, never as passes.
 
 Units 1–12 are landed. Units 1–7 and 10–12 are **DONE** for their recorded
 matrices; units 8 and 9 are **DONE WITH LIMITS** because a small set of tools
-outside the recorded matrix is still absent. Unit 13 is **DONE** for AV2: the
+outside the recorded matrix is still absent (unit 9: intra and 4-way/5-way
+transform partitions, lossless palette/DIP/CfL). Unit 13 is **DONE** for AV2: the
 12 in-tree external-oracle tests pass, the baseline driver is 84/84, and the
 quick driver is 9/9.
 
@@ -102,7 +103,7 @@ frame.
 | 6. NEWMV + switchable subpel | 19 | pass |
 | 7. Compound/wedge/CWP | 34 (28 in-tree) | pass |
 | 8. Warped motion | 17 + 3 12-bit | pass |
-| 9. Transform sets, WHT, DPCM | full sets + ignored tests | pass |
+| 9. Transform sets, WHT, DPCM, inter lossless, transform partitions | full sets + ignored tests + 9-case partition matrix | pass |
 | 10. Extended partitions | 37 decoder + 7 encoder | pass |
 | 11. Palette + IntraBC | 30 | pass |
 | 12. Film grain | 9 targeted + AVM gradient | pass |
@@ -211,7 +212,10 @@ Supported and verified in this close-out:
 - Film grain OBU parsing, model storage, output-side synthesis, encoder
   estimation/signalling.
 - Transform-type signalling for every transform set (full and reduced 0–3),
-  lossless 4x4 WHT at QP 0, and DPCM intra prediction.
+  lossless 4x4 WHT at QP 0 on intra **and** inter blocks (`lossless_tx_size`,
+  `txtp_lossless`, lossless `IDTX`), and DPCM intra prediction.
+- Transform partitions `TX_PARTITION_SPLIT`, `HORZ` and `VERT` for inter luma
+  blocks, with encoder RDO and per-sub-unit coefficient coding.
 - Extended partitions (`H3`, `V3`, `H4A/4B`, `V4A/4B`) with partition RDO.
 
 Rejected with a typed error (not silent misdecoding):
@@ -220,9 +224,9 @@ Rejected with a typed error (not silent misdecoding):
   motion, reference-frame MVs, OPFL/MV refinement, adaptive MVD, SDP/extended
   SDP, FSC, CCTX/MHCCP/IBP, TIP/BAWP/CWP-implicit-mask, IST/DDT, TCQ/parity
   hiding, skip mode, global IntraBC, sub-pixel IntraBC, wedge inter-intra,
-  six-parameter warp deltas, inter lossless 4x4 WHT, lossless palette/DIP/CfL,
-  transform partitions other than `TX_PARTITION_NONE`, and per-unit NS filter
-  banks. `WARPMV`/`LOCALWARP`/`EXTENDWARP` are no longer rejected by the
+  six-parameter warp deltas, lossless palette/DIP/CfL, intra transform
+  partitions, 4-way/5-way transform partitions (`HORZ4`/`VERT4`/`HORZ5`/
+  `VERT5`), and per-unit NS filter banks. `WARPMV`/`LOCALWARP`/`EXTENDWARP` are no longer rejected by the
   decoder; their encoder emission is the remaining unit-8 gap.
 
 ## Per-unit status
@@ -237,7 +241,7 @@ Rejected with a typed error (not silent misdecoding):
 | 6. NEWMV + switchable subpel | DONE | `cargo test -p rustmpeg-video --lib test_encoder_newmv_and_switchable_stats` and `... test_decode_matches_encoder_recon_with_newmv...` → pass; 19-case recorded matrix | Subpel compound and `TxPartition::TxSplit` rejected; reduced DRL |
 | 7. Compound, wedge, mask blending | DONE | `... av2_compound_decoder_dav2d_byte_exact -- --ignored` → pass; 28 in-tree, 34 recorded | `JOINT_NEWMV` parsed but not emitted; subpel compound not emitted |
 | 8. Warped motion (OBMC N/A) | DONE WITH LIMITS | `cargo test -p rustmpeg-video --test av2_warp` → pass; 17-case recorded matrix; 12-bit 3/3 exact; `INTERINTRA` + `WARPMV`/`WARP_NEWMV` matrix 64x64/256x192 QP20/100/140 + 10/12-bit 256x192 → `encoder recon == our decoder == dav2d`; counts 3–9 `WARPMV`, 5–22 `INTERINTRA` per 256x192 run | OBMC does not exist in AV2 v1.0.0 (§7.3 `MOTION_MODES = 5`, §5.20.7.14), cited. `INTERINTRA`, `LOCALWARP`, `EXTENDWARP` and `WARPMV` are parsed and predicted; the encoder emits `INTERINTRA`, `WARPMV` and `WARP_NEWMV`+`DELTAWARP`; `LOCALWARP`/`EXTENDWARP` emission remains blocked by the reduced `find_mv_stack`/`WarpParamStack`, which is also a residual `WARPMV` risk on strongly affine content; six-parameter warp deltas are not emitted |
-| 9. Transform types, lossless WHT, DPCM | DONE WITH LIMITS | `... av2_unit9_encoder_dav2d_byte_exact -- --ignored` and `... av2_unit9_decoder_dav2d_byte_exact -- --ignored` → pass; full sets 0–3 | Lossless is intra-only; encoder emits only `TX_PARTITION_NONE`; inter lossless CDF absent; lossless palette/DIP/CfL rejected |
+| 9. Transform types, lossless WHT, DPCM, inter lossless, partitions | DONE WITH LIMITS | `... av2_unit9_encoder_dav2d_byte_exact`, `... av2_unit9_decoder_dav2d_byte_exact`, `... av2_unit9_encoder_dav2d_tx_partition` → all pass; full sets 0–3; inter lossless and `SPLIT`/`HORZ`/`VERT` partitions byte-exact, counts > 0 | Intra and 4-way/5-way transform partitions, lossless palette/DIP/CfL rejected; long transform sets not emitted |
 | 10. Extended partitions + partition RDO | DONE | `... av2_extended_partitions_decoder_dav2d_byte_exact -- --ignored` → pass; 37 decoder + 7 encoder cases | Non-square luma intra is DC-only; extended search at 64x64 only; `dav2d` SIGSEGV on some 4:2:2/4:4:4 cells is skipped |
 | 11. Palette, IntraBC, ISP | DONE | 30-case screen-content matrix in [`docs/av2/UNIT11_ENCODER.md`](av2/UNIT11_ENCODER.md); `check_av2.py full` with screen tools off → 84/84 | ISP does not exist in AV2 v1.0.0; sub-pixel/global IntraBC rejected; one IntraBC block per frame; palette cache not reused |
 | 12. Film grain | DONE | `... av2_film_grain_decoder_dav2d_byte_exact -- --ignored` → pass; 9 targeted rows; AVM gradient byte-exact grain on/off | `mc_identity = 1`, `show_existing_frame`, multiple model slots, and non-slot-0 reuse not covered |
@@ -250,15 +254,21 @@ Run on 2026-10-30 in the repository root:
 ```text
 cargo fmt --all -- --check                                  -> rc 0
 cargo clippy --workspace --all-targets -- -D warnings       -> rc 0
-cargo test --workspace --no-fail-fast                      -> 742 passed, 0 failed, 12 ignored
-cargo test --workspace                                     -> 317 passed, 1 failed (vvc lfnst flake), 12 ignored
+cargo test --workspace                                     -> 800 passed, 0 failed, 13 ignored
+cargo test -p rustmpeg-video --lib av2_ -- --ignored       -> 13 passed, 0 failed
 python3 scripts/check-licenses.py                          -> license audit: OK (all packages permissive, no copyleft)
-$ORACLE/vvc-conf/run_conformance.sh                -> rc 0, 25/25 cases OK with VTM and VVdeC
+python3 $ORACLE/check_av2.py quick                         -> 9/9 OK, exit 0
+python3 $ORACLE/check_av2.py full                          -> 84/84 OK, exit 0
 cargo build --release -p rustmpeg-video --examples         -> rc 0
 ```
 
-The 12 ignored tests are the external-oracle tests that need `dav2d` or an AVM
-stream; all 12 were run for this report and passed. The workspace test count
+These gates were re-run on 2026-11-11 for the unit-9 completion (inter lossless
+and transform partitions); the earlier 2026-10-30 numbers in this section were
+superseded.
+
+The 13 ignored tests are the external-oracle tests that need `dav2d` or an AVM
+stream; all 13 were run for this report and passed (the new one is
+`av2::tests::av2_unit9_encoder_dav2d_tx_partition`). The workspace test count
 includes the AV2 and VVC suites. The plain `cargo test --workspace` failure is
 the VVC transform-selection flake described in the verdict, not an AV2 test.
 
