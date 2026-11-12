@@ -89,11 +89,16 @@ AVIF is excluded with it because it reuses the AV1 core.
 ## AV2
 
 Status: **experimental encoder + decoder** in `rustmpeg-video::av2`. Units 1–12
-landed on 2026-10-30: deblocking, CDEF, CCSO/GDF, loop restoration,
+landed on 2026-10-30 and are **DONE for their recorded matrices** (2026-11-12
+final status): deblocking, CDEF, CCSO/GDF, loop restoration,
 segmentation/VAQ, NEWMV/switchable subpel, compound/wedge/CWP, warped motion,
 transform sets/WHT/DPCM, extended partitions, palette/IntraBC, and film grain.
-Release close-out status, the per-unit support table, and the exact verification
-commands are in [`docs/AV2-RELEASE.md`](docs/AV2-RELEASE.md).
+Stock AVM **inter** stream decoding remains **blocked** (chroma syntax desync on
+sub-8x8 chroma; not claimed as passing), and the attempted fix is preserved,
+not shipped, at `docsagents/patches/av2-avm-chroma-wip.patch`. One out-of-matrix
+256x192 QP 20 frame-1 luma divergence also remains. Release close-out status,
+the per-unit support table, and the exact verification commands are in
+[`docs/AV2-RELEASE.md`](docs/AV2-RELEASE.md).
 
 - Encoder: pixel/bit-depth abstraction, padded planes, OBU/IVF/Y4M containers,
   MSAC/CDF entropy coding, transforms, quantisation, intra/inter prediction, rate
@@ -181,14 +186,15 @@ commands are in [`docs/AV2-RELEASE.md`](docs/AV2-RELEASE.md).
   reuse) and per-unit NS filter banks are rejected.
 - Remaining decoder limits (evidence in
   [`docs/AV2-RELEASE.md`](docs/AV2-RELEASE.md)):
-  - unit 8: `LOCALWARP`, `EXTENDWARP`, `INTERINTRA`, warp-inter-intra and
-    six-parameter warp deltas are rejected, and `WARPMV` is decoded but not
-    emitted. Warped motion is byte-exact at 8/10/12-bit on the recorded
-    matrices;
-  - unit 9: lossless is intra-only, the encoder emits only
-    `TX_PARTITION_NONE`, the inter lossless CDF is absent, and lossless
-    palette/DIP/CfL are rejected. Full transform sets 0–3, 4x4 WHT and DPCM are
-    implemented and verified;
+  - unit 8: `INTERINTRA`, `LOCALWARP`, `EXTENDWARP`, `WARPMV` and
+    `WARP_NEWMV`/`DELTAWARP` are parsed, predicted and emitted; six-parameter
+    warp deltas are not emitted. Warped motion is byte-exact at 8/10/12-bit on
+    the recorded matrices, with one out-of-matrix 256x192 QP 20 frame-1
+    luma-only divergence in the 21-case re-verification;
+  - unit 9: full transform sets 0–3, 4x4 WHT and DPCM are implemented and
+    verified, including inter lossless and `SPLIT`/`HORZ`/`VERT` transform
+    partitions. Intra and 4-way/5-way transform partitions and lossless
+    palette/DIP/CfL are rejected, and long transform sets are not emitted;
   - sub-pixel and global IntraBC are rejected; the encoder emits at most one
     IntraBC block per frame;
   - the encoder and decoder both use the full AV2 §7.12.2 `find_mv_stack`
@@ -196,8 +202,12 @@ commands are in [`docs/AV2-RELEASE.md`](docs/AV2-RELEASE.md).
     `WarpParamStack`, per-4x4 `Mvs`/`SubMvs`); the encoder emits `LOCALWARP`
     and `EXTENDWARP` and the recorded warp/newmv matrix is byte-exact except
     one out-of-matrix content case;
-  - AVM inter frames differ from `dav2d` even with loop filters disabled; AVM
-    4:2:2/4:4:4 and 10/12-bit streams are rejected by `dav2d` sequence headers.
+  - stock AVM **inter** stream decoding is blocked: the chroma syntax
+    desynchronises on sub-8x8 chroma and the chroma intra mode index lands
+    outside the AV2 enumeration. This is not a pass; the attempted fix is
+    preserved, not shipped, at
+    `docsagents/patches/av2-avm-chroma-wip.patch`. AVM 4:2:2/4:4:4 and
+    10/12-bit streams are rejected by `dav2d` sequence headers.
     The multi-frame AVM key frame also carries the unrelated 1-LSB intra
     reconstruction difference.
   - 10-frame 2x2-remainder streams (`66x66`, `130x66`, `130x130`) make `dav2d`
