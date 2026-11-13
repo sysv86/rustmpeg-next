@@ -1,5 +1,52 @@
 # H.266 / VVC Implementation Status (`rustmpeg-video::vvc`)
 
+## 0c. Chroma dual-tree, CCLM and JCCR (2026-11-13)
+
+The general coding-tree decoder (`decode_general.rs`) now closes the chroma half
+of the intra pipeline. Verified byte-exact (`cmp`, full Y+U+V, 3 frames, QP26,
+VTM 24.0 `EncoderApp` with `encoder_intra_vtm.cfg`, filters disabled:
+`--DeblockingFilterDisable=1 --SAO=0 --ALF=0 --CCALF=0 --LMCSEnable=0`) against
+VTM 24.0 `DecoderApp`:
+
+| Stream | CTU | CCLM | JCCR | Result |
+| :--- | :--- | :--- | :--- | :--- |
+| `vtm8n2_64` | 128 (64x64 picture) | off | off | byte-exact |
+| `vtm8n2_128` | 128 | off | off | byte-exact |
+| `vtm8_64` | 128 (64x64 picture) | on | on | byte-exact |
+| `vtm8_128` | 128 | on | on | byte-exact |
+
+The CABAC regular-bin trace matches VTM bin-for-bin for the complete 3-frame
+streams (`D_CABAC` on the trace build, `VVC_BINTRACE` on this decoder), so the
+match is a reconstruction match, not an agreement of two desynchronised parses.
+
+Fixes in this change:
+
+- **Dual-tree chroma geometry** (`decode_general.rs`): the split series of each
+  node is tracked, and `CclmEnabled` is derived per `H.266 §8.4.4` / VTM
+  `CodingUnit::checkCCLMAllowed` (64x64-node split pattern, co-located luma split
+  at the same depth, ISP exclusion). Chroma QP mapping for `TuCResMode == 2` uses
+  `Qp′CbCr` from `ChromaQpTable[2]` plus `pps_joint_cbcr_qp_offset_value` and
+  `sh_joint_cbcr_qp_offset` (`H.266 §8.7.2` Eq. 1125/1128/1135).
+- **Normative CCLM** (`H.266 §8.4.5.2.14`): `numTopRight`/`numLeftBelow`,
+  `numSampT`/`numSampL`, `numIs4N`, `startPosN`, `pickStepN`, `pickPosN`, the
+  per-sample template down-sampling of (368)/(369), the CTU-boundary top
+  template (371)–(373), the left template (376)/(377), the min/max group
+  parameter derivation (378)–(404), and per-sample application (404). Both
+  `sps_chroma_vertical_collocated_flag` values are parsed and honoured.
+- **JCCR in the general path** (`H.266 §7.4.12.7`, §8.7.4.2, VTM
+  `TU::getICTMode`/`inverseTransformICT`): both components of a joint pair are
+  reconstructed together; masks 1/2/3 derive the missing residual
+  (`cb = cr >> 1`, `cr = cb >> 1`, `cr = ±cb`) with `ph_joint_cbcr_sign_flag`.
+- **Chroma PDPC gating**: PDPC applies only when `nTbW >= 4 && nTbH >= 4`; a
+  `8x2` chroma block now predicts unpadded DC, matching VTM.
+- **LFNST for chroma**: the zero-out input width is 8 only for 4x4/8x8 and 16
+  otherwise (`TrQuant::xInvLfnst`), the chroma LFNST set/transpose mode is the
+  actual chroma intra mode (co-located luma mode for CCLM), and LFNST is not
+  applied to chroma of a single-tree CU.
+
+The strict 25-case harness (rustmpeg encode → VTM 24.0 / VVdeC 3.3 decode) is
+**50/50** after these changes; the full 266-check matrix was not re-run.
+
 ## 0b. Post-fix re-measurement (late 2026-10-28, after waves 1–4)
 
 Full matrix (`$ORACLE/vvc-conf-full/run_conformance_full.sh`): **261 passed /

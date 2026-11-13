@@ -1,6 +1,24 @@
 # Verification Debt (`rustmpeg-next` H.266/VVC)
 
-Last updated: 2026-10-28 (final, after waves 1–4).
+Last updated: 2026-11-13 (general intra decoder verification; 266-check matrix last run 2026-10-28).
+
+
+## 0a. General intra decoder verification (2026-11-13)
+
+Executed after the chroma dual-tree/CCLM/JCCR change:
+
+- VTM 24.0 `EncoderApp` (`encoder_intra_vtm.cfg`, QP26, 3 frames, filters off:
+  `--DeblockingFilterDisable=1 --SAO=0 --ALF=0 --CCALF=0 --LMCSEnable=0`) with
+  `LMChroma`/`JointCbCr` off and on, at 64x64 and 128x128 (128 CTU in both
+  cases): 4/4 streams byte-exact against VTM 24.0 `DecoderApp`
+  (`vtm8n2_64`, `vtm8n2_128`, `vtm8_64`, `vtm8_128`).
+- Regular CABAC bins matched VTM bin-for-bin across all three pictures for the
+  64x64 and 128x128 streams (VTM trace build `D_CABAC`, decoder `VVC_BINTRACE`).
+- Strict 25-case harness (`rustmpeg` encode -> VTM 24.0 `DecoderApp` + VVdeC 3.3
+  `vvdecapp`): **50/50**.
+- Not re-run: the external 266-check matrix, VTM-encoder interop (`d_i8`,
+  `d_i10`, `d_ra8`), tiles/WPP/slices/RPR, and GPU paths. Those rows are not
+  claimed by this change.
 
 ## 0. Measured Full Matrix (2026-10-28, final after waves 1–4)
 
@@ -40,16 +58,17 @@ Residual failures (precise scope — do not cite as conformant):
   our stream byte-exactly.
 - **`ctu16`: typed rejection.** `--ctu-size 16` returns `InvalidConfig` without
   panicking; the harness records `ENCODE FAIL`.
-- **`d_i8` / `d_i10`: VTM picture smaller than its CTU.** Our decoder rejects
-  `coded picture not aligned to the CTU grid` because VTM 24.0 uses a
-  128-sample CTU for a 64x64 picture. The general-QT/MTT/dual-tree subset would
-  next fail at `coding tree with a minimum QT below 32, MTT, or dual-tree intra`.
+- **`d_i8` / `d_i10`: stock VTM-stream interop is not yet re-measured.** The
+  former `coded picture not aligned to the CTU grid` rejection is gone:
+  `validate_decoded_sps` now accepts partial CTUs and the general QT/MTT
+  dual-tree decoder (`decode_general.rs`) handles the 128-sample CTU on a 64x64
+  picture. `d_i8`/`d_i10` still need a fresh run; they are not claimed passing.
 - **`d_ra8`: temporal sub-layers.** Rejected with
-  `SPS: more than one temporal sub-layer`; the random-access tree also needs the
-  general QT/MTT/dual-tree decoder.
+  `SPS: more than one temporal sub-layer`; the random-access tree also needs
+  inter parsing outside the general intra path.
 - **Decoder interop is proven only for a VTM subset configuration.** VTM streams
   carrying the PH in the slice header in that subset decode byte-exactly; stock
-  VTM streams do not.
+  VTM streams outside the verified general-intra configuration do not.
 
 Commands (external, not part of the repo test suite):
 

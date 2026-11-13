@@ -38,16 +38,7 @@ impl CoeffScan {
     /// For 64-point transforms, only the top-left 32x32 coefficient region is scanned.
     pub fn new(width: usize, height: usize) -> Self {
         assert!(width.is_power_of_two() && height.is_power_of_two());
-        let log2_cg_w = if width >= 4 {
-            2
-        } else {
-            width.trailing_zeros()
-        };
-        let log2_cg_h = if height >= 4 {
-            2
-        } else {
-            height.trailing_zeros()
-        };
+        let (log2_cg_w, log2_cg_h) = coefficient_group_log2(width, height);
         let cg_w = 1usize << log2_cg_w;
         let cg_h = 1usize << log2_cg_h;
         let capped_w = width.min(32);
@@ -72,7 +63,7 @@ impl CoeffScan {
         debug_assert_eq!(raster.len(), max_num_coeff);
         Self {
             width,
-            log2_cg_size: log2_cg_w + log2_cg_h,
+            log2_cg_size: (log2_cg_w + log2_cg_h) as u32,
             width_in_groups,
             height_in_groups,
             max_num_coeff,
@@ -94,6 +85,99 @@ impl CoeffScan {
         let (x, y) = self.group_xy[sub_set];
         y * self.width_in_groups + x
     }
+}
+
+/// Normative coefficient-group size for a transform block
+/// (`g_log2TxSubblockSize`, ITU-T Rec. H.266 §8.7.4; VTM `Rom.cpp:267-276`).
+///
+/// Wide or tall blocks use non-square groups (for example `2x8` for a `2x32`
+/// transform) so the group grid stays close to square.
+fn coefficient_group_log2(width: usize, height: usize) -> (usize, usize) {
+    const TABLE: [[(usize, usize); 8]; 8] = [
+        [
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (0, 4),
+            (0, 4),
+            (0, 4),
+        ],
+        [
+            (1, 0),
+            (1, 1),
+            (1, 1),
+            (1, 3),
+            (1, 3),
+            (1, 3),
+            (1, 3),
+            (1, 3),
+        ],
+        [
+            (2, 0),
+            (1, 1),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+        ],
+        [
+            (3, 0),
+            (3, 1),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+        ],
+        [
+            (4, 0),
+            (3, 1),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+        ],
+        [
+            (4, 0),
+            (3, 1),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+        ],
+        [
+            (4, 0),
+            (3, 1),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+        ],
+        [
+            (4, 0),
+            (3, 1),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+            (2, 2),
+        ],
+    ];
+    let lx = width.trailing_zeros() as usize;
+    let ly = height.trailing_zeros() as usize;
+    TABLE[lx.min(7)][ly.min(7)]
 }
 
 /// VTM `ScanGenerator` with `CoeffScanType::DIAG`, returning `(x, y)`.

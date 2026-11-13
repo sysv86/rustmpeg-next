@@ -34,6 +34,8 @@ pub struct CtxModel {
     state1: u16,
     rate0: u8,
     rate1: u8,
+    /// Diagnostic context index.
+    pub id: u16,
 }
 
 impl CtxModel {
@@ -52,6 +54,7 @@ impl CtxModel {
             state1: (u32::from(p1) & MASK_1) as u16,
             rate0,
             rate1,
+            id: 0,
         }
     }
 
@@ -266,8 +269,9 @@ impl CtxStore {
     pub fn from_table(qp: i32, table: &[(u8, u8); NUM_CONTEXTS]) -> Self {
         let qp = qp.clamp(0, 63);
         let mut models = [CtxModel::init(qp, 35, 8); NUM_CONTEXTS];
-        for (model, &(init_id, ws)) in models.iter_mut().zip(table.iter()) {
+        for (i, (model, &(init_id, ws))) in models.iter_mut().zip(table.iter()).enumerate() {
             *model = CtxModel::init(qp, init_id, ws);
+            model.id = i as u16;
         }
         Self { models }
     }
@@ -739,6 +743,21 @@ impl BinEncoder {
 }
 
 /// VVC arithmetic decoder.
+static NEXT_BIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `VVC_BINTRACE=1` enables the per-bin diagnostic trace; cached once so the
+/// environment is not inspected in the CABAC hot path.
+fn bin_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VVC_BINTRACE").is_some())
+}
+
+/// Current number of decoded CABAC bins (diagnostics only).
+pub fn bin_count() -> usize {
+    NEXT_BIN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// VVC CABAC decoder.
 pub struct BinDecoder<'a> {
     data: &'a [u8],
     pos: usize,
@@ -757,6 +776,9 @@ impl<'a> BinDecoder<'a> {
     /// slice header is still well defined; it is zero-extended here instead of
     /// being rejected.
     pub fn new(data: &'a [u8]) -> Result<Self, &'static str> {
+        if bin_trace_enabled() {
+            NEXT_BIN.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         let first = data.first().copied().unwrap_or(0);
         let second = data.get(1).copied().unwrap_or(0);
         Ok(Self {
@@ -813,6 +835,10 @@ impl<'a> BinDecoder<'a> {
             }
         }
         ctx.update(bin);
+        if bin_trace_enabled() {
+            let n = NEXT_BIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("BIN {} {} {}", n, ctx.id, u8::from(bin));
+        }
         bin
     }
 
@@ -826,12 +852,17 @@ impl<'a> BinDecoder<'a> {
             self.bits_needed = -8;
         }
         let scaled_range = self.range << 7;
-        if self.value >= scaled_range {
+        let bin = if self.value >= scaled_range {
             self.value -= scaled_range;
             true
         } else {
             false
+        };
+        if bin_trace_enabled() {
+            let n = NEXT_BIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("EP {} {}", n, u8::from(bin));
         }
+        bin
     }
 
     /// Decode `num_bins` equiprobable bins, MSB first.

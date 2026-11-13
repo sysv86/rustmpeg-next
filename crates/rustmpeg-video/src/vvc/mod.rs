@@ -55,6 +55,8 @@ pub mod bits;
 pub mod cabac;
 /// Core 1D/2D DCT-2, DST-7, DCT-8 transforms, quantization, and Dependent Quantization.
 pub mod dct;
+/// General QT/MTT coding-tree decoding for intra pictures.
+mod decode_general;
 /// In-loop filters: LMCS, Deblocking, SAO, ALF, and CCALF (ITU-T H.266 clause 8.8).
 pub mod filter;
 /// High-level syntax (OPI, DCI, VPS, SPS, PPS, APS, Picture Header, Slice Header).
@@ -384,15 +386,12 @@ fn validate_decoded_sps(info: &VvcSpsInfo) -> Result<(), VvcError> {
         )));
     }
     let ctu = 1u32 << info.ctu_log2;
-    if info.coded_width < ctu
-        || info.coded_height < ctu
-        || !info.coded_width.is_multiple_of(ctu)
-        || !info.coded_height.is_multiple_of(ctu)
-    {
-        return Err(VvcError::Unsupported(
-            "coded picture not aligned to the CTU grid",
+    if info.coded_width == 0 || info.coded_height == 0 {
+        return Err(VvcError::Bitstream(
+            "coded picture has a zero dimension".to_string(),
         ));
     }
+    let _ = ctu;
     let cf = ChromaFormatIdc::from_idc(info.chroma_format_idc);
     let sub_w = cf.sub_width_c() as u32;
     let sub_h = cf.sub_height_c() as u32;
@@ -2038,29 +2037,6 @@ impl VvcDecoder {
                     if let Some(full_pps) = &self.full_pps_table[usize::from(pps_id)] {
                         eff_opts.enable_deblock |= !full_pps.deblocking_disabled;
                     }
-                    // The slice reader below decodes one 32x32 coding unit per
-                    // CTU quadrant and only understands a quadtree down to that
-                    // unit. Reject other coding trees as unsupported instead of
-                    // desynchronising the CABAC stream and reporting a missing
-                    // terminating bit much later.
-                    if let Some(full_sps) = &self.full_sps_table[usize::from(pps.sps_id)] {
-                        let min_qt_intra = full_sps
-                            .min_cb_log2
-                            .saturating_add(full_sps.log2_diff_min_qt_min_cb_intra_luma);
-                        let min_qt_inter = full_sps
-                            .min_cb_log2
-                            .saturating_add(full_sps.log2_diff_min_qt_min_cb_inter);
-                        if min_qt_intra < 5
-                            || min_qt_inter < 5
-                            || full_sps.max_mtt_depth_intra_luma != 0
-                            || full_sps.max_mtt_depth_inter != 0
-                            || full_sps.dual_tree_intra
-                        {
-                            return Err(VvcError::Unsupported(
-                                "coding tree with a minimum QT below 32, MTT, or dual-tree intra",
-                            ));
-                        }
-                    }
                     let (qp_delta, data_off) = match &embedded_header {
                         Some((sh, data_off)) => {
                             // With `ph_in_slice_header_flag == 1` the slice
@@ -2100,6 +2076,83 @@ impl VvcDecoder {
                         self.dpb.clear();
                         let cf = ChromaFormatIdc::from_idc(info.chroma_format_idc);
                         let bd = info.bit_depth_luma;
+                        let general_tree = self.full_sps_table[usize::from(pps.sps_id)]
+                            .as_ref()
+                            .is_some_and(|s| {
+                                let min_qt_luma =
+                                    (1u32 << s.min_cb_log2) << s.log2_diff_min_qt_min_cb_intra_luma;
+                                let ctu = 1u32 << s.info.ctu_log2;
+                                s.dual_tree_intra
+                                    || s.max_mtt_depth_intra_luma != 0
+                                    || s.max_mtt_depth_inter != 0
+                                    || min_qt_luma < 32
+                                    || !s.info.width.is_multiple_of(ctu)
+                                    || !s.info.height.is_multiple_of(ctu)
+                            });
+                        if general_tree
+                            && bd == 8
+                            && cf == ChromaFormatIdc::Chroma420
+                            && embedded_header.is_some()
+                        {
+                            let (sh, _) = embedded_header.as_ref().ok_or_else(|| {
+                                VvcError::Bitstream("missing slice header".into())
+                            })?;
+                            let ph = sh.embedded_ph.as_ref().ok_or_else(|| {
+                                VvcError::Bitstream("missing picture header".into())
+                            })?;
+                            let full_sps = self.full_sps_table[usize::from(pps.sps_id)]
+                                .as_ref()
+                                .ok_or_else(|| VvcError::Bitstream("missing full SPS".into()))?;
+                            let full_pps = self.full_pps_table[usize::from(pps_id)]
+                                .as_ref()
+                                .ok_or_else(|| VvcError::Bitstream("missing full PPS".into()))?;
+                            let qp_cb = full_sps.mapped_chroma_qp(1, i32::from(slice_qp), 0);
+                            let qp_cr = full_sps.mapped_chroma_qp(2, i32::from(slice_qp), 0);
+                            let joint_qp_offset = full_pps.joint_cbcr_qp_offset.unwrap_or(0)
+                                + sh.joint_cbcr_qp_offset;
+                            let qp_joint =
+                                full_sps.mapped_chroma_qp(3, i32::from(slice_qp), joint_qp_offset);
+                            let gp = decode_general::decode_general_intra_picture(
+                                cabac,
+                                full_sps,
+                                full_pps,
+                                sh,
+                                ph,
+                                &self.aps_bank,
+                                i32::from(slice_qp),
+                                qp_cb,
+                                qp_cr,
+                                qp_joint,
+                            )?;
+                            let wy = gp.y.width as u32;
+                            let hy = gp.y.height as u32;
+                            let mut vf = VvcFrame::new(wy, hy, 8, ChromaFormatIdc::Chroma420);
+                            vf.y.data = gp.y.data.iter().map(|&v| u16::from(v)).collect();
+                            vf.u.data = gp.u.data.iter().map(|&v| u16::from(v)).collect();
+                            vf.v.data = gp.v.data.iter().map(|&v| u16::from(v)).collect();
+                            self.dpb.insert(RefFrame::from_planes(
+                                0,
+                                false,
+                                gp.y,
+                                gp.u,
+                                gp.v,
+                                MotionFieldGrid::new(wy as usize, hy as usize),
+                            ));
+                            let mut cropped_vvc = crop_vvc_frame(&vf, info.width, info.height);
+                            if let Some(ref fg) = self.active_film_grain {
+                                if !fg.cancel_flag {
+                                    apply_film_grain_to_vvc_frame(
+                                        &mut cropped_vvc,
+                                        fg,
+                                        slice_poc as u32,
+                                    );
+                                }
+                            }
+                            let i420 = cropped_vvc.to_i420();
+                            self.last_vvc_frame = Some(cropped_vvc);
+                            decoded_frame = Some(i420);
+                            continue;
+                        }
                         if bd != 8 || cf != ChromaFormatIdc::Chroma420 || info.ctu_log2 != CTU_LOG2
                         {
                             let coded_vvc = slice::decode_vvc_frame_picture_with_chroma_qp(
@@ -3401,7 +3454,7 @@ mod tests {
     }
 
     #[test]
-    fn decoded_sps_rejects_ctu_sizes_other_than_32_and_partial_ctus() {
+    fn decoded_sps_rejects_out_of_range_ctu_sizes_and_zero_dimensions() {
         let err = validate_decoded_sps(&sps_info(3, (64, 64)))
             .expect_err("8x8 CTUs are outside 32..=128");
         assert!(matches!(err, VvcError::Unsupported(_)), "{err}");
@@ -3410,9 +3463,12 @@ mod tests {
             .expect_err("256x256 CTUs are outside 32..=128");
         assert!(matches!(err, VvcError::Unsupported(_)), "{err}");
 
-        let err = validate_decoded_sps(&sps_info(5, (48, 48)))
-            .expect_err("partial CTUs are legal but not implemented");
-        assert!(matches!(err, VvcError::Unsupported(_)), "{err}");
+        let err = validate_decoded_sps(&sps_info(5, (0, 0))).expect_err("zero-sized picture");
+        assert!(matches!(err, VvcError::Bitstream(_)), "{err}");
+
+        // Partial CTUs are legal and handled by the general coding tree.
+        validate_decoded_sps(&sps_info(5, (48, 48))).expect("32x32 CTU, partial picture");
+        validate_decoded_sps(&sps_info(6, (96, 64))).expect("64x64 CTU, partial picture");
 
         validate_decoded_sps(&sps_info(5, (32, 32))).expect("32x32 CTU, CTU-aligned");
         validate_decoded_sps(&sps_info(5, (96, 64))).expect("32x32 CTU, CTU-aligned");

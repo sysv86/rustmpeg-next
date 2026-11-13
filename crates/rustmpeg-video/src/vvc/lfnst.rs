@@ -122,7 +122,7 @@ pub fn parameters_rect(
     let sb_size = if width >= 8 && height >= 8 { 8 } else { 4 };
     let tu_4x4_or_8x8 = (width == 4 && height == 4) || (width == 8 && height == 8);
     let tr_size = if sb_size == 4 { 16 } else { 48 };
-    let zero_out = if tu_4x4_or_8x8 || sb_size == 4 { 8 } else { 16 };
+    let zero_out = if tu_4x4_or_8x8 { 8 } else { 16 };
     Ok((sb_size, tr_size, zero_out))
 }
 

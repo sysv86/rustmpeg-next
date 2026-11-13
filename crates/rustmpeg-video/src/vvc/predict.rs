@@ -3500,36 +3500,40 @@ pub fn predict_cclm_with_format(
     let mut chroma_pts = [128i32; 4];
     let mut count = 0usize;
 
-    if has_top && has_left {
-        let x0 = cw / 4;
-        let x1 = (3 * cw) / 4;
-        let y0 = ch / 4;
-        let y1 = (3 * ch) / 4;
-        luma_pts = [ds_top[x0], ds_top[x1], ds_left[y0], ds_left[y1]];
-        chroma_pts = [
-            i32::from(refs_c.above[x0]),
-            i32::from(refs_c.above[x1]),
-            i32::from(refs_c.left[y0]),
-            i32::from(refs_c.left[y1]),
-        ];
-        count = 4;
-    } else if has_top {
-        for i in 0..4.min(cw) {
-            let idx = ((2 * i + 1) * cw) / 8;
-            luma_pts[i] = ds_top[idx.min(cw - 1)];
-            chroma_pts[i] = i32::from(refs_c.above[idx.min(cw - 1)]);
+    // VTM `xGetLMParameters`: sample the template at `startPos`/`pickStep`
+    // positions with the availability-dependent `4` mode. The number of
+    // selected samples is at most four per side.
+    let above_is_4 = if has_left { 0usize } else { 1usize };
+    let left_is_4 = if has_top { 0usize } else { 1usize };
+    if has_top {
+        let start = cw >> (2 + above_is_4);
+        let step = 1.max(cw >> (1 + above_is_4));
+        let cnt = cw.min((1 + above_is_4) << 1);
+        let mut pos = start;
+        for i in 0..cnt {
+            let idx = pos.min(cw - 1);
+            luma_pts[i] = ds_top[idx];
+            chroma_pts[i] = i32::from(refs_c.above[idx]);
             count += 1;
+            pos += step;
         }
-    } else if has_left {
-        for i in 0..4.min(ch) {
-            let idx = ((2 * i + 1) * ch) / 8;
-            luma_pts[i] = ds_left[idx.min(ch - 1)];
-            chroma_pts[i] = i32::from(refs_c.left[idx.min(ch - 1)]);
+    }
+    if has_left {
+        let start = ch >> (2 + left_is_4);
+        let step = 1.max(ch >> (1 + left_is_4));
+        let cnt = ch.min((1 + left_is_4) << 1);
+        let mut pos = start;
+        for _ in 0..cnt {
+            let idx = pos.min(ch - 1);
+            luma_pts[count] = ds_left[idx];
+            chroma_pts[count] = i32::from(refs_c.left[idx]);
             count += 1;
+            pos += step;
         }
     }
 
     let params = derive_cclm_params_from_4_samples(luma_pts, chroma_pts, count, 8);
+
     ds_block
         .into_iter()
         .map(|y_val| {

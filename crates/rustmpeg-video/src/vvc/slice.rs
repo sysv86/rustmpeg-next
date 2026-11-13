@@ -1320,7 +1320,7 @@ fn encode_ts_block(enc: &mut BinEncoder, ctx: &mut CtxStore, scan: &CoeffScan, c
     }
 }
 
-fn decode_ts_block(
+pub(crate) fn decode_ts_block(
     dec: &mut BinDecoder<'_>,
     ctx: &mut CtxStore,
     scan: &CoeffScan,

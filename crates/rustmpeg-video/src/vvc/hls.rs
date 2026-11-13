@@ -1482,6 +1482,14 @@ pub struct VvcSps {
     pub log2_diff_max_tt_min_qt_intra_luma: u8,
     /// `sps_qtbtt_dual_tree_intra_flag`.
     pub dual_tree_intra: bool,
+    /// `sps_log2_diff_min_qt_min_cb_intra_slice_chroma`.
+    pub log2_diff_min_qt_min_cb_intra_chroma: u8,
+    /// `sps_max_mtt_hierarchy_depth_intra_slice_chroma`.
+    pub max_mtt_depth_intra_chroma: u8,
+    /// `sps_log2_diff_max_bt_min_qt_intra_slice_chroma`.
+    pub log2_diff_max_bt_min_qt_intra_chroma: u8,
+    /// `sps_log2_diff_max_tt_min_qt_intra_slice_chroma`.
+    pub log2_diff_max_tt_min_qt_intra_chroma: u8,
     /// `sps_log2_diff_min_qt_min_cb_inter_slice`.
     pub log2_diff_min_qt_min_cb_inter: u8,
     /// `sps_max_mtt_hierarchy_depth_inter_slice`.
@@ -1576,6 +1584,10 @@ pub struct VvcSps {
     pub mip_enabled: bool,
     /// `sps_cclm_enabled_flag`.
     pub cclm_enabled: bool,
+    /// `sps_chroma_horizontal_collocated_flag` (4:2:0 CCLM down-sampling).
+    pub chroma_horizontal_collocated: bool,
+    /// `sps_chroma_vertical_collocated_flag` (4:2:0 CCLM down-sampling).
+    pub chroma_vertical_collocated: bool,
     /// `sps_explicit_scaling_list_enabled_flag`.
     pub explicit_scaling_list_enabled: bool,
     /// `sps_scaling_matrix_for_lfnst_disabled_flag`.
@@ -1695,12 +1707,16 @@ pub fn parse_full_sps_rbsp(rbsp: &[u8]) -> Result<VvcSps, VvcError> {
     } else {
         false
     };
+    let mut log2_diff_min_qt_min_cb_intra_chroma = 0u8;
+    let mut max_mtt_depth_intra_chroma = 0u8;
+    let (mut log2_diff_max_bt_min_qt_intra_chroma, mut log2_diff_max_tt_min_qt_intra_chroma) =
+        (0, 0);
     if dual_tree_intra {
-        let _min_qt_c = sps_bit(br.read_ue())?;
-        let mtt_c = sps_bit(br.read_ue())?;
-        if mtt_c != 0 {
-            let _ = sps_bit(br.read_ue())?;
-            let _ = sps_bit(br.read_ue())?;
+        log2_diff_min_qt_min_cb_intra_chroma = sps_bit(br.read_ue())? as u8;
+        max_mtt_depth_intra_chroma = sps_bit(br.read_ue())? as u8;
+        if max_mtt_depth_intra_chroma != 0 {
+            log2_diff_max_bt_min_qt_intra_chroma = sps_bit(br.read_ue())? as u8;
+            log2_diff_max_tt_min_qt_intra_chroma = sps_bit(br.read_ue())? as u8;
         }
     }
     let log2_diff_min_qt_min_cb_inter = sps_bit(br.read_ue())? as u8;
@@ -1898,10 +1914,12 @@ pub fn parse_full_sps_rbsp(rbsp: &[u8]) -> Result<VvcSps, VvcError> {
     } else {
         false
     };
-    if info.chroma_format_idc == 1 {
-        let _hor_col = sps_bit(br.read_bit())?;
-        let _ver_col = sps_bit(br.read_bit())?;
-    }
+    let (chroma_horizontal_collocated, chroma_vertical_collocated) = if info.chroma_format_idc == 1
+    {
+        (sps_bit(br.read_bit())?, sps_bit(br.read_bit())?)
+    } else {
+        (true, true)
+    };
     let palette_enabled = sps_bit(br.read_bit())?;
     let act_enabled = if info.chroma_format_idc == 3 && !max_tb_size_64 {
         sps_bit(br.read_bit())?
@@ -1949,6 +1967,10 @@ pub fn parse_full_sps_rbsp(rbsp: &[u8]) -> Result<VvcSps, VvcError> {
         log2_diff_max_bt_min_qt_intra_luma,
         log2_diff_max_tt_min_qt_intra_luma,
         dual_tree_intra,
+        log2_diff_min_qt_min_cb_intra_chroma,
+        max_mtt_depth_intra_chroma,
+        log2_diff_max_bt_min_qt_intra_chroma,
+        log2_diff_max_tt_min_qt_intra_chroma,
         log2_diff_min_qt_min_cb_inter,
         max_mtt_depth_inter,
         log2_diff_max_bt_min_qt_inter,
@@ -1996,6 +2018,8 @@ pub fn parse_full_sps_rbsp(rbsp: &[u8]) -> Result<VvcSps, VvcError> {
         mrl_enabled,
         mip_enabled,
         cclm_enabled,
+        chroma_horizontal_collocated,
+        chroma_vertical_collocated,
         explicit_scaling_list_enabled,
         scaling_matrix_for_lfnst_disabled,
         dep_quant_enabled,
