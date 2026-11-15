@@ -44,6 +44,20 @@ enum Split {
     None,
 }
 
+/// Coding-unit mode type of a coding-tree node (`H.266 §7.4.12.4`,
+/// VTM `ModeType`). `All` is the CTU root of an inter slice; `Intra` and
+/// `Inter` are set when `mode_constraint()` signals or infers a mode type.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum ModeType {
+    /// `MODE_TYPE_ALL`
+    #[default]
+    All,
+    /// `MODE_TYPE_INTER`
+    Inter,
+    /// `MODE_TYPE_INTRA`
+    Intra,
+}
+
 #[derive(Clone, Copy)]
 struct Node {
     x: usize,
@@ -59,6 +73,8 @@ struct Node {
     checkd_implicit: bool,
     implicit_split: Split,
     tree: TreeType,
+    /// Mode type inherited from the parent split (`mode_constraint()`).
+    mode_type: ModeType,
     /// Split series from the CTU root (`H.266 §8.4.4` / VTM `cu.splitSeries`).
     series: [u8; 8],
     series_len: u8,
@@ -107,6 +123,10 @@ struct LumaCell {
     split64: u8,
     /// Whether the co-located luma CU uses ISP.
     isp: bool,
+    /// `cu_skip_flag` of the co-located CU (merge/skip context derivation).
+    skip: bool,
+    /// `inter_affine_flag` / `merge_subblock_flag` of the co-located CU.
+    affine: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -128,26 +148,30 @@ struct Lim {
     max_tb: usize,
 }
 
-fn limits(sps: &VvcSps, chroma: bool) -> Lim {
+fn limits(g: &Gen<'_>, chroma: bool) -> Lim {
+    let sps = g.sps;
     let min_cb = 1usize << sps.min_cb_log2;
-    let min_qt = if chroma {
-        min_cb << sps.log2_diff_min_qt_min_cb_intra_chroma
+    // VTM `PreCalcValues` (`Slice.h:1140-1185`, `getValIdx`): an intra slice uses
+    // the intra-slice parameters (the chroma-specific ones for the chroma tree
+    // of a dual tree), every other slice - including intra subtrees of an inter
+    // slice - uses the inter-slice parameters for both channels.
+    let inter = g.sh.slice_type != super::hls::VvcSliceType::I;
+    // The picture header carries the effective partition limits: the
+    // `ph_partition_constraints_override_*` values when the PH signals an
+    // override, the SPS values otherwise (`H.266 §7.4.12.4`,
+    // `VvcPictureHeader::log2_diff_min_qt_min_cb`).
+    let channel = if inter {
+        1
+    } else if chroma {
+        2
     } else {
-        min_cb << sps.log2_diff_min_qt_min_cb_intra_luma
+        0
     };
-    let (bt_diff, tt_diff, max_mtt) = if chroma {
-        (
-            sps.log2_diff_max_bt_min_qt_intra_chroma,
-            sps.log2_diff_max_tt_min_qt_intra_chroma,
-            sps.max_mtt_depth_intra_chroma,
-        )
-    } else {
-        (
-            sps.log2_diff_max_bt_min_qt_intra_luma,
-            sps.log2_diff_max_tt_min_qt_intra_luma,
-            sps.max_mtt_depth_intra_luma,
-        )
-    };
+    let min_qt_diff = g.ph.log2_diff_min_qt_min_cb[channel];
+    let bt_diff = g.ph.log2_diff_max_bt_min_qt[channel];
+    let tt_diff = g.ph.log2_diff_max_tt_min_qt[channel];
+    let max_mtt = g.ph.max_mtt_depth[channel];
+    let min_qt = min_cb << min_qt_diff;
     Lim {
         min_qt,
         max_bt: min_qt << bt_diff,
@@ -357,6 +381,10 @@ struct Gen<'a> {
     qp_cr: i32,
     /// `Qp′CbCr` (`H.266 §8.7.2`, used when `TuCResMode == 2`).
     qp_joint: i32,
+    /// `NumRefIdxActive[0..1]` of the slice.
+    num_ref_idx: [u8; 2],
+    /// `slice->getBiDirPred()`: symmetric MVD is available for this picture.
+    bidir_pred: bool,
     lmcs: Option<LmcsReshaper16>,
     lmcs_on: bool,
     sao: Vec<[filter::SaoType; 3]>,
@@ -443,6 +471,34 @@ impl<'a> Gen<'a> {
                     mip,
                     split64,
                     isp,
+                    ..LumaCell::default()
+                };
+            }
+        }
+    }
+
+    /// Record the inter syntax state of a coding unit on the luma grid.
+    fn set_lcell_inter(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        qt: u8,
+        skip: bool,
+        affine: bool,
+    ) {
+        for yy in y..(y + h).min(self.pic_h) {
+            for xx in x..(x + w).min(self.pic_w) {
+                self.lgrid[(yy / 4) * self.lgrid_w + xx / 4] = LumaCell {
+                    valid: true,
+                    cu_w: w as u16,
+                    cu_h: h as u16,
+                    qt_depth: qt,
+                    intra: false,
+                    skip,
+                    affine,
+                    ..LumaCell::default()
                 };
             }
         }
@@ -673,6 +729,10 @@ struct CuPlan {
     mts: u8,
     implicit_mts: bool,
     dep_quant: bool,
+    /// Subblock-transform mode (`0` = none, else `sbt_idx * 2 + pos + 1`).
+    sbt: u8,
+    /// Whether the coding unit is intra (`CU::isIntra`).
+    intra: bool,
 }
 
 pub(crate) struct GeneralPicture {
@@ -682,7 +742,7 @@ pub(crate) struct GeneralPicture {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn decode_general_intra_picture(
+pub(crate) fn decode_general_picture(
     cabac: &[u8],
     sps: &VvcSps,
     _pps: &VvcPps,
@@ -693,6 +753,8 @@ pub(crate) fn decode_general_intra_picture(
     qp_cb: i32,
     qp_cr: i32,
     qp_joint: i32,
+    num_ref_idx: [u8; 2],
+    bidir_pred: bool,
 ) -> Result<GeneralPicture, VvcError> {
     if sps.info.chroma_format_idc != 1 || !matches!(sps.info.bit_depth_luma, 8 | 10) {
         return Err(VvcError::Unsupported(
@@ -776,6 +838,8 @@ pub(crate) fn decode_general_intra_picture(
         qp_cb,
         qp_cr,
         qp_joint,
+        num_ref_idx,
+        bidir_pred,
         lmcs,
         lmcs_on,
         sao: vec![[filter::SaoType::Off; 3]; ctu_cols * ctu_rows],
@@ -803,7 +867,11 @@ pub(crate) fn decode_general_intra_picture(
     };
 
     let mut dec = BinDecoder::new(cabac).map_err(|e| VvcError::Bitstream(e.to_string()))?;
-    let mut ctx = CtxStore::new_i_slice(qp_y);
+    // `initCtxModels()` selects the P/B table from the slice type and swaps it
+    // when `sh_cabac_init_flag` is set (`H.266 §9.3.2.2`, VTM
+    // `CABACReader.cpp:75-88`); using the I-slice table for an inter picture
+    // desynchronises at the first context-coded bin.
+    let mut ctx = CtxStore::new_for_slice(sh.slice_type, sh.cabac_init_flag, qp_y);
     let dual = sps.dual_tree_intra && sh.slice_type == super::hls::VvcSliceType::I;
 
     for ctu_y in (0..pic_h).step_by(ctu) {
@@ -826,12 +894,13 @@ pub(crate) fn decode_general_intra_picture(
                 checkd_implicit: false,
                 implicit_split: Split::None,
                 tree: TreeType::Joint,
+                mode_type: ModeType::All,
                 series: [0; 8],
                 series_len: 0,
             };
             if dual {
                 if ctu > 64 {
-                    let lim = limits(sps, false);
+                    let lim = limits(&g, false);
                     let mut can = CanSplit::default();
                     let root = Node {
                         tree: TreeType::Luma,
@@ -863,6 +932,7 @@ pub(crate) fn decode_general_intra_picture(
                                 checkd_implicit: false,
                                 implicit_split: Split::None,
                                 tree: TreeType::Luma,
+                                mode_type: ModeType::Intra,
                                 series: {
                                     let mut series = [0u8; 8];
                                     series[0] = Split::Qt as u8;
@@ -945,8 +1015,10 @@ fn coding_tree(
     ctx: &mut CtxStore,
     node: Node,
 ) -> Result<(), VvcError> {
-    let lim = limits(g.sps, node.tree == TreeType::Chroma);
-    let dual = g.sps.dual_tree_intra;
+    let lim = limits(g, node.tree == TreeType::Chroma);
+    // The dual-tree rules only apply to intra pictures; an inter picture always
+    // uses a single tree even when `sps_qtbtt_dual_tree_intra_flag` is set.
+    let dual = g.sps.dual_tree_intra && g.sh.slice_type == super::hls::VvcSliceType::I;
     let mut can = CanSplit::default();
     can_split(g, &node, &lim, dual, &mut can);
     let contexts = split_contexts(g, &node, can);
@@ -977,7 +1049,9 @@ fn coding_tree(
         return coding_unit(g, dec, ctx, node);
     }
     let is_implicit = implicit_split(&node, &lim, g.pic_w, g.pic_h, dual) != Split::None;
+    let child_mode = signal_mode_constraint(g, dec, ctx, &node, split)?;
     let mut next = node;
+    next.mode_type = child_mode;
     next.last_split = split;
     next.checkd_implicit = false;
     next.implicit_split = Split::None;
@@ -1065,6 +1139,55 @@ fn coding_tree(
         _ => {}
     }
     Ok(())
+}
+
+/// `mode_constraint()` (`H.266 §7.4.12.4`, VTM `CodingStructure::signalModeCons`
+/// and `CABACReader::mode_constraint`, `CodingStructure.cpp:1046-1072`,
+/// `CABACReader.cpp:757-777`).
+///
+/// In an inter slice a split can switch the subtree to intra coding when the
+/// chroma block would be too small: `LDT_MODE_TYPE_SIGNAL` carries one
+/// `mode_cons_flag` bin, `LDT_MODE_TYPE_INFER` forces intra and
+/// `LDT_MODE_TYPE_INHERIT` keeps the parent mode type.
+fn signal_mode_constraint(
+    g: &mut Gen<'_>,
+    dec: &mut BinDecoder<'_>,
+    ctx: &mut CtxStore,
+    node: &Node,
+    split: Split,
+) -> Result<ModeType, VvcError> {
+    if g.sh.slice_type == super::hls::VvcSliceType::I || node.mode_type != ModeType::All {
+        return Ok(node.mode_type);
+    }
+    let mut min_luma_area = node.w * node.h;
+    match split {
+        Split::Qt | Split::Th | Split::Tv => min_luma_area >>= 2,
+        Split::Bh | Split::Bv => min_luma_area >>= 1,
+        _ => {}
+    }
+    // 4:2:0: `getChannelTypeScaleX + getChannelTypeScaleY == 2`.
+    let min_chroma_block = min_luma_area >> 2;
+    let chroma_w = node.w / 2;
+    let is_2xn = (chroma_w == 4 && split == Split::Bv) || (chroma_w == 8 && split == Split::Tv);
+    if min_chroma_block >= 16 && !is_2xn {
+        return Ok(node.mode_type);
+    }
+    if min_luma_area < 32 {
+        return Ok(ModeType::Intra);
+    }
+    let left_intra = g
+        .lcell(node.x.wrapping_sub(1), node.y)
+        .is_some_and(|c| c.intra);
+    let above_intra = g
+        .lcell(node.x, node.y.wrapping_sub(1))
+        .is_some_and(|c| c.intra);
+    let flag = dec
+        .decode_bin(&mut ctx.models[ctx::MODE_CONS_FLAG + usize::from(left_intra || above_intra)]);
+    Ok(if flag {
+        ModeType::Intra
+    } else {
+        ModeType::Inter
+    })
 }
 
 fn decode_sao_ctu(
@@ -1239,6 +1362,638 @@ fn bit_is_on(dec: &mut BinDecoder<'_>, ctx: &mut CtxStore, model: usize) -> bool
     dec.decode_bin(&mut ctx.models[model])
 }
 
+// ============================================================================
+// Inter coding units (`H.266 §7.3.8.7`, VTM `CABACReader::coding_unit`,
+// `prediction_unit`, `merge_data`, `cu_residual`)
+// ============================================================================
+
+/// Inter syntax state of one coding unit (VTM `CodingUnit` + `PredictionUnit`
+/// fields that are signalled or derived while parsing).
+#[derive(Clone, Copy)]
+struct InterCu {
+    skip: bool,
+    merge: bool,
+    /// `merge_subblock_flag` (called `affine` in VTM).
+    affine: bool,
+    /// `cu_affine_type_flag` (6-parameter affine model).
+    affine_6param: bool,
+    mmvd: bool,
+    ciip: bool,
+    geo: bool,
+    /// `geoSplitDir` for a geometric-partitioning merge.
+    geo_split_dir: u8,
+    /// `geoMergeIdx[0..1]` for a geometric-partitioning merge.
+    geo_cand: [u8; 2],
+    merge_idx: u8,
+    /// `inter_pred_idc`: `1` = L0, `2` = L1, `3` = BI.
+    inter_dir: u8,
+    ref_idx: [i8; 2],
+    mvd: [super::inter::Mv; 2],
+    /// `sym_mvd_flag` + 1 (`0` = absent).
+    smvd: u8,
+    /// `amvr_flag`/`amvr_precision_idx` result (`0` = 1/4 pel).
+    imv: u8,
+    /// `bcw_idx` (`BCW_DEFAULT == 2`).
+    bcw: u8,
+}
+
+impl Default for InterCu {
+    fn default() -> Self {
+        Self {
+            skip: false,
+            merge: false,
+            affine: false,
+            affine_6param: false,
+            mmvd: false,
+            ciip: false,
+            geo: false,
+            geo_split_dir: 0,
+            geo_cand: [0, 0],
+            merge_idx: 0,
+            inter_dir: 0,
+            ref_idx: [-1, -1],
+            mvd: [super::inter::Mv::default(); 2],
+            smvd: 0,
+            imv: 0,
+            bcw: 2,
+        }
+    }
+}
+
+/// `DeriveCtx::CtxSkipFlag` (`ContextModelling.cpp:328-342`).
+fn skip_ctx(g: &Gen<'_>, node: &Node) -> usize {
+    let left = g
+        .lcell(node.x.wrapping_sub(1), node.y)
+        .is_some_and(|c| c.skip);
+    let above = g
+        .lcell(node.x, node.y.wrapping_sub(1))
+        .is_some_and(|c| c.skip);
+    usize::from(left) + usize::from(above)
+}
+
+/// `DeriveCtx::CtxPredModeFlag` (`ContextModelling.cpp:344-352`).
+fn pred_mode_ctx(g: &Gen<'_>, node: &Node) -> usize {
+    let left = g
+        .lcell(node.x.wrapping_sub(1), node.y)
+        .is_some_and(|c| c.intra);
+    let above = g
+        .lcell(node.x, node.y.wrapping_sub(1))
+        .is_some_and(|c| c.intra);
+    usize::from(left || above)
+}
+
+/// `DeriveCtx::CtxAffineFlag` (`ContextModelling.cpp:314-326`).
+fn affine_ctx(g: &Gen<'_>, node: &Node) -> usize {
+    let left = g
+        .lcell(node.x.wrapping_sub(1), node.y)
+        .is_some_and(|c| c.affine);
+    let above = g
+        .lcell(node.x, node.y.wrapping_sub(1))
+        .is_some_and(|c| c.affine);
+    usize::from(left) + usize::from(above)
+}
+
+/// `DeriveCtx::CtxInterDir` (`ContextModelling.cpp:302-305`).
+fn inter_dir_ctx(w: usize, h: usize) -> usize {
+    7 - ((w.trailing_zeros() as usize + h.trailing_zeros() as usize + 1) >> 1)
+}
+
+/// Unary index with a coded first bin (`merge_idx`, `merge_subblock_idx`).
+fn unary_index(dec: &mut BinDecoder<'_>, ctx: &mut CtxStore, base: usize, num: usize) -> u8 {
+    let num_minus1 = num.saturating_sub(1);
+    let mut idx = 0u8;
+    if num_minus1 > 0 && dec.decode_bin(&mut ctx.models[base]) {
+        idx = 1;
+        while usize::from(idx) < num_minus1 && dec.decode_bin_ep() {
+            idx += 1;
+        }
+    }
+    idx
+}
+
+/// `unary_max_eqprob()` (`H.266 §9.3.3.9`, VTM `CABACReader.cpp:3612-3622`).
+fn unary_max_eqprob(dec: &mut BinDecoder<'_>, max_symbol: usize) -> u8 {
+    let mut symbol = 0u8;
+    while usize::from(symbol) < max_symbol && dec.decode_bin_ep() {
+        symbol += 1;
+    }
+    symbol
+}
+
+/// `mmvd_merge_idx()` (`H.266 §7.3.8.9`, VTM `CABACReader.cpp:2420-2451`).
+fn mmvd_merge_idx(
+    dec: &mut BinDecoder<'_>,
+    ctx: &mut CtxStore,
+    max_merge_cand: u8,
+) -> (u8, u8, u8) {
+    let base_idx = if max_merge_cand > 1 {
+        u8::from(dec.decode_bin(&mut ctx.models[ctx::MMVD_MERGE_IDX]))
+    } else {
+        0
+    };
+    let num_step_minus1 = 7u8; // `MmvdIdx::REFINE_STEP - 1`
+    let mut step = 0u8;
+    if dec.decode_bin(&mut ctx.models[ctx::MMVD_STEP_MVP_IDX]) {
+        step = 1;
+        while step < num_step_minus1 && dec.decode_bin_ep() {
+            step += 1;
+        }
+    }
+    let position = dec.decode_bin_ep() as u8 * 2 + dec.decode_bin_ep() as u8;
+    (base_idx, step, position)
+}
+
+/// `imv_mode()` / `affine_amvr_mode()` (`H.266 §7.3.8.7`, VTM
+/// `CABACReader.cpp:1017-1100`).
+fn amvr_mode(
+    g: &Gen<'_>,
+    dec: &mut BinDecoder<'_>,
+    ctx: &mut CtxStore,
+    affine: bool,
+    nonzero_mvd: bool,
+    nonzero_affine_mvd: bool,
+) -> u8 {
+    if !g.sps.amvr_enabled {
+        return 0;
+    }
+    if affine {
+        if !g.sps.affine_amvr_enabled || !nonzero_affine_mvd {
+            return 0;
+        }
+        let mut value = u8::from(dec.decode_bin(&mut ctx.models[ctx::IMV_FLAG + 2]));
+        if value != 0 {
+            value = u8::from(dec.decode_bin(&mut ctx.models[ctx::IMV_FLAG + 3]));
+            value += 1;
+        }
+        return value;
+    }
+    if !nonzero_mvd {
+        return 0;
+    }
+    let value = u8::from(dec.decode_bin(&mut ctx.models[ctx::IMV_FLAG]));
+    if value == 0 {
+        return 0;
+    }
+    let hpel = u8::from(dec.decode_bin(&mut ctx.models[ctx::IMV_FLAG + 4]));
+    if hpel == 0 {
+        return 3; // `IMV_HPEL`
+    }
+    let four_pel = u8::from(dec.decode_bin(&mut ctx.models[ctx::IMV_FLAG + 1]));
+    if four_pel == 0 { 1 } else { 2 } // `IMV_FPEL`, `IMV_4PEL`
+}
+
+/// `cu_bcw_flag()` (`H.266 §7.3.8.7`, VTM `CABACReader.cpp:1275-1312`).
+fn bcw_flag(dec: &mut BinDecoder<'_>, ctx: &mut CtxStore) -> u8 {
+    // `g_BcwParsingOrder` = {2, 3, 1, 4, 0} with `BCW_DEFAULT == 2`.
+    const PARSING_ORDER: [u8; 5] = [2, 3, 1, 4, 0];
+    let mut idx = 0usize;
+    if dec.decode_bin(&mut ctx.models[ctx::BCW_IDX]) {
+        idx = 1;
+        let num_bcw = 3usize; // `slice->getCheckLDC()` is always 0 in the decoder
+        while idx + 1 < num_bcw && dec.decode_bin_ep() {
+            idx += 1;
+        }
+    }
+    PARSING_ORDER[idx]
+}
+
+/// Parse one inter coding unit.
+///
+/// The prediction and residual reconstruction of inter coding units is the
+/// next decoder stage: the syntax below is complete for the tools that
+/// `d_ra8` uses, and `VVC_INTER_SYNTAX_ONLY` exists so that the CABAC
+/// synchronisation of those pictures can be verified while reconstruction is
+/// still missing.
+fn decode_inter_cu(
+    g: &mut Gen<'_>,
+    dec: &mut BinDecoder<'_>,
+    ctx: &mut CtxStore,
+    node: Node,
+    skip: bool,
+) -> Result<(), VvcError> {
+    let w = node.w;
+    let h = node.h;
+    let mut cu = InterCu {
+        skip,
+        ..InterCu::default()
+    };
+
+    // `prediction_unit()`: `merge_flag` unless the CU is a skip CU.
+    cu.merge = if skip {
+        true
+    } else {
+        bit_is_on(dec, ctx, ctx::MERGE_FLAG)
+    };
+
+    if cu.merge {
+        // `merge_data()`
+        if g.sps.max_num_affine_merge_cand > 0 && w >= 8 && h >= 8 {
+            cu.affine = bit_is_on(dec, ctx, ctx::SUBBLOCK_MERGE_FLAG + affine_ctx(g, &node));
+        }
+        if cu.affine {
+            cu.merge_idx = unary_index(
+                dec,
+                ctx,
+                ctx::AFF_MERGE_IDX,
+                usize::from(g.sps.max_num_affine_merge_cand),
+            );
+        } else {
+            let ciip_avail = g.sps.ciip_enabled && !skip && w < 128 && h < 128 && w * h >= 64;
+            let geo_avail = g.sps.gpm_enabled
+                && g.sh.slice_type == super::hls::VvcSliceType::B
+                && g.sps.max_num_gpm_cand > 1
+                && (8..=64).contains(&w)
+                && (8..=64).contains(&h)
+                && w < 8 * h
+                && h < 8 * w;
+            let regular = if geo_avail || ciip_avail {
+                bit_is_on(dec, ctx, ctx::REGULAR_MERGE_FLAG + usize::from(!skip))
+            } else {
+                true
+            };
+            if regular {
+                cu.mmvd = g.sps.mmvd_enabled && bit_is_on(dec, ctx, ctx::MMVD_FLAG);
+                if cu.mmvd {
+                    let (base_idx, step, position) =
+                        mmvd_merge_idx(dec, ctx, g.sps.max_num_merge_cand);
+                    let _ = (base_idx, step, position);
+                } else {
+                    cu.merge_idx = unary_index(
+                        dec,
+                        ctx,
+                        ctx::MERGE_IDX,
+                        usize::from(g.sps.max_num_merge_cand),
+                    );
+                }
+            } else if ciip_avail && geo_avail {
+                cu.ciip = bit_is_on(dec, ctx, ctx::CIIP_FLAG);
+                cu.geo = !cu.ciip;
+            } else if ciip_avail {
+                cu.ciip = true;
+            } else {
+                cu.geo = true;
+            }
+            if cu.geo {
+                // `merge_idx()` for a geometric-partitioning merge: the split
+                // direction is a truncated binary code over
+                // `GEO_NUM_PARTITION_MODE` and the two merge candidates are
+                // equal-probability unary codes (`CABACReader.cpp:2395-2418`).
+                cu.geo_split_dir = dec.decode_trunc_bin(64) as u8;
+                let num_cand_minus2 = usize::from(g.sps.max_num_gpm_cand).saturating_sub(2);
+                let mut cand0 = 0u8;
+                let mut cand1 = 0u8;
+                if bit_is_on(dec, ctx, ctx::MERGE_IDX) {
+                    cand0 += unary_max_eqprob(dec, num_cand_minus2) + 1;
+                }
+                if num_cand_minus2 > 0 && bit_is_on(dec, ctx, ctx::MERGE_IDX) {
+                    cand1 += unary_max_eqprob(dec, num_cand_minus2 - 1) + 1;
+                }
+                if cand1 >= cand0 {
+                    cand1 += 1;
+                }
+                cu.geo_cand = [cand0, cand1];
+            }
+        }
+    } else {
+        // `inter_pred_idc()`
+        if g.sh.slice_type == super::hls::VvcSliceType::P {
+            cu.inter_dir = 1;
+        } else {
+            let restricted = (w == 4 && h == 4) || w + h == 12;
+            if !restricted && bit_is_on(dec, ctx, ctx::INTER_DIR + inter_dir_ctx(w, h)) {
+                cu.inter_dir = 3;
+            }
+            if cu.inter_dir != 3 {
+                cu.inter_dir = if bit_is_on(dec, ctx, ctx::INTER_DIR + 5) {
+                    2
+                } else {
+                    1
+                };
+            }
+        }
+        // `affine_flag()` + `affine_type()`
+        if g.sps.affine_enabled && w > 8 && h > 8 {
+            cu.affine = bit_is_on(dec, ctx, ctx::AFFINE_FLAG + affine_ctx(g, &node));
+            if cu.affine && g.sps.affine_type_6param {
+                cu.affine_6param = bit_is_on(dec, ctx, ctx::AFFINE_TYPE);
+            }
+        }
+        // `smvd_mode()`
+        if cu.inter_dir == 3 && !cu.affine && g.bidir_pred {
+            cu.smvd = if bit_is_on(dec, ctx, ctx::SMVD_FLAG) {
+                1
+            } else {
+                0
+            };
+        }
+        // `ref_idx()`, `mvd_coding()`, `mvp_flag()` per list.
+        let num_mv = if cu.affine {
+            if cu.affine_6param { 3 } else { 2 }
+        } else {
+            1
+        };
+        if cu.inter_dir != 2 {
+            cu.ref_idx[0] = ref_idx(dec, ctx, g.num_ref_idx[0], cu.smvd != 0, 0);
+            for i in 0..num_mv {
+                cu.mvd[0] = super::slice::decode_mvd(dec, ctx);
+                let _ = i;
+            }
+            bit_is_on(dec, ctx, ctx::MVP_IDX);
+        }
+        if cu.inter_dir != 1 {
+            if cu.smvd == 0 {
+                cu.ref_idx[1] = ref_idx(dec, ctx, g.num_ref_idx[1], false, 1);
+                // `ph_mvd_l1_zero_flag` suppresses the list-1 MVD for BI CUs.
+                if !(g.ph.mvd_l1_zero && cu.inter_dir == 3) {
+                    for i in 0..num_mv {
+                        cu.mvd[1] = super::slice::decode_mvd(dec, ctx);
+                        let _ = i;
+                    }
+                }
+            }
+            bit_is_on(dec, ctx, ctx::MVP_IDX);
+        }
+        if cu.inter_dir == 3 && ((w == 4 && h == 4) || w + h == 12) {
+            cu.inter_dir = 1;
+            cu.ref_idx[1] = -1;
+            cu.bcw = 2;
+        }
+        if cu.smvd != 0 {
+            let cur = usize::from(cu.smvd - 1);
+            cu.mvd[1 - cur] = super::inter::Mv::new(-cu.mvd[cur].hor, -cu.mvd[cur].ver);
+        }
+    }
+
+    let nonzero_mvd =
+        cu.mvd[0].hor != 0 || cu.mvd[0].ver != 0 || cu.mvd[1].hor != 0 || cu.mvd[1].ver != 0;
+    cu.imv = amvr_mode(g, dec, ctx, cu.affine, nonzero_mvd, nonzero_mvd);
+    if !cu.merge
+        && !cu.affine
+        && g.sps.bcw_enabled
+        && g.sh.slice_type == super::hls::VvcSliceType::B
+        && w * h >= 256
+        && cu.inter_dir == 3
+    {
+        cu.bcw = bcw_flag(dec, ctx);
+    }
+
+    // `cu_residual()`: `rqt_root_cbf`, `sbt_mode`, transform tree.
+    let mut cuctx = CuCtx::default();
+    let mut tus = Vec::new();
+    let mut root_cbf = true;
+    if !cu.merge {
+        root_cbf = bit_is_on(dec, ctx, ctx::QT_ROOT_CBF);
+    }
+    if !root_cbf {
+        if std::env::var_os("VVC_TRACE").is_some() {
+            eprintln!(
+                "inter_cu pos=({},{}) size={}x{} skip={} merge={} dir={} root_cbf=0",
+                node.x, node.y, w, h, cu.skip, cu.merge, cu.inter_dir
+            );
+        }
+        g.set_lcell_inter(node.x, node.y, w, h, node.qt_depth, cu.skip, cu.affine);
+        return inter_reconstruction_placeholder(&cu);
+    }
+
+    // A skip coding unit carries no residual syntax: `coding_unit()` returns
+    // right after `prediction_unit()` (`CABACReader.cpp:888-897`), so neither
+    // `sbt_mode()` nor the transform tree is coded.
+    if cu.skip {
+        if std::env::var_os("VVC_TRACE").is_some() {
+            eprintln!(
+                "inter_cu pos=({},{}) size={}x{} skip=true merge={} subblock={} mmvd={} merge_idx={}",
+                node.x, node.y, w, h, cu.merge, cu.affine, cu.mmvd, cu.merge_idx
+            );
+        }
+        g.set_lcell_inter(node.x, node.y, w, h, node.qt_depth, true, cu.affine);
+        return inter_reconstruction_placeholder(&cu);
+    }
+
+    // `sbt_mode()`
+    let mut sbt = 0u8;
+    if root_cbf {
+        sbt = decode_sbt_mode(g, dec, ctx, &node, cu.affine)?;
+    }
+
+    let mut plan = CuPlan {
+        tree: node.tree,
+        x: node.x,
+        w,
+        h,
+        qp_y: g.qp_y,
+        qp_cb: g.qp_cb,
+        qp_cr: g.qp_cr,
+        mode: 0,
+        mip: None,
+        isp: predict::IspMode::None,
+        mrl: 0,
+        bdpcm_l: 0,
+        bdpcm_c: 0,
+        chroma_mode: 0,
+        lfnst_mode_c: 0,
+        lfnst: 0,
+        mts: 0,
+        implicit_mts: false,
+        dep_quant: g.sh.dep_quant_used,
+        sbt,
+        intra: false,
+    };
+    let mut isp_prev = false;
+    let mut isp_any_cbf = false;
+    {
+        transform_tree(
+            g,
+            dec,
+            ctx,
+            &node,
+            &mut plan,
+            0,
+            0,
+            &mut tus,
+            &mut cuctx,
+            &mut isp_prev,
+            &mut isp_any_cbf,
+            false,
+            false,
+        )?;
+    }
+    decode_inter_mts(g, dec, ctx, &node, &mut plan, &tus, &cuctx);
+
+    if std::env::var_os("VVC_TRACE").is_some() {
+        eprintln!(
+            "inter_cu pos=({},{}) size={}x{} skip={} merge={} subblock={} mmvd={} ciip={} dir={} merge_idx={} imv={} bcw={} sbt={} root_cbf=1",
+            node.x,
+            node.y,
+            w,
+            h,
+            cu.skip,
+            cu.merge,
+            cu.affine,
+            cu.mmvd,
+            cu.ciip,
+            cu.inter_dir,
+            cu.merge_idx,
+            cu.imv,
+            cu.bcw,
+            sbt
+        );
+    }
+    g.set_lcell_inter(node.x, node.y, w, h, node.qt_depth, cu.skip, cu.affine);
+    inter_reconstruction_placeholder(&cu)
+}
+
+/// `ref_idx_l0/l1` (`H.266 §7.3.8.7`, VTM `CABACReader::ref_idx`).
+fn ref_idx(
+    dec: &mut BinDecoder<'_>,
+    ctx: &mut CtxStore,
+    num_ref: u8,
+    smvd: bool,
+    _list: usize,
+) -> i8 {
+    if smvd || num_ref <= 1 {
+        return 0;
+    }
+    if !dec.decode_bin(&mut ctx.models[ctx::REF_PIC]) {
+        return 0;
+    }
+    if num_ref <= 2 || !dec.decode_bin(&mut ctx.models[ctx::REF_PIC + 1]) {
+        return 1;
+    }
+    let mut idx = 3i8;
+    loop {
+        if i16::from(idx) >= i16::from(num_ref) || !dec.decode_bin_ep() {
+            return idx - 1;
+        }
+        idx += 1;
+    }
+}
+
+/// `sbt_mode()` (`H.266 §7.3.8.7`, VTM `CABACReader.cpp:1628-1683`).
+fn decode_sbt_mode(
+    g: &Gen<'_>,
+    dec: &mut BinDecoder<'_>,
+    ctx: &mut CtxStore,
+    node: &Node,
+    affine: bool,
+) -> Result<u8, VvcError> {
+    // `CU::checkAllowedSbt()` does not exclude subblock-merge (affine) CUs.
+    let _ = affine;
+    let allowed = sbt_allowed(g, node);
+    if allowed == 0 {
+        return Ok(0);
+    }
+    let ctx_idx = usize::from(node.w * node.h <= 256);
+    if !dec.decode_bin(&mut ctx.models[ctx::SBT_FLAG + ctx_idx]) {
+        return Ok(0);
+    }
+    let (ver_half, hor_half) = (allowed & 1 != 0, allowed & 2 != 0);
+    let (ver_quad, hor_quad) = (allowed & 4 != 0, allowed & 8 != 0);
+    let quad = if (hor_half || ver_half) && (hor_quad || ver_quad) {
+        dec.decode_bin(&mut ctx.models[ctx::SBT_QUAD_FLAG])
+    } else {
+        false
+    };
+    let hor = if (quad && ver_quad && hor_quad) || (!quad && ver_half && hor_half) {
+        let c = if node.w == node.h {
+            0
+        } else if node.w < node.h {
+            1
+        } else {
+            2
+        };
+        dec.decode_bin(&mut ctx.models[ctx::SBT_HOR_FLAG + c])
+    } else {
+        (quad && hor_quad) || (!quad && hor_half)
+    };
+    let pos = u8::from(dec.decode_bin(&mut ctx.models[ctx::SBT_POS_FLAG]));
+    // Encode the mode as `sbtIdx * 2 + pos` so the transform tree can split.
+    // `SbtIdx`: `SBT_VER_HALF = 0`, `SBT_HOR_HALF = 1`, `SBT_VER_QUAD = 2`,
+    // `SBT_HOR_QUAD = 3` (`TypeDef.h`).
+    let idx = match (hor, quad) {
+        (false, false) => 0,
+        (true, false) => 1,
+        (false, true) => 2,
+        (true, true) => 3,
+    };
+    Ok(idx * 2 + pos + 1)
+}
+
+/// `CU::checkAllowedSbt` bit mask (`H.266 §7.4.12.7`,
+/// VTM `UnitTools.cpp`, `SBT_VER_HALF = 1`, `SBT_HOR_HALF = 2`,
+/// `SBT_VER_QUAD = 4`, `SBT_HOR_QUAD = 8`).
+fn sbt_allowed(g: &Gen<'_>, node: &Node) -> u8 {
+    // `CU::checkAllowedSbt()` (`Unit.cpp:453-495`).
+    let (w, h) = (node.w, node.h);
+    let max_sbt_cu = if g.sps.max_tb_size_64 { 64 } else { 32 };
+    if !g.sps.sbt_enabled || w > max_sbt_cu || h > max_sbt_cu {
+        return 0;
+    }
+    let min_sbt_cu = 8usize; // `1 << (MIN_CU_LOG2 + 1)`
+    let mut mask = 0u8;
+    if w >= min_sbt_cu {
+        mask |= 1; // `SBT_VER_HALF`
+    }
+    if h >= min_sbt_cu {
+        mask |= 2; // `SBT_HOR_HALF`
+    }
+    if w >= 2 * min_sbt_cu {
+        mask |= 4; // `SBT_VER_QUAD`
+    }
+    if h >= 2 * min_sbt_cu {
+        mask |= 8; // `SBT_HOR_QUAD`
+    }
+    mask
+}
+
+/// Inter `mts_idx()` (`H.266 §7.3.11.10`, VTM `CABACReader.cpp:3025-3057`).
+fn decode_inter_mts(
+    g: &Gen<'_>,
+    dec: &mut BinDecoder<'_>,
+    ctx: &mut CtxStore,
+    node: &Node,
+    plan: &mut CuPlan,
+    tus: &[TuData],
+    cuctx: &CuCtx,
+) {
+    let (w, h) = (node.w, node.h);
+    let first_ts = tus
+        .iter()
+        .find(|t| t.component == 0)
+        .map(|t| t.ts)
+        .unwrap_or(true);
+    let allowed = g.sps.mts_enabled && g.sps.explicit_mts_inter && w <= 32 && h <= 32 && !first_ts;
+    if !allowed || cuctx.violates_mts || !cuctx.mts_last_scan_pos || plan.sbt != 0 {
+        return;
+    }
+    let mut v = 0u8;
+    if dec.decode_bin(&mut ctx.models[ctx::MTS_IDX]) {
+        v = 1;
+        for i in 0..3usize {
+            if !dec.decode_bin(&mut ctx.models[ctx::MTS_IDX + 1 + i]) {
+                break;
+            }
+            v += 1;
+        }
+    }
+    plan.mts = v;
+}
+
+/// Report that inter reconstruction is not implemented yet.
+///
+/// `VVC_INTER_SYNTAX_ONLY=1` turns this into a no-op so that the CABAC
+/// synchronisation of the inter pictures can be verified against VTM while the
+/// motion-compensation stage is missing. The pixel output of that mode is
+/// meaningless and the frame is dropped.
+fn inter_reconstruction_placeholder(cu: &InterCu) -> Result<(), VvcError> {
+    if std::env::var_os("VVC_INTER_SYNTAX_ONLY").is_some() {
+        return Ok(());
+    }
+    let _ = cu;
+    Err(VvcError::Unsupported(
+        "inter coding unit reconstruction (motion compensation)",
+    ))
+}
+
 fn decode_cu_luma(
     g: &mut Gen<'_>,
     dec: &mut BinDecoder<'_>,
@@ -1247,6 +2002,28 @@ fn decode_cu_luma(
 ) -> Result<(), VvcError> {
     let w = node.w;
     let h = node.h;
+    // `cu_skip_flag` / `pred_mode_flag` (`H.266 §7.3.8.7`). IBC and palette are
+    // rejected for this decoder, so a skip or inter prediction mode always
+    // selects the inter coding-unit syntax below.
+    if g.sh.slice_type != super::hls::VvcSliceType::I && node.mode_type != ModeType::Intra {
+        if g.sps.ibc_enabled {
+            return Err(VvcError::Unsupported(
+                "general coding-tree decoding does not implement IBC",
+            ));
+        }
+        let skip = !(w == 4 && h == 4) && bit_is_on(dec, ctx, ctx::SKIP_FLAG + skip_ctx(g, &node));
+        if skip {
+            return decode_inter_cu(g, dec, ctx, node, true);
+        }
+        let intra = if node.mode_type == ModeType::All && !(w == 4 && h == 4) {
+            bit_is_on(dec, ctx, ctx::PRED_MODE + pred_mode_ctx(g, &node))
+        } else {
+            node.mode_type == ModeType::All
+        };
+        if node.mode_type == ModeType::Inter || !intra {
+            return decode_inter_cu(g, dec, ctx, node, false);
+        }
+    }
     let ts_max = 1usize << g.sps.log2_transform_skip_max_size;
     let bdpcm_l = if g.sps.bdpcm_enabled && w <= ts_max && h <= ts_max {
         decode_bdpcm(dec, ctx, false)
@@ -1274,6 +2051,8 @@ fn decode_cu_luma(
         mts: 0,
         implicit_mts: g.sps.mts_enabled && !g.sps.explicit_mts_intra,
         dep_quant: g.sh.dep_quant_used,
+        sbt: 0,
+        intra: true,
     };
 
     if bdpcm_l != 0 {
@@ -1423,6 +2202,7 @@ fn decode_cu_luma(
         &mut isp_prev,
         &mut isp_any_cbf,
         false,
+        false,
     )?;
     decode_lfnst_mts(g, dec, ctx, &node, &mut plan, &mut cuctx, &tus);
     if std::env::var_os("VVC_TRACE").is_some() {
@@ -1493,6 +2273,8 @@ fn decode_cu_chroma(
         mts: 0,
         implicit_mts: g.sps.mts_enabled && !g.sps.explicit_mts_intra,
         dep_quant: g.sh.dep_quant_used,
+        sbt: 0,
+        intra: true,
     };
     if std::env::var_os("VVC_TRACE").is_some() {
         eprintln!(
@@ -1518,6 +2300,7 @@ fn decode_cu_chroma(
         &mut isp_prev,
         &mut isp_any_cbf,
         true,
+        false,
     )?;
     decode_lfnst_mts(g, dec, ctx, &node, &mut plan, &mut cuctx, &tus);
     reconstruct_tus(g, &plan, &tus)?;
@@ -1641,8 +2424,9 @@ fn transform_tree(
     isp_prev: &mut bool,
     isp_any_cbf: &mut bool,
     chroma_tree: bool,
+    no_residual: bool,
 ) -> Result<(), VvcError> {
-    let lim = limits(g.sps, chroma_tree);
+    let lim = limits(g, chroma_tree);
     let (w, h) = if chroma_tree {
         (node.w / 2, node.h / 2)
     } else {
@@ -1660,9 +2444,15 @@ fn transform_tree(
     let ny = (lh / max_tr).max(1);
     let can_max_split = nx > 1 || ny > 1;
     let isp_split = tr_depth == 0 && !chroma_tree && plan.isp != predict::IspMode::None;
-    if can_max_split || isp_split {
+    // `cu_sbt_flag` splits the coding unit's transform area into two tiles and
+    // leaves one of them without residual (`H.266 §7.3.11.10`,
+    // VTM `PartitionerImpl::getSbtTuTiling`, `UnitPartitioner.cpp:1194-1258`).
+    let sbt_split = tr_depth == 0 && !chroma_tree && plan.sbt != 0 && !can_max_split;
+    if can_max_split || isp_split || sbt_split {
         let parts: Vec<(usize, usize, usize, usize)> = if can_max_split {
             max_tu_tiles(w, h, nx, ny)
+        } else if sbt_split {
+            sbt_tu_tiles(w, h, plan.sbt)
         } else {
             predict::isp_subpartitions(0, 0, w, h, plan.isp)
         };
@@ -1675,6 +2465,7 @@ fn transform_tree(
                 ..*node
             };
             if child.x < g.vis_w && child.y < g.vis_h {
+                let no_residual = sbt_split && sbt_tile_has_no_residual(plan.sbt, i);
                 transform_tree(
                     g,
                     dec,
@@ -1688,6 +2479,7 @@ fn transform_tree(
                     isp_prev,
                     isp_any_cbf,
                     chroma_tree,
+                    no_residual,
                 )?;
             }
         }
@@ -1699,6 +2491,7 @@ fn transform_tree(
         ctx,
         node,
         plan,
+        no_residual,
         tr_depth,
         sub_tu,
         tus,
@@ -1714,6 +2507,48 @@ fn transform_tree(
 ///
 /// `nx`/`ny` are the luma tile counts; the parts are returned in raster order
 /// over that grid, which is what the `g_rsScanToZ`/`g_zScanTo*` tables produce.
+/// Tile geometry of a subblock transform (`plan.sbt = sbt_idx * 2 + pos + 1`),
+/// following VTM `PartitionerImpl::getSbtTuTiling`
+/// (`UnitPartitioner.cpp:1194-1258`).
+fn sbt_tu_tiles(w: usize, h: usize, sbt: u8) -> Vec<(usize, usize, usize, usize)> {
+    let info = sbt.saturating_sub(1);
+    let idx = info / 2;
+    let pos = info % 2;
+    match idx {
+        0 => {
+            // `SBT_VER_HALF`
+            vec![(0, 0, w / 2, h), (w / 2, 0, w / 2, h)]
+        }
+        1 => {
+            // `SBT_HOR_HALF`
+            vec![(0, 0, w, h / 2), (0, h / 2, w, h / 2)]
+        }
+        2 => {
+            // `SBT_VER_QUAD`
+            if pos == 0 {
+                vec![(0, 0, w / 4, h), (w / 4, 0, 3 * w / 4, h)]
+            } else {
+                vec![(0, 0, 3 * w / 4, h), (3 * w / 4, 0, w / 4, h)]
+            }
+        }
+        _ => {
+            // `SBT_HOR_QUAD`
+            if pos == 0 {
+                vec![(0, 0, w, h / 4), (0, h / 4, w, 3 * h / 4)]
+            } else {
+                vec![(0, 0, w, 3 * h / 4), (0, 3 * h / 4, w, h / 4)]
+            }
+        }
+    }
+}
+
+/// Whether SBT tile `index` carries no residual
+/// (`TransformUnit::checkTuNoResidual`).
+fn sbt_tile_has_no_residual(sbt: u8, index: usize) -> bool {
+    let pos = sbt.saturating_sub(1) % 2;
+    (pos == 0 && index == 1) || (pos == 1 && index == 0)
+}
+
 fn max_tu_tiles(w: usize, h: usize, nx: usize, ny: usize) -> Vec<(usize, usize, usize, usize)> {
     let tw = w / nx;
     let th = h / ny;
@@ -1724,12 +2559,14 @@ fn max_tu_tiles(w: usize, h: usize, nx: usize, ny: usize) -> Vec<(usize, usize, 
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transform_unit(
     g: &mut Gen<'_>,
     dec: &mut BinDecoder<'_>,
     ctx: &mut CtxStore,
     node: &Node,
     plan: &mut CuPlan,
+    no_residual: bool,
     tr_depth: u8,
     sub_tu: i32,
     tus: &mut Vec<TuData>,
@@ -1743,16 +2580,27 @@ fn transform_unit(
     let joint = plan.tree == TreeType::Joint && !chroma_tree;
     let mut cbf = [false; 3];
     let mut jccr = 0u8;
+    if no_residual {
+        // A subblock-transform tile without residual infers every cbf to 0 and
+        // codes no coefficient syntax (`TransformUnit::checkTuNoResidual`).
+        tus.push(TuData {
+            x: node.x,
+            y: node.y,
+            w: lw,
+            h: lh,
+            component: 0,
+            levels: Vec::new(),
+            cbf: false,
+            ts: false,
+            joint: 0,
+        });
+        return Ok(());
+    }
     if chroma_tree || (joint && !isp) {
         let c0 = dec.decode_bin(&mut ctx.models[ctx::QT_CBF_CB]);
         let c1 = dec.decode_bin(&mut ctx.models[ctx::QT_CBF_CR + usize::from(c0)]);
         cbf[1] = c0;
         cbf[2] = c1;
-        if g.sps.joint_cbcr_enabled && (c0 || c1) {
-            let mask = u32::from(c0) * 2 + u32::from(c1);
-            let on = dec.decode_bin(&mut ctx.models[ctx::JOINT_CB_CR_FLAG + (mask - 1) as usize]);
-            jccr = if on { mask as u8 } else { 0 };
-        }
     }
     if !chroma_tree {
         let n_tus = if isp {
@@ -1771,7 +2619,12 @@ fn transform_unit(
         let last = sub_tu as usize + 1 == n_tus;
         let prev = *isp_prev;
         let any_cbf = *isp_any_cbf;
+        // `H.266 §7.3.11.10` / VTM `CABACReader.cpp:2759-2763`: an inter
+        // transform unit at depth 0 with no chroma residual infers
+        // `tu_y_coded_flag == 1` instead of coding it.
         cbf[0] = if isp && last && !any_cbf {
+            true
+        } else if !plan.intra && tr_depth == 0 && !cbf[1] && !cbf[2] {
             true
         } else {
             let c = ctx::QT_CBF_Y + if isp { 2 + usize::from(prev) } else { 0 };
@@ -1779,6 +2632,18 @@ fn transform_unit(
         };
         *isp_prev = cbf[0];
         *isp_any_cbf = any_cbf || cbf[0];
+    }
+
+    // `joint_cb_cr()` follows the luma cbf and precedes the coefficient syntax
+    // (VTM `CABACReader.cpp:2838-2840`, `2913-2925`): the flag is read for an
+    // intra coding unit with any coded chroma component, and for an inter
+    // coding unit only when both are coded.
+    if plan.tree != TreeType::Luma && g.sps.joint_cbcr_enabled && (cbf[1] || cbf[2]) {
+        let mask = u8::from(cbf[1]) * 2 + u8::from(cbf[2]);
+        if (plan.intra && mask != 0) || mask == 3 {
+            let on = dec.decode_bin(&mut ctx.models[ctx::JOINT_CB_CR_FLAG + usize::from(mask - 1)]);
+            jccr = if on { mask } else { 0 };
+        }
     }
 
     let comps: &[usize] = if chroma_tree {
@@ -1805,7 +2670,10 @@ fn transform_unit(
         let mut levels = Vec::new();
         let mut ts = false;
         if cbf[comp] && !(comp == 2 && jccr == 3) {
+            // `TU::isTSAllowed` (`UnitTools.cpp`): transform skip is not
+            // signalled in a subblock-transform coding unit.
             let ts_allowed = g.sps.transform_skip_enabled
+                && plan.sbt == 0
                 && plan.bdpcm_l == 0
                 && plan.bdpcm_c == 0
                 && (!isp || comp != 0)
@@ -1921,7 +2789,7 @@ fn decode_lfnst_mts(
             any_ts = true;
         }
     }
-    let max_tb = limits(g.sps, chroma_tree).max_tb;
+    let max_tb = limits(g, chroma_tree).max_tb;
     let luma_size = if chroma_tree {
         (node.w, node.h)
     } else {
@@ -3729,6 +4597,8 @@ mod tests {
             mts: 0,
             implicit_mts: false,
             dep_quant: false,
+            sbt: 0,
+            intra: true,
         }
     }
 

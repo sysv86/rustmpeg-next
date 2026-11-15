@@ -858,6 +858,35 @@ fn push_nal_unit(out: &mut Vec<VvcNalUnit>, raw: &[u8]) -> Result<(), VvcError> 
     Ok(())
 }
 
+/// `slice->getBiDirPred()`: symmetric MVD (`sym_mvd_flag`) is available when the
+/// nearest forward reference of list 0 and the nearest backward reference of
+/// list 1 exist (`H.266 §7.4.12.6`, VTM `DecLib.cpp:3508-3585`).
+fn derive_bidir_pred(
+    sps: &hls::VvcSps,
+    sh: &hls::VvcSliceHeader,
+    ph: &hls::VvcPictureHeader,
+    poc: i32,
+    ref_l0: &[&RefFrame],
+    ref_l1: &[&RefFrame],
+) -> bool {
+    if !sps.smvd_enabled || ph.mvd_l1_zero || sh.slice_type != VvcSliceType::B {
+        return false;
+    }
+    let mut forward: Option<i32> = None;
+    for frame in ref_l0.iter().take(usize::from(sh.num_ref_idx_active[0])) {
+        if frame.poc < poc && !frame.is_long_term && forward.is_none_or(|f| frame.poc > f) {
+            forward = Some(frame.poc);
+        }
+    }
+    let mut backward: Option<i32> = None;
+    for frame in ref_l1.iter().take(usize::from(sh.num_ref_idx_active[1])) {
+        if frame.poc > poc && !frame.is_long_term && backward.is_none_or(|b| frame.poc < b) {
+            backward = Some(frame.poc);
+        }
+    }
+    forward.is_some() && backward.is_some()
+}
+
 /// Replicate the right/bottom edges until the picture reaches the coded size.
 fn pad_i420(frame: &I420Frame, width: u32, height: u32) -> I420Frame {
     let pad_plane = |src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32| -> Vec<u8> {
@@ -2200,9 +2229,11 @@ impl VvcDecoder {
                         && cf == ChromaFormatIdc::Chroma420
                         && embedded_header.is_some();
 
-                    if nal_type.is_irap() && !inter_allowed {
-                        self.dpb.clear();
-                        if general_tree {
+                    if general_tree {
+                        if nal_type.is_irap() {
+                            self.dpb.clear();
+                        }
+                        {
                             let (sh, _) = embedded_header.as_ref().ok_or_else(|| {
                                 VvcError::Bitstream("missing slice header".into())
                             })?;
@@ -2229,7 +2260,19 @@ impl VvcDecoder {
                             let qp_joint =
                                 full_sps.mapped_chroma_qp(3, i32::from(slice_qp), joint_qp_offset)
                                     - qp_bd;
-                            let gp = decode_general::decode_general_intra_picture(
+                            // Reference lists for the inter coding units of this
+                            // picture (`H.266 §8.3.2`), in RPL order.
+                            let (ref_l0, ref_l1) = if sh.slice_type == VvcSliceType::I {
+                                (Vec::new(), Vec::new())
+                            } else {
+                                (
+                                    self.dpb.build_ref_list(slice_poc, &sh.rpl[0]),
+                                    self.dpb.build_ref_list(slice_poc, &sh.rpl[1]),
+                                )
+                            };
+                            let bidir_pred =
+                                derive_bidir_pred(full_sps, sh, ph, slice_poc, &ref_l0, &ref_l1);
+                            let gp = decode_general::decode_general_picture(
                                 cabac,
                                 full_sps,
                                 full_pps,
@@ -2240,6 +2283,8 @@ impl VvcDecoder {
                                 qp_cb,
                                 qp_cr,
                                 qp_joint,
+                                sh.num_ref_idx_active,
+                                bidir_pred,
                             )?;
                             let wy = gp.y.width as u32;
                             let hy = gp.y.height as u32;
@@ -2291,11 +2336,14 @@ impl VvcDecoder {
                                     );
                                 }
                             }
-                            let i420 = cropped_vvc.to_i420();
-                            self.last_vvc_frame = Some(cropped_vvc);
-                            decoded_frame = Some(i420);
+                            let output = self.queue_output(slice_poc, cropped_vvc);
+                            decoded_frame = output.as_ref().map(VvcFrame::to_i420);
+                            self.last_vvc_frame = output;
                             continue;
                         }
+                    }
+                    if nal_type.is_irap() && !inter_allowed {
+                        self.dpb.clear();
                         if bd != 8 || cf != ChromaFormatIdc::Chroma420 || info.ctu_log2 != CTU_LOG2
                         {
                             let coded_vvc = slice::decode_vvc_frame_picture_with_chroma_qp(
@@ -2372,13 +2420,6 @@ impl VvcDecoder {
                             }
                         }
                         decoded_frame = Some(disp);
-                    } else if general_tree {
-                        // Inter coding units in the general coding tree are the
-                        // next decoder stage; the CTU-sized subset inter decoder
-                        // below cannot parse VTM's multi-tool inter syntax.
-                        return Err(VvcError::Unsupported(
-                            "inter slice in the general coding tree",
-                        ));
                     } else {
                         if embedded_ph.is_some() {
                             return Err(VvcError::Unsupported(

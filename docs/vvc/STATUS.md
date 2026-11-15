@@ -1,5 +1,67 @@
 # H.266 / VVC Implementation Status (`rustmpeg-video::vvc`)
 
+## 0k. d_ra8 inter syntax: all five pictures parse bin-for-bin with VTM (2026-11-15)
+
+The general coding-tree decoder now parses the complete syntax of the four
+random-access B pictures. Verified against a VTM 24.0 decoder built with
+`-DENABLE_TRACING=ON`: for every picture the sequence of
+`(context, bin)` pairs from `D_CABAC` is identical - 13538 bins in total
+(picture 1: 8863, POC 4: 1941, POC 2: 1279, POC 1: 704, POC 3: 751) with no
+missing or extra bin. Pixel reconstruction of the inter pictures is the next
+stage; the public path still returns a typed
+`Unsupported("inter coding unit reconstruction (motion compensation)")`.
+
+Implemented: `mode_constraint()`/`mode_cons_flag` with `ModeType` propagation,
+`cu_skip_flag`, `pred_mode_flag`, `merge_flag`, `merge_subblock_flag`,
+`regular_merge_flag`, `mmvd_merge_flag`/`mmvd_merge_idx`, `ciip_flag`,
+geometric-partitioning `merge_idx` (split direction plus two candidate
+indices), `merge_idx`, `inter_pred_idc`, `affine_flag`/`affine_type`,
+`sym_mvd_flag`, `ref_idx`, `mvd_coding`, `mvp_flag`, `imv_mode`,
+`affine_amvr_mode`, `cu_bcw_flag`, `rqt_root_cbf`, `sbt_mode` with the
+`getSbtTuTiling` transform split and its no-residual tile, and inter
+`mts_idx`. `slice->getBiDirPred()` is derived from the reference POCs for
+`sym_mvd_flag`.
+
+The defects that produced the earlier desync (each found by diffing
+`(context, bin)` pairs against VTM and fixed at the derivation, not
+special-cased):
+
+- **Context initialisation.** The general path always built its context store
+  with `new_i_slice`, so every inter picture used the I-slice table. It now
+  calls `new_for_slice(slice_type, cabac_init_flag, SliceQpY)`, matching
+  `CABACReader::initCtxModels` (`CABACReader.cpp:75-88`), including the P/B
+  table swap when `sh_cabac_init_flag` is set.
+- **Partition limits.** `limits()` always used the intra-slice SPS values. It
+  now selects intra/inter by slice type (the inter values for both channels in
+  an inter slice) and takes the effective values from the picture header, so
+  `ph_partition_constraints_override_flag` is honoured. POC 3 signals
+  `log2_diff_max_bt_min_qt_inter_slice = 3` in its PH and was the last picture
+  to desynchronise.
+- **Dual-tree rules.** `coding_tree` used `sps.dual_tree_intra` alone, so a
+  128x128 CTU of an inter picture was implicitly QT-split. The flag now also
+  requires an intra slice, which restores the `split_cu_flag` bin at the CTU
+  root with its correct context.
+- **`joint_cb_cr`.** The flag was read before `tu_y_coded_flag` and only for a
+  non-chroma tree. VTM reads it after the luma cbf, for joint *and* chroma
+  trees, and only when both chroma components are coded (`cbfMask == 3`) for an
+  inter CU (`CABACReader.cpp:2838-2840, 2913-2925`).
+- **Inter luma cbf inference.** `tu_y_coded_flag` is inferred to 1 for an inter
+  TU at depth 0 without chroma residual (`CABACReader.cpp:2759-2763`); it was
+  being read, which shifted every following bin.
+- **Skip and SBT gating.** A skip CU codes neither `sbt_mode()` nor a transform
+  tree; `cu_sbt_flag` *is* coded for subblock-merge CUs (VTM's
+  `checkAllowedSbt` has no affine exclusion); its size mask is
+  `w>=8`/`h>=8` for half and `w>=16`/`h>=16` for quad with `MaxTbSize` as the
+  upper bound; and `ts_flag` is not coded in an SBT coding unit
+  (`TU::isTSAllowed`).
+
+Verification: strict 25-case harness **50/50**; full 266-check matrix
+**263 passed / 3 failed / 0 skipped** (same `b12_420`, `ctu16`, `d_ra8` rows -
+`d_ra8` now fails at inter reconstruction instead of at the slice); `d_i8`,
+`d_i10` and the `d_ra8` IDR stay byte-exact; `cargo test --workspace`,
+`clippy -D warnings`, `fmt` and the license audit pass. Reproduction of the
+bin comparison is recorded in `VERIFICATION_DEBT.md` §0i.
+
 ## 0j. 10-bit 128x128 CABAC fixes: maximum transform size and SAO (2026-11-15)
 
 Two parsing defects broke every 128x128 10-bit stream at the CABAC level. Both

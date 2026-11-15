@@ -806,6 +806,8 @@ impl<'a> BinDecoder<'a> {
     /// Decode one context-coded bin.
     #[inline]
     pub fn decode_bin(&mut self, ctx: &mut CtxModel) -> bool {
+        let self_state_before = ctx.state();
+        let mps_before = ctx.mps();
         let mps = ctx.mps();
         let lps_range = ctx.get_lps(self.range);
         self.range -= lps_range;
@@ -837,7 +839,14 @@ impl<'a> BinDecoder<'a> {
         ctx.update(bin);
         if bin_trace_enabled() {
             let n = NEXT_BIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("BIN {} {} {}", n, ctx.id, u8::from(bin));
+            eprintln!(
+                "BIN {} {} {} st={} mps={}",
+                n,
+                ctx.id,
+                u8::from(bin),
+                self_state_before,
+                mps_before
+            );
         }
         bin
     }

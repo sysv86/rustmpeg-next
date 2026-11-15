@@ -1,7 +1,74 @@
 # Verification Debt (`rustmpeg-next` H.266/VVC)
 
-Last updated: 2026-11-15 (10-bit max-transform-size and SAO fixes, all 10-bit
-128x128 acceptance streams byte-exact; d_ra8 inter pictures still unsupported).
+Last updated: 2026-11-15 (d_ra8 inter syntax parses bin-for-bin with VTM;
+inter reconstruction still missing; matrix 263/3).
+
+## 0i. d_ra8 inter syntax bin-for-bin against VTM (2026-11-15)
+
+The four B pictures of `d_ra8` now consume exactly the same CABAC bins as VTM
+24.0. Oracle: the same source tree built with tracing
+(`cmake -DENABLE_TRACING=ON -DCMAKE_CXX_FLAGS="-Wno-unused-but-set-variable
+-Wno-unused-variable -Wno-unused-parameter"`, `make DecoderApp`); the tracing
+build was re-checked to decode identically to the pristine one
+(`cmp` of the decoded YUV).
+
+Per-picture census of `D_CABAC` (context id + decoded bin) against our
+`VVC_BINTRACE` output, aligned by decoding from the start of the stream:
+
+```text
+poc 0 (IDR)  8863 bins, 0 mismatches
+poc 4        1941 bins, 0 mismatches
+poc 2        1279 bins, 0 mismatches
+poc 1         704 bins, 0 mismatches
+poc 3         751 bins, 0 mismatches
+total       13538 bins
+```
+
+(An IDR-picture census is included because it doubles as the control: it was
+already exact, so a mismatch anywhere would be an inter-path regression.)
+
+Result of the run itself: `vvc_stateful_decode d_ra8.vvc` now reports
+`Unsupported("inter coding unit reconstruction (motion compensation)")` instead
+of the earlier slice-level rejection, i.e. every syntax element of all five
+pictures is parsed and the decoder stops only at the missing reconstruction
+stage. `VVC_INTER_SYNTAX_ONLY=1` parses all five pictures to
+`end_of_slice` and emits a frame whose pixels are meaningless by construction
+(diagnostic hook only).
+
+Root causes fixed in this increment (all derivation-level, no special cases):
+
+1. `CtxStore::new_i_slice` was used for every picture; inter pictures need
+   `new_for_slice(slice_type, cabac_init_flag, SliceQpY)`
+   (`CABACReader.cpp:75-88`).
+2. `limits()` used the intra-slice SPS partition parameters; an inter slice must
+   use the inter values for both channels, and the effective values come from
+   the picture header so `ph_partition_constraints_override_flag` applies
+   (`Slice.h:1140-1185`, `CodingStructure::signalModeCons`).
+3. `coding_tree` applied the dual-tree split rules to inter pictures
+   (`dual = sps.dual_tree_intra` instead of `&& slice_type == I`), which forced
+   an implicit QT split at the 128x128 CTU root and shifted the first
+   `split_cu_flag` context from 3 to 6.
+4. `joint_cb_cr` was decoded before `tu_y_coded_flag` and only for joint trees;
+   VTM decodes it after the luma cbf, for chroma trees as well, and for an inter
+   CU only when both chroma components are coded.
+5. `tu_y_coded_flag` is inferred (not coded) for an inter TU at depth 0 with no
+   chroma residual.
+6. Skip CUs code no `sbt_mode()`/transform tree; `cu_sbt_flag` is coded for
+   subblock-merge CUs too; `ts_flag` is not coded in an SBT CU; SBT splits the
+   transform area with `getSbtTuTiling` and leaves one tile without residual.
+7. Geometric partitioning (2 CUs) codes a truncated-binary split direction and
+   two equal-probability candidate indices.
+
+Other results: strict 25-case harness **50/50**; full 266-check matrix
+**263 passed / 3 failed / 0 skipped**; `cargo test --workspace` OK;
+`clippy -D warnings` OK; `fmt` OK; license audit OK. `d_i8`, `d_i10` and the
+`d_ra8` IDR remain byte-exact.
+
+Not implemented (next stage): merge/AMVP candidate derivation, motion
+compensation (8-tap luma / 4-tap chroma at the AMVR precision, BCW), BDOF,
+DMVR, PROF, CIIP and geometric-partition blending, SBT residual zero-out area,
+inter boundary strength for deblocking, per-picture reference POC lists for TMVP
+scaling.
 
 ## 0h. 10-bit 128x128 CABAC desynchronisation fixed (2026-11-15)
 
