@@ -149,7 +149,7 @@ fn sig_ctx_id_abs(
 ) -> usize {
     let (pos_x, pos_y) = scan.xy[scan_pos];
     let width = scan.width;
-    let height = scan.max_num_coeff / scan.width;
+    let height = scan.height;
     let base = pos_y * width + pos_x;
 
     let mut sum_abs = 0i32;
@@ -210,7 +210,7 @@ fn ctx_offset_abs(tmpl: &Tmpl, is_luma: bool) -> usize {
 fn derive_rice(scan: &CoeffScan, coeffs: &[i32], scan_pos: usize, base_level: i32) -> u32 {
     let (pos_x, pos_y) = scan.xy[scan_pos];
     let width = scan.width;
-    let height = scan.max_num_coeff / scan.width;
+    let height = scan.height;
     let base = pos_y * width + pos_x;
     let mut sum = 0i32;
 
@@ -285,7 +285,7 @@ fn encode_last_sig_coeff(
     is_luma: bool,
 ) {
     let width = scan.width;
-    let height = scan.max_num_coeff / scan.width;
+    let height = scan.height;
     let (pos_x, pos_y) = scan.xy[scan_pos_last];
     let group_idx_x = GROUP_IDX[pos_x];
     let group_idx_y = GROUP_IDX[pos_y];
@@ -363,7 +363,7 @@ fn decode_last_sig_coeff(
     is_luma: bool,
 ) -> Result<usize, VvcError> {
     let width = scan.width;
-    let height = scan.max_num_coeff / scan.width;
+    let height = scan.height;
     let max_last_pos_x = GROUP_IDX[width.min(32) - 1];
     let max_last_pos_y = GROUP_IDX[height.min(32) - 1];
     let (last_x_base, last_y_base) = if is_luma {
@@ -454,7 +454,7 @@ pub fn encode_residual_with_options(
     dep_quant: bool,
     sign_hiding: bool,
 ) {
-    debug_assert_eq!(coeffs.len(), scan.max_num_coeff);
+    debug_assert!(coeffs.len() >= scan.max_num_coeff);
     let scan_pos_last = (0..scan.max_num_coeff)
         .rev()
         .find(|&pos| coeffs[scan.raster[pos]] != 0)
@@ -543,7 +543,7 @@ pub fn decode_residual_with_options(
     dep_quant: bool,
     sign_hiding: bool,
 ) -> Result<(), VvcError> {
-    if coeffs.len() != scan.max_num_coeff {
+    if coeffs.len() < scan.max_num_coeff {
         return Err(VvcError::Bitstream(
             "coefficient buffer size does not match the transform block".to_string(),
         ));

@@ -1809,16 +1809,6 @@ fn transform_unit(
         if cw == 0 || ch == 0 {
             continue;
         }
-        // A transform block larger than 32 samples codes its coefficients with
-        // the full-size grouped scan of `CoeffCodingContext`, whose
-        // `scanPosLast` numbering differs from the capped 32x32 scan used by
-        // `CoeffScan`; it is not implemented here (rejected before the CABAC
-        // parse of the block would desynchronise).
-        if cbf[comp] && (cw > 32 || ch > 32) {
-            return Err(VvcError::Unsupported(
-                "general coding-tree decoding: transform block larger than 32 samples",
-            ));
-        }
         let mut levels = Vec::new();
         let mut ts = false;
         if cbf[comp] && !(comp == 2 && jccr == 3) {
@@ -1831,10 +1821,11 @@ fn transform_unit(
             ts = ts_allowed
                 && dec
                     .decode_bin(&mut ctx.models[ctx::TRANSFORM_SKIP_FLAG + usize::from(comp != 0)]);
-            let cw_coded = cw.min(32);
-            let ch_coded = ch.min(32);
-            let scan = CoeffScan::new(cw_coded, ch_coded);
-            levels = vec![0i32; scan.max_num_coeff];
+            // A transform block larger than 32 samples zeroes the coefficients
+            // outside the top-left 32x32 region but keeps the full block stride
+            // for `scanPosLast` (`H.266 §7.4.11.6`, VTM `CABACReader.cpp:3142-3206`).
+            let scan = CoeffScan::new(cw, ch);
+            levels = vec![0i32; cw * ch];
             if ts {
                 super::slice::decode_ts_block(dec, ctx, &scan, &mut levels);
             } else {
@@ -1893,7 +1884,7 @@ fn update_constraints(cuctx: &mut CuCtx, scan: &CoeffScan, levels: &[i32], luma:
             levels.iter().filter(|&&l| l != 0).count()
         );
     }
-    let height = scan.max_num_coeff / scan.width;
+    let height = scan.height;
     if scan.width >= 4 && height >= 4 {
         let max_lfnst = if (scan.width == 4 && height == 4) || (scan.width == 8 && height == 8) {
             7
@@ -2265,9 +2256,7 @@ fn inverse_residual(
     qp: i32,
     bit_depth: u8,
 ) -> Result<Vec<i32>, VvcError> {
-    let cw_coded = cw.min(32);
-    let ch_coded = ch.min(32);
-    let scan = CoeffScan::new(cw_coded, ch_coded);
+    let scan = CoeffScan::new(cw, ch);
     // `Qp′ = Qp + QpBdOffset` (H.266 Eq. 29); the dequantisers expect the
     // scaled value and apply `qp_bd_offset` internally only for the transform
     // shift, not for the QP itself (`Quant.cpp:64-103`).

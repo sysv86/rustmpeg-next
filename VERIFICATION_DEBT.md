@@ -1,7 +1,90 @@
 # Verification Debt (`rustmpeg-next` H.266/VVC)
 
-Last updated: 2026-11-15 (random-access high-level syntax + POC/DPB reordering;
-`d_ra8` IDR byte-exact, inter coding units still unsupported; matrix 263/3).
+Last updated: 2026-11-15 (transform blocks larger than 32 samples; a 10-bit
+128x128 CABAC defect found but not fixed; matrix 263/3).
+
+## 0g. Transform blocks larger than 32 samples (2026-11-15)
+
+Executed after building the coefficient scan for the full transform block size
+instead of the zero-out size, allocating `width * height` coefficients, and
+deriving the sub-block height used by the LFNST/MTS constraint checks from the
+scan. Oracle: pristine VTM 24.0 build (`/tmp/opencode/vtm-src`,
+`EncoderApp` + `DecoderApp`). `rustmpeg` decoder:
+`target/release/examples/vvc_stateful_decode`.
+
+```bash
+D=/tmp/opencode/tb
+BIN=/tmp/opencode/vtm-src/bin/umake/gcc-16.2/x86_64/release
+python3 - <<'PY'   # smooth 10-bit gradient source favouring a 64x64 luma transform
+import struct
+W=H=128
+d=bytearray()
+for y in range(H):
+    for x in range(W):
+        d+=struct.pack('<H', min(1023, 300+(x*3+y*2)//2+((x*y)//200)))
+d+=struct.pack('<H',512)*(2*(W//2)*(H//2))
+open('/tmp/opencode/tb/flat10.yuv','wb').write(d)
+PY
+$BIN/EncoderApp -c /tmp/opencode/vtm-src/cfg/encoder_intra_vtm.cfg \
+  -i $D/flat10.yuv -wdt 128 -hgt 128 -fr 30 -f 1 --TemporalSubsampleRatio=1 \
+  -q 26 --InputBitDepth=10 --InternalBitDepth=10 --InputChromaFormat=420 \
+  --Log2MaxTbSize=6 --DeblockingFilterDisable=1 --SAO=0 --ALF=0 --CCALF=0 \
+  --LMCSEnable=0 -b $D/flat10.vvc -o $D/flat10.recon.yuv
+target/release/examples/vvc_stateful_decode $D/flat10.vvc $D/flat10.ours.yuv
+cmp $D/flat10.ours.yuv $D/flat10.recon.yuv     # identical
+```
+
+Result:
+
+```text
+flat10 (10-bit 128x128, 64x64 luma transform present)   OK  (previous code: typed rejection)
+d_i8 / d_i10 (64x64, 3 frames, stock intra cfg)         OK  (unchanged)
+d_ra8 picture 1 (IDR, 128x128, 8-bit)                   OK  (unchanged)
+```
+
+Other results in this run:
+
+- Strict 25-case harness (`run_conformance.sh`, pristine VTM 24.0 + VVdeC 3.3):
+  **50/50**.
+- Full 266-check matrix (`run_conformance_full.sh`): **263 passed / 3 failed /
+  0 skipped**; same three failures (`b12_420`, `ctu16`, `d_ra8`).
+- `cargo test --workspace`: OK (new test
+  `large_transform_scan_covers_the_top_left_32x32_region_with_the_full_stride`).
+- `cargo clippy --workspace --all-targets -- -D warnings`: OK.
+- `cargo fmt --all -- --check`: OK.
+- `python3 scripts/check-licenses.py`: OK.
+
+### Newly found, not fixed: 10-bit 128x128 CABAC desynchronisation
+
+While building an acceptance case for the large-transform path, the 10-bit
+128x128 streams from `~/vvc-conf-full/ctu128_10.source.yuv` exposed a
+**pre-existing** defect, unrelated to the transform size:
+
+| Configuration (128x128, 10-bit, QP26) | Result |
+| :-- | :-- |
+| stock intra cfg, all filters, default `Log2MaxTbSize` | `missing CABAC end_of_slice_one_bit` |
+| stock intra cfg, all filters, `--Log2MaxTbSize=5` | `missing CABAC end_of_slice_one_bit` |
+| filters off, default `Log2MaxTbSize` | byte-exact at QP22/26/32 |
+| filters off, `--Log2MaxTbSize=5` | `missing CABAC end_of_slice_one_bit` |
+| filters off, LMCS/+SAO/+ALF/+CCALF/+deblock chain at `--Log2MaxTbSize=5` | all fail identically |
+
+The `--Log2MaxTbSize=5` rows cannot involve a transform block larger than 32, and
+they fail at HEAD as well, so the defect is independent of this change. It does
+not affect the matrix (its 10-bit rows use 64x64 pictures) or the large-transform
+acceptance case, but it blocks 10-bit 128x128 verification with filters on.
+Reproduce exactly as above with `--Log2MaxTbSize=5` and no filter flags; the
+first synchronisation loss has not been localised yet. Not fixed in this change.
+
+Still not covered:
+
+- Transform blocks with a chroma dimension above 32 (needs 4:2:2/4:4:4 with a
+  64x64 luma transform); the 4:2:0 geometry is the only tested one.
+- Inter coding units in the general coding tree (merge/AMVP, affine, MMVD,
+  SMVD, CIIP, GPM, BDOF, DMVR, SBT), inter motion compensation and inter
+  boundary strength for deblocking: `d_ra8` pictures 2-5 are still rejected with
+  a typed `Unsupported`.
+- Virtual boundaries, weighted prediction, long-term reference pictures,
+  multi-slice/multi-tile pictures.
 
 ## 0f. Random-access headers and the `d_ra8` IDR (2026-11-15)
 

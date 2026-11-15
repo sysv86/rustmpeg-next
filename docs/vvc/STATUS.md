@@ -1,3 +1,50 @@
+# H.266 / VVC Implementation Status (`rustmpeg-video::vvc`)
+
+## 0i. Transform blocks larger than 32 samples (2026-11-15)
+
+The general coding-tree decoder now parses and reconstructs transform blocks
+larger than 32 samples, which it previously rejected with
+`Unsupported("transform block larger than 32 samples")`.
+
+`CoeffScan` already described the grouped scan of a block, but the decoder built
+it from the zero-out size (`min(dimension, 32)`), which is only correct while
+both dimensions fit in 32 samples. For a 64x64 transform, VVC codes coefficients
+only inside the top-left 32x32 region while `last_sig_coeff` and every
+`scanPosLast`-derived sub-set index refer to positions in the *full* block
+(`blkPos = PosLastX + PosLastY * width`, VTM `CABACReader.cpp:3142-3206`,
+`Rom.cpp:355-390`). The scan is therefore built for the full block size, the
+coefficient buffer is `width * height` samples, and the sub-block height used by
+the LFNST/MTS constraint checks comes from the scan instead of being derived
+from the capped coefficient count. The coded region, the sub-set count, the
+group grid and `regBinLimit` still use the zero-out area
+(`TransformUnit::getTbAreaAfterCoefZeroOut`, `Unit.cpp:894-908`).
+
+Verification (pristine VTM 24.0 `EncoderApp`/`DecoderApp`, `cmp` on Y+U+V):
+
+| Stream | Result |
+| :--- | :--- |
+| 128x128 10-bit intra, `--Log2MaxTbSize=6`, QP26, filters off, smooth 10-bit gradient source (contains a 64x64 luma transform) | byte-exact; the previous code rejected the stream |
+| `d_i8`, `d_i10` (64x64, 3 frames, stock intra cfg) | byte-exact (unchanged) |
+| `d_ra8` picture 1 (IDR, 128x128, 8-bit) | byte-exact (unchanged) |
+
+Strict 25-case harness (VTM 24.0 `DecoderApp` + VVdeC 3.3 `vvdecapp`): **50/50**.
+Full 266-check matrix: **263 passed / 3 failed / 0 skipped**, the same three
+documented failures (`b12_420`, `ctu16`, `d_ra8`). New unit test:
+`large_transform_scan_covers_the_top_left_32x32_region_with_the_full_stride`.
+
+Not covered: a transform block with chroma larger than 32 samples (needs 4:2:2
+or 4:4:4 with a 64x64 luma transform); only the 4:2:0 geometry is tested, where
+a 64x64 luma block maps to a 32x32 chroma block.
+
+**Pre-existing defect found while validating this change:** 128x128 10-bit
+streams at QP26 fail with `missing CABAC end_of_slice_one_bit` when the in-loop
+filters are enabled, and also when the encoder is limited to
+`--Log2MaxTbSize=5` with filters off. The same content at 10-bit, filters off,
+default maximum transform size decodes byte-exactly at QP22/26/32, and the
+64x64 transform path is byte-exact on its own. The defect is independent of this
+change (it reproduces with `--Log2MaxTbSize=5`, where no block is larger than 32)
+and is recorded in `VERIFICATION_DEBT.md`; it is not fixed here.
+
 ## 0h. Random-access high-level syntax, POC/DPB reordering, and the d_ra8 IDR (2026-11-15)
 
 The general coding-tree decoder now parses the complete random-access high-level
@@ -67,8 +114,6 @@ deblocking, and the full-size coefficient scan for transform blocks larger than
 32 samples. None of that is implemented for the general coding tree; the reduced
 `slice::decode_inter_picture` path is a CTU-sized subset decoder and is not a
 base for it.
-
-# H.266 / VVC Implementation Status (`rustmpeg-video::vvc`)
 
 ## 0g. 10-bit general coding-tree decode and VTM intra interop (2026-11-15)
 

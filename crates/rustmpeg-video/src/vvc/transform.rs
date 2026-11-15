@@ -15,6 +15,8 @@ use super::dct::TrType;
 pub struct CoeffScan {
     /// Transform block width in samples.
     pub width: usize,
+    /// Transform block height in samples.
+    pub height: usize,
     /// Base-2 logarithm of the number of coefficients per group (`4` for 4x4 CGs).
     pub log2_cg_size: u32,
     /// Width of the block in coefficient groups.
@@ -35,7 +37,9 @@ impl CoeffScan {
     /// Build the grouped scan for a `width x height` block.
     ///
     /// Internal invariant: both dimensions are powers of two and at least 2.
-    /// For 64-point transforms, only the top-left 32x32 coefficient region is scanned.
+    /// For 64-point transforms, only the top-left 32x32 coefficient region is
+    /// scanned (`getNonzeroTuSize`); the raster indices keep the full block
+    /// stride because VTM's `last_sig_coeff` maps into the full block width.
     pub fn new(width: usize, height: usize) -> Self {
         assert!(width.is_power_of_two() && height.is_power_of_two());
         let (log2_cg_w, log2_cg_h) = coefficient_group_log2(width, height);
@@ -63,6 +67,7 @@ impl CoeffScan {
         debug_assert_eq!(raster.len(), max_num_coeff);
         Self {
             width,
+            height,
             log2_cg_size: (log2_cg_w + log2_cg_h) as u32,
             width_in_groups,
             height_in_groups,
@@ -712,6 +717,41 @@ pub fn derive_split_contexts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_transform_scan_covers_the_top_left_32x32_region_with_the_full_stride() {
+        // A 64x64 transform codes only the top-left 32x32 coefficients, but the
+        // scan positions index the full block so `last_sig_coeff` can map them
+        // (`CABACReader.cpp:3142-3206`, `Rom.cpp:355-390`).
+        let scan = CoeffScan::new(64, 64);
+        assert_eq!(scan.max_num_coeff, 1024);
+        assert_eq!(scan.raster.len(), 1024);
+        assert_eq!((scan.width, scan.height), (64, 64));
+        assert_eq!((scan.width_in_groups, scan.height_in_groups), (8, 8));
+        assert_eq!(scan.last_sub_set(), 63);
+        for (&raster, &(x, y)) in scan.raster.iter().zip(scan.xy.iter()) {
+            assert!(
+                x < 32 && y < 32,
+                "coefficient ({x}, {y}) is outside the coded region"
+            );
+            assert_eq!(raster, y * 64 + x);
+        }
+        // The scan is a permutation of the coded region: every position appears once.
+        let mut sorted = scan.raster.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 1024);
+
+        // Rectangular 64x16 blocks keep the coded width capped at 32.
+        let rect = CoeffScan::new(64, 16);
+        assert_eq!((rect.max_num_coeff, rect.height), (512, 16));
+        assert!(
+            rect.raster
+                .iter()
+                .zip(rect.xy.iter())
+                .all(|(&r, &(x, _))| r % 64 == x && x < 32)
+        );
+    }
 
     #[test]
     fn diagonal_scan_is_anti_diagonal_with_x_increasing() {
