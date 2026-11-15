@@ -1,7 +1,51 @@
 # Verification Debt (`rustmpeg-next` H.266/VVC)
 
-Last updated: 2026-11-15 (transform blocks larger than 32 samples; a 10-bit
-128x128 CABAC defect found but not fixed; matrix 263/3).
+Last updated: 2026-11-15 (10-bit max-transform-size and SAO fixes, all 10-bit
+128x128 acceptance streams byte-exact; d_ra8 inter pictures still unsupported).
+
+## 0h. 10-bit 128x128 CABAC desynchronisation fixed (2026-11-15)
+
+The defect recorded in section 0g is fixed. Two independent parsing bugs both
+produced `missing CABAC end_of_slice_one_bit` on 128x128 10-bit streams:
+
+1. **Maximum transform size.** `transform_tree` compared the *chroma* dimensions
+   of an area against `MaxTbSize` and tiled the split with a Z-like recursion.
+   VTM compares the *luma* area against `MaxTbSize` capped at 64 and divides
+   every component by the luma-derived tile counts, in raster order
+   (`QTBTPartitioner::canSplit(TU_MAX_TR_SPLIT)`, `UnitPartitioner.cpp:528-544`;
+   `PartitionerImpl::getMaxTuTiling`, `UnitPartitioner.cpp:1155-1195`). With
+   `MaxTbSize == 32` a 16x32 chroma area (32x64 luma) was therefore not split
+   into 16x16 chroma TUs, which shifted every following cbf flag and coefficient
+   bin.
+2. **SAO offsets.** `decode_ctu_sao` received a hard-coded 8 as the bit depth, so
+   `sao_offset_abs` was read with three bits instead of
+   `Min(BitDepth, 10) - 5` (`H.266 §7.3.11.3`, VTM `CABACReader.cpp:343-505`).
+   The first stream that enables SAO at 10-bit desynchronised at the first CTU.
+
+Reproduction and result (VTM 24.0 `EncoderApp`/`DecoderApp`, `cmp` on Y+U+V,
+128x128 10-bit, `~/vvc-conf-full/ctu128_10.source.yuv`):
+
+```bash
+OFF="--DeblockingFilterDisable=1 --SAO=0 --ALF=0 --CCALF=0 --LMCSEnable=0"
+# stages: $OFF, then $OFF --LMCSEnable=1, --SAO=1, --ALF=1, --CCALF=1,
+#         and finally the full chain (no $OFF)
+```
+
+```text
+10-bit 128x128 QP26 tb32 filters off            OK  (was: end_of_slice)
+10-bit 128x128 QP26 stages base/LMCS/SAO/ALF/CCALF/deblock   OK  (5/5, was 1/6)
+10-bit 128x128 QP26 full filter chain           OK  (was: end_of_slice)
+10-bit 128x128 QP37 full filter chain           OK  (was: end_of_slice)
+10-bit 128x128 QP22/26/32 filters off           OK  (unchanged)
+d_i8 / d_i10 (64x64)                            OK  (unchanged)
+d_ra8 picture 1 (IDR, 128x128 8-bit)            OK  (unchanged)
+```
+
+`cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo fmt --all -- --check` and `python3 scripts/check-licenses.py`
+all pass. Strict 25-case harness: **50/50**. Full 266-check matrix:
+**263 passed / 3 failed / 0 skipped** (same three rows: `b12_420`, `ctu16`,
+`d_ra8`).
 
 ## 0g. Transform blocks larger than 32 samples (2026-11-15)
 
@@ -54,7 +98,7 @@ Other results in this run:
 - `cargo fmt --all -- --check`: OK.
 - `python3 scripts/check-licenses.py`: OK.
 
-### Newly found, not fixed: 10-bit 128x128 CABAC desynchronisation
+### Newly found here, fixed in section 0h: 10-bit 128x128 CABAC desynchronisation
 
 While building an acceptance case for the large-transform path, the 10-bit
 128x128 streams from `~/vvc-conf-full/ctu128_10.source.yuv` exposed a
@@ -72,8 +116,9 @@ The `--Log2MaxTbSize=5` rows cannot involve a transform block larger than 32, an
 they fail at HEAD as well, so the defect is independent of this change. It does
 not affect the matrix (its 10-bit rows use 64x64 pictures) or the large-transform
 acceptance case, but it blocks 10-bit 128x128 verification with filters on.
-Reproduce exactly as above with `--Log2MaxTbSize=5` and no filter flags; the
-first synchronisation loss has not been localised yet. Not fixed in this change.
+Reproduce exactly as above with `--Log2MaxTbSize=5` and no filter flags. Section
+0h localises and fixes it (luma-vs-chroma maximum-transform-size split and the
+SAO offset bit depth).
 
 Still not covered:
 

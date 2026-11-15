@@ -1,5 +1,41 @@
 # H.266 / VVC Implementation Status (`rustmpeg-video::vvc`)
 
+## 0j. 10-bit 128x128 CABAC fixes: maximum transform size and SAO (2026-11-15)
+
+Two parsing defects broke every 128x128 10-bit stream at the CABAC level. Both
+are fixed and the affected streams now decode byte-exactly.
+
+- **Maximum transform size split.** `transform_tree` compared the chroma
+  dimensions of an area against `MaxTbSize` and tiled the split with a Z-like
+  recursion. VTM compares the luma area against `MaxTbSize` capped at 64 and
+  divides every component by the luma-derived tile counts in raster order
+  (`QTBTPartitioner::canSplit(TU_MAX_TR_SPLIT)`, `UnitPartitioner.cpp:528-544`;
+  `PartitionerImpl::getMaxTuTiling`, `UnitPartitioner.cpp:1155-1195`). With
+  `MaxTbSize == 32`, a `16x32` chroma area (`32x64` luma) was not split into
+  `16x16` chroma transform blocks, so every following cbf flag and coefficient
+  bin was read at the wrong position.
+- **SAO offsets.** `decode_ctu_sao` was called with a hard-coded bit depth of 8,
+  so `sao_offset_abs` used three bits instead of `Min(BitDepth, 10) - 5`
+  (`H.266 §7.3.11.3`). A 10-bit stream with SAO enabled desynchronised at the
+  first CTU.
+
+Verification (VTM 24.0 `EncoderApp`/`DecoderApp`, `cmp` on Y+U+V, `128x128`
+10-bit, `~/vvc-conf-full/ctu128_10.source.yuv`):
+
+| Stream | Result |
+| :--- | :--- |
+| QP26, `--Log2MaxTbSize=5`, filters off | byte-exact (was `end_of_slice`) |
+| QP26, filter stage chain base/LMCS/+SAO/+ALF/+CCALF/+deblock | 6/6 byte-exact (was 1/6) |
+| QP26 and QP37, full filter chain | byte-exact each (was `end_of_slice`) |
+| QP22/26/32, filters off | byte-exact (unchanged) |
+| `d_i8`, `d_i10` (64x64) | byte-exact (unchanged) |
+| `d_ra8` picture 1 (IDR, 128x128 8-bit) | byte-exact (unchanged) |
+
+Strict 25-case harness: **50/50**. Full 266-check matrix: **263 passed / 3
+failed / 0 skipped**; the same three rows (`b12_420`, `ctu16`, `d_ra8`).
+`cargo test --workspace` passes; no test was added because the acceptance
+evidence is the VTM comparison above.
+
 ## 0i. Transform blocks larger than 32 samples (2026-11-15)
 
 The general coding-tree decoder now parses and reconstructs transform blocks
@@ -108,12 +144,32 @@ override/RPL round trip, the slice-header reference-list inheritance and the
 POC output order.
 
 Remaining for `d_ra8`: the general inter coding-unit syntax and its prediction
-tools (merge/AMVP, affine, MMVD, SMVD, CIIP, GPM, BDOF, DMVR, SBT), inter motion
-compensation with the recorded reconstruction path, inter boundary strength for
-deblocking, and the full-size coefficient scan for transform blocks larger than
-32 samples. None of that is implemented for the general coding tree; the reduced
-`slice::decode_inter_picture` path is a CTU-sized subset decoder and is not a
-base for it.
+tools, inter motion compensation, and inter boundary strength for deblocking.
+The tool mix of the four B pictures was measured from a VTM 24.0 decoder built
+with `-DENABLE_TRACING=ON` (`DecoderApp --TraceFile --TraceRule="D_SYNTAX:poc>=0"`),
+which is the oracle for every inter syntax element:
+
+| Syntax element | Occurrences in pictures 2-5 |
+| :--- | ---: |
+| `cu_skip_flag` | 165 |
+| `merge_flag` / `merge_idx` | 109 / 128 |
+| `mmvd_merge_flag` (all 0, MMVD never selected) | 122 |
+| `merge_subblock_flag` (SbTMVP / affine merge) | 117, 5 × `aff_merge_idx` |
+| `inter_pred_idc` (L0 / L1 / BI) | 33 |
+| `affine_flag` (all 0) | 24 |
+| `sym_mvd_flag` | 11 |
+| `imv_mode` (AMVR) | 87 |
+| `cu_bcw_flag` | 9 |
+| `cu_sbt_flag` | 6 |
+| `ciip_flag` (0 selected) | 1 |
+| geometric partitioning (`GEO_NUM_PARTITION_MODE` code) | 0 |
+
+So the pictures need regular merge, AMVP with AMVR, SMVD, BCW, SbTMVP/affine
+merge and SBT, plus the BDOF/DMVR/PROF decisions that are derived per CU rather
+than signalled, and inter boundary strength. None of that is implemented for the
+general coding tree yet; the reduced `slice::decode_inter_picture` path is a
+CTU-sized subset decoder that consumes only a merge flag and is not a base for
+it.
 
 ## 0g. 10-bit general coding-tree decode and VTM intra interop (2026-11-15)
 
