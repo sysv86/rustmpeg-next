@@ -2090,7 +2090,7 @@ impl VvcDecoder {
                                     || !s.info.height.is_multiple_of(ctu)
                             });
                         if general_tree
-                            && bd == 8
+                            && matches!(bd, 8 | 10)
                             && cf == ChromaFormatIdc::Chroma420
                             && embedded_header.is_some()
                         {
@@ -2106,12 +2106,20 @@ impl VvcDecoder {
                             let full_pps = self.full_pps_table[usize::from(pps_id)]
                                 .as_ref()
                                 .ok_or_else(|| VvcError::Bitstream("missing full PPS".into()))?;
-                            let qp_cb = full_sps.mapped_chroma_qp(1, i32::from(slice_qp), 0);
-                            let qp_cr = full_sps.mapped_chroma_qp(2, i32::from(slice_qp), 0);
+                            // `mapped_chroma_qp` returns the scaled `Qp′C`
+                            // (it adds `QpBdOffset`). The general path takes the
+                            // unscaled QP and applies `QpBdOffset` once, at
+                            // dequantisation time.
+                            let qp_bd = dct::qp_bd_offset(bd);
+                            let qp_cb =
+                                full_sps.mapped_chroma_qp(1, i32::from(slice_qp), 0) - qp_bd;
+                            let qp_cr =
+                                full_sps.mapped_chroma_qp(2, i32::from(slice_qp), 0) - qp_bd;
                             let joint_qp_offset = full_pps.joint_cbcr_qp_offset.unwrap_or(0)
                                 + sh.joint_cbcr_qp_offset;
                             let qp_joint =
-                                full_sps.mapped_chroma_qp(3, i32::from(slice_qp), joint_qp_offset);
+                                full_sps.mapped_chroma_qp(3, i32::from(slice_qp), joint_qp_offset)
+                                    - qp_bd;
                             let gp = decode_general::decode_general_intra_picture(
                                 cabac,
                                 full_sps,
@@ -2126,18 +2134,44 @@ impl VvcDecoder {
                             )?;
                             let wy = gp.y.width as u32;
                             let hy = gp.y.height as u32;
-                            let mut vf = VvcFrame::new(wy, hy, 8, ChromaFormatIdc::Chroma420);
-                            vf.y.data = gp.y.data.iter().map(|&v| u16::from(v)).collect();
-                            vf.u.data = gp.u.data.iter().map(|&v| u16::from(v)).collect();
-                            vf.v.data = gp.v.data.iter().map(|&v| u16::from(v)).collect();
-                            self.dpb.insert(RefFrame::from_planes(
-                                0,
-                                false,
-                                gp.y,
-                                gp.u,
-                                gp.v,
-                                MotionFieldGrid::new(wy as usize, hy as usize),
-                            ));
+                            let cw = gp.u.width;
+                            let ch = gp.u.height;
+                            // The DPB stores 8-bit reference planes only: the
+                            // general coding-tree path reconstructs intra pictures,
+                            // and inter prediction at a higher bit depth is not
+                            // implemented (it is rejected before this point).
+                            if bd == 8 {
+                                let to8 =
+                                    |d: &[u16]| d.iter().map(|&v| v as u8).collect::<Vec<_>>();
+                                let y = predict::Plane::from_slice(
+                                    wy as usize,
+                                    hy as usize,
+                                    &to8(&gp.y.data),
+                                )
+                                .ok_or_else(|| {
+                                    VvcError::Bitstream("luma plane size mismatch".into())
+                                })?;
+                                let u = predict::Plane::from_slice(cw, ch, &to8(&gp.u.data))
+                                    .ok_or_else(|| {
+                                        VvcError::Bitstream("chroma plane size mismatch".into())
+                                    })?;
+                                let v = predict::Plane::from_slice(cw, ch, &to8(&gp.v.data))
+                                    .ok_or_else(|| {
+                                        VvcError::Bitstream("chroma plane size mismatch".into())
+                                    })?;
+                                self.dpb.insert(RefFrame::from_planes(
+                                    0,
+                                    false,
+                                    y,
+                                    u,
+                                    v,
+                                    MotionFieldGrid::new(wy as usize, hy as usize),
+                                ));
+                            }
+                            let mut vf = VvcFrame::new(wy, hy, bd, ChromaFormatIdc::Chroma420);
+                            vf.y.data = gp.y.data;
+                            vf.u.data = gp.u.data;
+                            vf.v.data = gp.v.data;
                             let mut cropped_vvc = crop_vvc_frame(&vf, info.width, info.height);
                             if let Some(ref fg) = self.active_film_grain {
                                 if !fg.cancel_flag {

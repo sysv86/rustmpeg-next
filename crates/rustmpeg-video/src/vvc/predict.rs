@@ -1765,6 +1765,25 @@ pub fn predict_angular_with_params(
     is_luma: bool,
     params: &AngularParams,
 ) -> Vec<i32> {
+    predict_angular_with_params_bd(mrl_refs, w, h, is_luma, params, 8)
+}
+
+/// [`predict_angular_with_params`] parameterised by sample bit depth.
+///
+/// The unavailable-reference default (`1 << (BitDepth - 1)`) and the output clip
+/// (`ClipBD(., BitDepth)`) both depend on the picture bit depth
+/// (ITU-T Rec. H.266 §8.4.5.2.12; VTM `IntraPrediction.cpp:455-639`).
+pub fn predict_angular_with_params_bd(
+    mrl_refs: &MrlRefSamples,
+    w: usize,
+    h: usize,
+    is_luma: bool,
+    params: &AngularParams,
+    bit_depth: u8,
+) -> Vec<i32> {
+    let bd = bit_depth.clamp(8, 12);
+    let max_val = (1i32 << bd) - 1;
+    let default_sample = 1i32 << (bd - 1);
     let is_mode_ver = params.is_mode_ver;
     let multi_ref_idx = if is_luma { mrl_refs.mrl_idx } else { 0 };
     let intra_pred_angle = params.intra_pred_angle;
@@ -1775,8 +1794,8 @@ pub fn predict_angular_with_params(
 
     let base_offset = h.max(w) + 4;
     let buf_len = base_offset + 2 * w.max(h) + 2 * top_ref_len.max(left_ref_len) + 64;
-    let mut ref_above = vec![128i32; buf_len];
-    let mut ref_left = vec![128i32; buf_len];
+    let mut ref_above = vec![default_sample; buf_len];
+    let mut ref_left = vec![default_sample; buf_len];
 
     let main_base: usize;
     let side_base: usize;
@@ -1855,7 +1874,7 @@ pub fn predict_angular_with_params(
                     let wl = 32i32 >> ((2 * x) >> (scale as usize));
                     let val = temp_buf[row_off + x];
                     temp_buf[row_off + x] =
-                        (val + ((wl * (left - top_left) + 32) >> 6)).clamp(0, 255);
+                        (val + ((wl * (left - top_left) + 32) >> 6)).clamp(0, max_val);
                 }
             }
         }
@@ -1888,7 +1907,7 @@ pub fn predict_angular_with_params(
                         let p2 = ref_main[base_idx + 2];
                         let p3 = ref_main[base_idx + 3];
                         let val = (f[0] * p0 + f[1] * p1 + f[2] * p2 + f[3] * p3 + 32) >> 6;
-                        temp_buf[row_off + x] = val.clamp(0, 255);
+                        temp_buf[row_off + x] = val.clamp(0, max_val);
                     }
                 } else {
                     for x in 0..work_w {
@@ -1916,7 +1935,8 @@ pub fn predict_angular_with_params(
                     let left_idx = side_base + y + ((inv_angle_sum >> 9) as usize) + 1;
                     let left = ref_side[left_idx.min(ref_side.len() - 1)];
                     let val = temp_buf[row_off + x];
-                    temp_buf[row_off + x] = (val + ((wl * (left - val) + 32) >> 6)).clamp(0, 255);
+                    temp_buf[row_off + x] =
+                        (val + ((wl * (left - val) + 32) >> 6)).clamp(0, max_val);
                 }
             }
 
@@ -1946,6 +1966,19 @@ pub fn predict_angular(
     is_luma: bool,
     dir_mode: u8,
 ) -> Vec<i32> {
+    predict_angular_bd(refs, w, h, is_luma, dir_mode, 8)
+}
+
+/// [`predict_angular`] parameterised by sample bit depth (the output clip is
+/// `ClipBD(., BitDepth)`).
+pub fn predict_angular_bd(
+    refs: &RefSamples,
+    w: usize,
+    h: usize,
+    is_luma: bool,
+    dir_mode: u8,
+    bit_depth: u8,
+) -> Vec<i32> {
     let params = init_angular_params(dir_mode, w, h, w, h, is_luma, 0, false);
     let used_refs = if params.ref_filter_flag {
         refs.filtered()
@@ -1953,7 +1986,7 @@ pub fn predict_angular(
         refs.clone()
     };
     let mrl_refs = MrlRefSamples::from_ref_samples(&used_refs);
-    predict_angular_with_params(&mrl_refs, w, h, is_luma, &params)
+    predict_angular_with_params_bd(&mrl_refs, w, h, is_luma, &params, bit_depth)
 }
 
 /// Block DPCM intra prediction (`IntraPrediction.cpp:641-676`, `xPredIntraBDPCM`).
@@ -2414,6 +2447,17 @@ pub fn predict_mip(
 /// The rebasing centre `1 << (BitDepth - 1)` and the output clip
 /// `ClipBD(., BitDepth)` both depend on the picture bit depth
 /// (ITU-T Rec. H.266 §8.4.5.2.11; VTM `MatrixIntraPrediction.cpp:110,352`).
+pub fn predict_mip_with_bit_depth(
+    refs: &RefSamples,
+    w: usize,
+    h: usize,
+    mode_idx: u8,
+    transpose: bool,
+    bit_depth: u8,
+) -> Vec<i32> {
+    predict_mip_bd(refs, w, h, mode_idx, transpose, bit_depth)
+}
+
 fn predict_mip_bd(
     refs: &RefSamples,
     w: usize,
@@ -4434,6 +4478,33 @@ mod tests {
         assert_eq!(subs_4x8[1], (0, 4, 4, 4));
         let subs_16x16 = isp_subpartitions(0, 0, 16, 16, IspMode::Hor);
         assert_eq!(subs_16x16.len(), 4);
+    }
+
+    /// `predict_angular_with_params_bd` with `BitDepth == 8` must reproduce the
+    /// 8-bit angular path sample for sample; the only bit-depth dependence is
+    /// the output clip and the unavailable-reference default.
+    #[test]
+    fn angular_bd_matches_8bit_path_at_8bit() {
+        let refs = RefSamples {
+            above: (0..=2 * 16).map(|i| (i * 37 + 5) % 256).collect(),
+            left: (0..=2 * 16).map(|i| (i * 53 + 9) % 256).collect(),
+            top_left: 90,
+        };
+        let mrl = MrlRefSamples::from_ref_samples(&refs);
+        for &(w, h) in &[(4usize, 4usize), (8, 16), (16, 8), (4, 16)] {
+            for dir in [2u8, 10, 18, 26, 34, 50, 58, 66] {
+                for mrl_idx in 0..3usize {
+                    let mut m = mrl.clone();
+                    m.mrl_idx = mrl_idx;
+                    let params = init_angular_params(dir, w, h, w, h, true, mrl_idx, false);
+                    assert_eq!(
+                        predict_angular_with_params(&m, w, h, true, &params),
+                        predict_angular_with_params_bd(&m, w, h, true, &params, 8),
+                        "dir {dir}, {w}x{h}, mrl {mrl_idx}"
+                    );
+                }
+            }
+        }
     }
 
     fn ramp_plane_16(width: usize, height: usize, bit_depth: u8) -> Plane16 {

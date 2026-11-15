@@ -1,5 +1,77 @@
 # H.266 / VVC Implementation Status (`rustmpeg-video::vvc`)
 
+## 0g. 10-bit general coding-tree decode and VTM intra interop (2026-11-15)
+
+The general coding-tree decoder (`decode_general.rs`) now reconstructs 8-bit and
+10-bit 4:2:0 pictures, and both VTM-encoder intra rows of the matrix decode
+byte-exactly. Streams: VTM 24.0 `EncoderApp` with the stock
+`encoder_intra_vtm.cfg` (every coding tool and every in-loop filter enabled),
+64x64, 3 frames, QP26, 8-bit (`d_i8`) and 10-bit (`d_i10`), 128-sample CTU on a
+64x64 picture. Our output is bit-identical to VTM 24.0 `DecoderApp` over the
+full Y+U+V sequence.
+
+Fixes in this change:
+
+- **Bit depth in the general path.** `Gen` now stores `Plane16` planes plus the
+  picture bit depth: the unavailable-reference default is `1 << (BitDepth - 1)`,
+  samples clip to `ClipBD`, and the angular and MIP predictors take the bit depth
+  so their internal clip matches. The 8-bit callers keep `BitDepth == 8`, which
+  is sample-identical; new parity tests cover the angular, MIP, SAO, ALF-class
+  and LMCS paths.
+- **Quantisation.** Dequantisation and the inverse transform receive
+  `Qp′ = Qp + QpBdOffset` (`H.266 Eq. 29`) and the picture bit depth. The
+  general decoder is handed the *unscaled* `Qp` and applies the offset once;
+  `VvcSps::mapped_chroma_qp` returns the scaled `Qp′C`, so the call site
+  subtracts `QpBdOffset` first. The previous code added it twice, which broke
+  every chroma plane at 10-bit.
+- **LMCS.** `LmcsReshaper16` serves both depths. `lmcs_delta_abs_cw` is added to
+  `OrgCW` unscaled (`Reshape.cpp:272`), so the previous `<< (BitDepth - 8)`
+  scaling was wrong at 10-bit, and chroma residual scaling clips to
+  `[-maxVal-1, maxVal]` (`Buffer.cpp:400-410`).
+- **SAO.** `sao_offset_abs` is signalled with `Min(BitDepth, 10) - 5` bits, so
+  the offset is already expressed in sample units and must not be rescaled by
+  `BitDepth - 8` (`SampleAdaptiveOffset.cpp:159-167`). The new
+  `apply_sao_region_bounded_16` also reproduces the 8-bit visible-boundary rule
+  for edge offsets.
+- **ALF and deblocking.** ALF classification uses the `BitDepth + 4` activity
+  shift and the 8/10/12-bit clip tables; deblocking uses the bit-depth-aware
+  normative filter with the unscaled `Qp` (VTM `QpParam::Qp(0) - qpBdOffset`).
+- **Routing and DPB.** 10-bit pictures with a general coding tree reach
+  `decode_general` (previously they fell into the CTU-aligned subset decoder and
+  were rejected), and the DPB keeps the reconstructed reference planes.
+
+Transform blocks larger than 32 samples are **not** implemented in the general
+decoder: VTM codes their coefficients with the full-size grouped scan of
+`CoeffCodingContext`, whose `scanPosLast` numbering differs from the capped
+32x32 scan used by `CoeffScan`. Such a block now returns a typed
+`Unsupported("transform block larger than 32 samples")` instead of a bogus CABAC
+error. The matrix's VTM streams do not contain one; VTM 10-bit intra streams at
+low QP do, and they are outside the current scope.
+
+Verification (pristine VTM 24.0 build from `vtm24.tar.gz`, `cmp` on Y+U+V):
+
+| Stream | Result |
+| :--- | :--- |
+| `d_i8` (64x64, 8-bit, 3 frames, stock intra cfg, all filters) | byte-exact |
+| `d_i10` (64x64, 10-bit, 3 frames, stock intra cfg, all filters) | byte-exact |
+| 10-bit stages LMCS / +SAO / +ALF / +CCALF / +deblock, QP26 | 5/5 byte-exact |
+| 10-bit stock cfg, QP26/32/37, 64x64 | 3/3 byte-exact |
+| 8-bit stock cfg, QP37, 64x64 | byte-exact |
+
+Strict 25-case harness (VTM 24.0 `DecoderApp` + VVdeC 3.3 `vvdecapp`):
+**50/50**. Full 266-check matrix: **263 passed / 3 failed / 0 skipped**. The
+three remaining failures are `b12_420` (VVdeC has no 12-bit oracle), `ctu16`
+(the 16-sample CTU cannot be signalled and the harness prints `ENCODE FAIL`),
+and `d_ra8`.
+
+`d_ra8` (VTM stock `encoder_randomaccess_vtm.cfg`, 128x128, 5 frames, POC order
+0/4/2/1/3, temporal ids 0..5) is still outside the decoder: the SPS is rejected
+at `max_sub_layers_minus1 != 0` before CABAC. Decoding it needs the multi
+sub-layer SPS/PH syntax, RPL-based reference-list construction, a POC-keyed DPB,
+and the general inter coding-unit syntax with its prediction tools; none of that
+is implemented for the general coding tree yet. It is the next decoder stage and
+is not claimed by this change.
+
 ## 0f. Deblocking on full-tool intra streams (2026-11-15)
 
 The deblocking filter now derives `maxFilterLengthP`/`maxFilterLengthQ` pair-wise
@@ -44,8 +116,9 @@ The QP37 64x64 full-chain case that sections 0d and 0e recorded as failing is
 byte-exact. Strict 25-case harness (VTM 24.0 `DecoderApp` + VVdeC 3.3 `vvdecapp`):
 **50/50**. Full 266-check matrix: **261 passed / 5 failed / 0 skipped**, the same
 five documented residual failures (12-bit VVdeC oracle limit, the CTU-16 typed
-rejection, and the three VTM-encoder streams outside the decoder subset). No new
-failure. `cargo test --workspace` passes (two new deblocking unit tests).
+rejection, and the three VTM-encoder streams outside the decoder subset; section
+0g fixes two of those three). No new failure. `cargo test --workspace` passes
+(two new deblocking unit tests).
 
 ## 0e. LFNST and ISP reconstruction for the stock configuration (2026-11-15)
 

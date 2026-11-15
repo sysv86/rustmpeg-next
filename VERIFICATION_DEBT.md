@@ -1,6 +1,78 @@
 # Verification Debt (`rustmpeg-next` H.266/VVC)
 
-Last updated: 2026-11-15 (deblocking of full-tool intra streams byte-exact at every tested QP).
+Last updated: 2026-11-15 (10-bit general coding-tree decode; VTM intra interop
+`d_i8`/`d_i10` byte-exact; matrix 263/3).
+
+## 0e. VTM intra interop at 8- and 10-bit (2026-11-15)
+
+Executed after porting the general coding-tree decoder to 10-bit. Oracle: a
+pristine VTM 24.0 build from `~/h266-package/reference/vtm24.tar.gz`
+(unpacked to `/tmp/opencode/vtm-src`, `cmake .. -DCMAKE_BUILD_TYPE=Release`,
+`make -j12 DecoderApp EncoderApp`). The recorded scratch trees under
+`~/h266-package`/`~/h266-package-v2` contain instrumentation prints and, in the
+case of `~/h266-package`, no `DecoderApp` binary in
+`bin/umake/gcc-16.2/x86_64/release` (`rc=127`), so they are not usable as the
+oracle without qualification. The pristine build reproduces every recorded
+`.vtm.yuv` reference byte-exactly (`d_i8`, `d_i10`).
+
+`rustmpeg` decoder: `target/release/examples/vvc_stateful_decode`.
+
+```bash
+VTM=/tmp/opencode/vtm-src/VVCSoftware_VTM-VTM-24.0
+BIN=$VTM/../bin/umake/gcc-16.2/x86_64/release   # built tree
+SRC=$DIR/d_i10.src.source.yuv
+
+$BIN/EncoderApp -c $VTM/cfg/encoder_intra_vtm.cfg -i $SRC \
+  -wdt 64 -hgt 64 -fr 30 -f 3 --TemporalSubsampleRatio=1 -q 26 \
+  --InputBitDepth=10 --InternalBitDepth=10 --InputChromaFormat=420 \
+  -b $DIR/d_i10.vvc -o $DIR/d_i10.vtm.yuv
+$BIN/DecoderApp -b $DIR/d_i10.vvc -o $DIR/d_i10.dec.yuv
+target/release/examples/vvc_stateful_decode $DIR/d_i10.vvc $DIR/d_i10.ours.yuv
+cmp $DIR/d_i10.ours.yuv $DIR/d_i10.dec.yuv
+```
+
+`--TemporalSubsampleRatio=1` is required for the 3-frame rows: the default ratio
+is 8, so `-f 3` alone encodes a single picture and the matrix size check
+(`frame_bytes(..., frames=3)`) can never pass. The matrix script
+(`~/vvc-conf-full/run_conformance_full.sh`, `decode_vtm`) now passes the flag;
+the previous failure text (`rustmpeg decoder failed`) had masked this.
+
+Result (`cmp` on full Y+U+V):
+
+```text
+d_i8  64x64  8-bit  3 frames  stock intra cfg, all filters   OK
+d_i10 64x64 10-bit  3 frames  stock intra cfg, all filters   OK
+10-bit stages QP26: lmcs OK, +sao OK, +alf OK, +ccalf OK, +deblock OK
+10-bit stock cfg 64x64: QP26 OK, QP32 OK, QP37 OK
+8-bit  stock cfg 64x64: QP37 OK
+```
+
+First divergences observed while fixing the 10-bit path (all resolved):
+
+- chroma from the first sample (chroma `Qp′` offset applied twice);
+- luma at `(x=0, y=0)` after LMCS (codeword deltas rescaled by `BitDepth - 8`);
+- luma at `(x=8, y=0)` with SAO only (SAO offsets rescaled by `BitDepth - 8`).
+
+Not implemented: transform blocks larger than 32 samples. VTM codes them with
+the full-size grouped scan of `CoeffCodingContext`; our capped 32x32 `CoeffScan`
+desynchronises CABAC, so the decoder now returns
+`Unsupported("transform block larger than 32 samples")`. Reproduce with a stock
+10-bit intra stream at QP22, which produces such a block.
+
+Other results in this run:
+
+- Strict 25-case harness (`run_conformance.sh`, pristine VTM 24.0 + VVdeC 3.3):
+  **50/50**.
+- Full 266-check matrix (`run_conformance_full.sh`): **263 passed / 3 failed /
+  0 skipped**. Remaining failures: `b12_420` (VVdeC 12-bit limit), `ctu16`
+  (typed rejection), `d_ra8` (multi sub-layer random access, not implemented).
+- `cargo test --workspace`: OK (new parity tests: SAO region 16 vs 8, ALF class
+  16 vs 8, LMCS reshaper 16 vs 8, angular `_bd` vs 8-bit, luma deblock `_bd`).
+- `cargo clippy --workspace --all-targets -- -D warnings`: OK.
+- `cargo fmt --all -- --check`: OK.
+- `python3 scripts/check-licenses.py`: OK.
+- Not re-run: 12-bit and 4:2:2/4:4:4 full-tool VTM streams, tiles/WPP/slices/RPR
+  VTM streams, GPU paths.
 
 ## 0d. Deblocking on full-tool intra streams (2026-11-15)
 

@@ -711,6 +711,36 @@ pub fn deblock_luma_edge_normative(
     );
 }
 
+/// [`deblock_luma_edge_normative`] parameterised by sample bit depth
+/// (`bit_depth` in `8..=12`); the sample clamp and the `tC`/`β` scaling follow
+/// `H.266 §8.8.3.5`/§8.8.3.6.
+#[allow(clippy::too_many_arguments)]
+pub fn deblock_luma_edge_normative_bd(
+    lines: &mut [[i32; 16]; 4],
+    qp_p: u8,
+    qp_q: u8,
+    bs: u8,
+    beta_offset_div2: i8,
+    tc_offset_div2: i8,
+    max_len_p: usize,
+    max_len_q: usize,
+    at_ctb_hor_boundary: bool,
+    bit_depth: u8,
+) {
+    deblock_luma_edge_bd(
+        lines,
+        i32::from(qp_p),
+        i32::from(qp_q),
+        bs,
+        beta_offset_div2,
+        tc_offset_div2,
+        bit_depth,
+        max_len_p,
+        max_len_q,
+        at_ctb_hor_boundary,
+    );
+}
+
 /// Filter a 4-line luma edge segment (`lines` of 8 samples `[p3, p2, p1, p0, q0, q1, q2, q3]`
 /// per line) in-place using the H.266 §8.8.3.6.2-§8.8.3.6.7 short/long deblocking filters.
 ///
@@ -1512,16 +1542,56 @@ pub fn derive_alf_class_4x4_vb(
     vb_h: usize,
     vb_pos: usize,
 ) -> (usize, usize) {
-    const TH: [usize; 16] = [0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4];
-    const TRANSPOSE_TABLE: [usize; 8] = [0, 1, 0, 2, 2, 3, 1, 3];
-
     let lw = bw.min(plane.width) as isize;
     let lh = bh.min(plane.height) as isize;
-    let get_p = |x: isize, y: isize| -> i32 {
+    derive_alf_class_4x4_vb_samples(bx, by, vb_h, vb_pos, 8, |x, y| {
         let cx = x.clamp(0, lw - 1) as usize;
         let cy = y.clamp(0, lh - 1) as usize;
         i32::from(plane.get(cx, cy))
-    };
+    })
+}
+
+/// Derive the ALF class and transpose index for a `4x4` 16-bit luma block, with
+/// the same virtual-boundary handling as [`derive_alf_class_4x4_vb`]. The
+/// activity normalisation shift is `BitDepth + 4` (`AdaptiveLoopFilter.cpp:992-1002`).
+#[allow(clippy::too_many_arguments)]
+pub fn derive_alf_class_4x4_vb_16(
+    plane: &Plane16,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+    vb_h: usize,
+    vb_pos: usize,
+) -> (usize, usize) {
+    let lw = bw.min(plane.width) as isize;
+    let lh = bh.min(plane.height) as isize;
+    let bd = plane.bit_depth.clamp(8, 12);
+    derive_alf_class_4x4_vb_samples(bx, by, vb_h, vb_pos, bd, |x, y| {
+        let cx = x.clamp(0, lw - 1) as usize;
+        let cy = y.clamp(0, lh - 1) as usize;
+        i32::from(plane.get(cx, cy))
+    })
+}
+
+/// Shared ALF classification core: `get_p` supplies the clamped neighbour
+/// sample and `bit_depth` selects the activity normalisation
+/// (`bitDepth + 4`, `AdaptiveLoopFilter.cpp:992-1002`).
+fn derive_alf_class_4x4_vb_samples<F>(
+    bx: usize,
+    by: usize,
+    vb_h: usize,
+    vb_pos: usize,
+    bit_depth: u8,
+    get_p: F,
+) -> (usize, usize)
+where
+    F: Fn(isize, isize) -> i32,
+{
+    const TH: [usize; 16] = [0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4];
+    const TRANSPOSE_TABLE: [usize; 8] = [0, 1, 0, 2, 2, 3, 1, 3];
+
+    let bd = i32::from(bit_depth.clamp(8, 12));
 
     let mut sum_v = 0i32;
     let mut sum_h = 0i32;
@@ -1584,7 +1654,7 @@ pub fn derive_alf_class_4x4_vb(
     } else {
         64
     };
-    let activity = ((temp_act * activity_scale) >> 12).clamp(0, 15) as usize;
+    let activity = ((temp_act * activity_scale) >> (bd + 4)).clamp(0, 15) as usize;
     let mut class_idx = TH[activity];
 
     let (hv1, hv0, dir_temp_hv) = if sum_v > sum_h {
@@ -1830,7 +1900,11 @@ pub fn apply_sao_region_16(
                     let s = i32::from(src.get(x, y));
                     let band = ((s >> band_shift) as u8).wrapping_sub(band_pos) & 31;
                     if band < 4 {
-                        let off = i32::from(offsets[band as usize]) << (bd - 8);
+                        // `sao_offset_abs` is signalled with
+                        // `Min(BitDepth, 10) - 5` bits, so the value is already
+                        // expressed in sample units and is not rescaled
+                        // (`H.266 §7.4.9.3`, `SampleAdaptiveOffset.cpp:159-167`).
+                        let off = i32::from(offsets[band as usize]);
                         dst.set(x, y, (s + off).clamp(0, max_val) as u16);
                     }
                 }
@@ -1864,7 +1938,93 @@ pub fn apply_sao_region_16(
                         3 => i32::from(offsets[2]),
                         4 => i32::from(offsets[3]),
                         _ => 0,
-                    } << (bd - 8);
+                    };
+                    dst.set(x, y, (c + off).clamp(0, max_val) as u16);
+                }
+            }
+        }
+    }
+}
+
+/// Apply one SAO type over a region of a 16-bit picture whose visible extent is
+/// `bw x bh`, with the same boundary rule as [`apply_sao_region_bounded`]:
+/// samples whose edge-offset neighbour falls outside the visible picture are
+/// left unchanged (`SampleAdaptiveOffset.cpp:308-310`, `:453-515`).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_sao_region_bounded_16(
+    src: &Plane16,
+    dst: &mut Plane16,
+    bx: usize,
+    by: usize,
+    w: usize,
+    h: usize,
+    bw: usize,
+    bh: usize,
+    sao: SaoType,
+) {
+    let bd = src.bit_depth.clamp(8, 12);
+    let max_val = src.max_sample();
+    let band_shift = bd - 5;
+    let w_lim = (bx + w).min(src.width);
+    let h_lim = (by + h).min(src.height);
+
+    match sao {
+        SaoType::Off => {}
+        SaoType::BandOffset { band_pos, offsets } => {
+            for y in by..h_lim {
+                for x in bx..w_lim {
+                    let s = i32::from(src.get(x, y));
+                    let band = ((s >> band_shift) as u8).wrapping_sub(band_pos) & 31;
+                    if band < 4 {
+                        // `sao_offset_abs` is signalled with
+                        // `Min(BitDepth, 10) - 5` bits, so the value is already
+                        // expressed in sample units and is not rescaled
+                        // (`H.266 §7.4.9.3`, `SampleAdaptiveOffset.cpp:159-167`).
+                        let off = i32::from(offsets[band as usize]);
+                        dst.set(x, y, (s + off).clamp(0, max_val) as u16);
+                    }
+                }
+            }
+        }
+        SaoType::EdgeOffset { eo_class, offsets } => {
+            let (dx, dy): (isize, isize) = match eo_class & 3 {
+                0 => (1, 0),
+                1 => (0, 1),
+                2 => (1, 1),
+                _ => (-1, 1),
+            };
+            let pw = bw.min(src.width) as isize;
+            let ph = bh.min(src.height) as isize;
+            for y in by..h_lim {
+                for x in bx..w_lim {
+                    let ix = x as isize;
+                    let iy = y as isize;
+                    let ax = ix - dx;
+                    let ay = iy - dy;
+                    let bx_n = ix + dx;
+                    let by_n = iy + dy;
+                    if ax < 0
+                        || ay < 0
+                        || ax >= pw
+                        || ay >= ph
+                        || bx_n < 0
+                        || by_n < 0
+                        || bx_n >= pw
+                        || by_n >= ph
+                    {
+                        continue;
+                    }
+                    let c = i32::from(src.get(x, y));
+                    let a = i32::from(src.get(ax as usize, ay as usize));
+                    let b = i32::from(src.get(bx_n as usize, by_n as usize));
+                    let edge_idx = 2 + (c - a).signum() + (c - b).signum();
+                    let off = match edge_idx {
+                        0 => i32::from(offsets[0]),
+                        1 => i32::from(offsets[1]),
+                        3 => i32::from(offsets[2]),
+                        4 => i32::from(offsets[3]),
+                        _ => 0,
+                    };
                     dst.set(x, y, (c + off).clamp(0, max_val) as u16);
                 }
             }
@@ -2475,8 +2635,9 @@ impl LmcsReshaper16 {
 
         let mut bin_cw = [0i32; 16];
         for i in min_bin..=max_bin {
-            let delta = i32::from(aps.bin_cw_delta[i]) << (bd - 8);
-            bin_cw[i] = (init_cw + delta).max(0);
+            // `lmcs_delta_abs_cw` is signalled in codewords of the picture bit
+            // depth, so it is added to `OrgCW` unscaled (`Reshape.cpp:272`).
+            bin_cw[i] = (init_cw + i32::from(aps.bin_cw_delta[i])).max(0);
         }
 
         let mut input_pivot = [0i32; 17];
@@ -2494,7 +2655,7 @@ impl LmcsReshaper16 {
                 chroma_adj_lut[i] = 1 << LMCS_FP_PREC;
             } else {
                 inv_scale_coef[i] = (init_cw << LMCS_FP_PREC) / bin_cw[i];
-                let c_off = i32::from(aps.chroma_res_scaling_offset) << (bd - 8);
+                let c_off = i32::from(aps.chroma_res_scaling_offset);
                 let denom = (bin_cw[i] + c_off).max(1);
                 chroma_adj_lut[i] = (init_cw << LMCS_FP_PREC) / denom;
             }
@@ -2570,6 +2731,21 @@ impl LmcsReshaper16 {
             idx_s += 1;
         }
         self.chroma_adj_lut[idx_s.min(15)]
+    }
+
+    /// Scale a chroma residual block in-place at this reshaper's bit depth
+    /// (`H.266 §8.7.5.3 Eq. 1222`, VTM `AreaBuf<Pel>::scaleSignal` with
+    /// `dir == false`). The clip range is `[-maxVal-1, maxVal]`, the high
+    /// bit-depth form of the 8-bit `[-256, 255]` range.
+    pub fn scale_chroma_residual(&self, residual: &mut [i32], avg_luma: i32) {
+        let scale = self.chroma_scale_for_luma(avg_luma);
+        let max_val = (1i32 << u32::from(self.bit_depth.clamp(8, 12))) - 1;
+        for r in residual.iter_mut() {
+            let v = (*r).clamp(-max_val - 1, max_val);
+            let sign = if v < 0 { -1 } else { 1 };
+            let abs = v.abs();
+            *r = sign * ((abs * scale + (1 << (LMCS_FP_PREC - 1))) >> LMCS_FP_PREC);
+        }
     }
 }
 
@@ -2672,6 +2848,100 @@ pub fn derive_sao_ctu_params_16(
 mod tests {
     use super::*;
 
+    /// The 16-bit reshaper must reproduce the 8-bit reshaper exactly at
+    /// `BitDepth == 8`: `OrgCW` is `(1 << BitDepth) / 16` and
+    /// `lmcs_delta_abs_cw` is added to it unscaled (`Reshape.cpp:272`).
+    #[test]
+    fn lmcs_reshaper_16_matches_8bit_path_at_8bit() {
+        let aps = VvcLmcsAps {
+            min_bin_idx: 1,
+            max_bin_idx: 14,
+            bin_cw_delta: [0, -3, -2, -1, 0, 1, 2, 2, 1, 0, -1, -2, -1, 0, 3, 0],
+            chroma_res_scaling_offset: -2,
+        };
+        let r8 = LmcsReshaper::from_aps_8bit(&aps);
+        let r16 = LmcsReshaper16::from_aps(&aps, 8);
+        assert_eq!(r8.min_bin_idx, r16.min_bin_idx);
+        assert_eq!(r8.max_bin_idx, r16.max_bin_idx);
+        assert_eq!(r8.bin_cw, r16.bin_cw);
+        assert_eq!(r8.chroma_adj_lut, r16.chroma_adj_lut);
+        for v in 0..=255usize {
+            assert_eq!(u16::from(r8.fwd_lut[v]), r16.fwd_lut[v], "fwd {v}");
+            assert_eq!(u16::from(r8.inv_lut[v]), r16.inv_lut[v], "inv {v}");
+        }
+        let mut a = vec![-300, -255, -1, 0, 1, 200, 255, 300];
+        let mut b = a.clone();
+        r8.scale_chroma_residual(&mut a, 128);
+        r16.scale_chroma_residual(&mut b, 128);
+        assert_eq!(a, b);
+    }
+
+    /// `derive_alf_class_4x4_vb_16` at 8-bit must classify every 4x4 block
+    /// exactly like the 8-bit path, including the virtual-boundary rows.
+    #[test]
+    fn alf_class_16_matches_8bit_path_at_8bit() {
+        let (w, h) = (16, 16);
+        let mut st = 7u32;
+        let mut rnd = || {
+            st = st.wrapping_mul(1103515245).wrapping_add(12345);
+            ((st >> 16) & 0xff) as u8
+        };
+        let plane8 = Plane {
+            width: w,
+            height: h,
+            data: (0..w * h).map(|_| rnd()).collect(),
+        };
+        let plane16 = Plane16::from_slice(
+            w,
+            h,
+            8,
+            &plane8
+                .data
+                .iter()
+                .map(|&v| u16::from(v))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for &(vb_h, vb_pos) in &[(0usize, 0usize), (16, 12), (16, 8)] {
+            for by in (0..h).step_by(4) {
+                for bx in (0..w).step_by(4) {
+                    assert_eq!(
+                        derive_alf_class_4x4_vb(&plane8, bx, by, w, h, vb_h, vb_pos),
+                        derive_alf_class_4x4_vb_16(&plane16, bx, by, w, h, vb_h, vb_pos),
+                        "block ({bx},{by}) vb ({vb_h},{vb_pos})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The bit-depth-parameterised luma deblock must be the normative 8-bit
+    /// filter when called with `bit_depth == 8`.
+    #[test]
+    fn luma_deblock_bd_wrapper_matches_8bit_at_8bit() {
+        let lines = [
+            [40, 55, 70, 82, 96, 110, 125, 140],
+            [41, 56, 71, 83, 97, 111, 126, 141],
+            [42, 57, 72, 84, 98, 112, 127, 142],
+            [43, 58, 73, 85, 99, 113, 128, 143],
+        ];
+        let narrow = lines;
+        let mut wide = [[0i32; 16]; 4];
+        for (i, line) in narrow.iter().enumerate() {
+            wide[i][4..12].copy_from_slice(line);
+        }
+        let mut a = narrow;
+        let mut b = wide;
+        deblock_luma_edge_4(&mut a, 32, 32, 2, 0, 0);
+        let qp = 32u8;
+        deblock_luma_edge_normative_bd(&mut b, qp, qp, 2, 0, 0, 3, 3, false, 8);
+        let mut b_narrow = [[0i32; 8]; 4];
+        for (i, line) in b_narrow.iter_mut().enumerate() {
+            line.copy_from_slice(&b[i][4..12]);
+        }
+        assert_eq!(a, b_narrow);
+    }
+
     #[test]
     fn identity_lmcs_reshaper_preserves_all_256_levels() {
         let aps = VvcLmcsAps {
@@ -2741,4 +3011,72 @@ mod tests {
 pub struct SaoBlkParams {
     /// Luma SAO type for the superblock.
     pub y: SaoType,
+}
+
+#[cfg(test)]
+mod sao_region_parity {
+    use super::*;
+    /// `apply_sao_region_bounded_16` at 8-bit must reproduce
+    /// `apply_sao_region_bounded` sample for sample, including the visible
+    /// boundary rule of the edge-offset classes.
+    #[test]
+    fn sao_region_16_matches_8bit_path_at_8bit() {
+        let mut st = 12345u32;
+        let mut rnd = || {
+            st = st.wrapping_mul(1103515245).wrapping_add(12345);
+            ((st >> 16) & 0xff) as u8
+        };
+        let (w, h) = (16, 16);
+        let plane8 = Plane {
+            width: w,
+            height: h,
+            data: (0..w * h).map(|_| rnd()).collect(),
+        };
+        let plane16 = Plane16::from_slice(
+            w,
+            h,
+            8,
+            &plane8
+                .data
+                .iter()
+                .map(|&v| u16::from(v))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let cases = [
+            SaoType::BandOffset {
+                band_pos: 0,
+                offsets: [1, -1, 2, -2],
+            },
+            SaoType::BandOffset {
+                band_pos: 30,
+                offsets: [3, 4, -3, -4],
+            },
+            SaoType::EdgeOffset {
+                eo_class: 0,
+                offsets: [1, 2, -1, -2],
+            },
+            SaoType::EdgeOffset {
+                eo_class: 1,
+                offsets: [1, 2, -1, -2],
+            },
+            SaoType::EdgeOffset {
+                eo_class: 2,
+                offsets: [1, 2, -1, -2],
+            },
+            SaoType::EdgeOffset {
+                eo_class: 3,
+                offsets: [1, 2, -1, -2],
+            },
+        ];
+        for case in cases {
+            let mut d8 = plane8.clone();
+            let mut d16 = plane16.clone();
+            apply_sao_region_bounded(&plane8, &mut d8, 2, 2, 10, 10, 12, 12, case);
+            apply_sao_region_bounded_16(&plane16, &mut d16, 2, 2, 10, 10, 12, 12, case);
+            for i in 0..w * h {
+                assert_eq!(d8.data[i], d16.data[i] as u8, "case {case:?} at {i}");
+            }
+        }
+    }
 }

@@ -17,9 +17,9 @@
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
 use super::cabac::{BinDecoder, CtxStore, ctx};
-use super::filter::LmcsReshaper;
+use super::filter::LmcsReshaper16;
 use super::hls::{VvcActiveApsBank, VvcPictureHeader, VvcPps, VvcSliceHeader, VvcSps};
-use super::predict::{self, IntraMode, Plane};
+use super::predict::{self, IntraMode, Plane16};
 use super::transform::CoeffScan;
 use super::{VvcError, dct, filter, lfnst, residual, transform};
 
@@ -342,20 +342,22 @@ struct Gen<'a> {
     vis_w: usize,
     vis_h: usize,
     ctu: usize,
+    /// Luma sample bit depth (`sps_bit_depth_minus8 + 8`).
+    bit_depth: u8,
     lgrid: Vec<LumaCell>,
     lgrid_w: usize,
     cgrid: Vec<ChromaCell>,
     cgrid_w: usize,
     cgrid_h: usize,
-    y: Plane,
-    u: Plane,
-    v: Plane,
+    y: Plane16,
+    u: Plane16,
+    v: Plane16,
     qp_y: i32,
     qp_cb: i32,
     qp_cr: i32,
     /// `Qp′CbCr` (`H.266 §8.7.2`, used when `TuCResMode == 2`).
     qp_joint: i32,
-    lmcs: Option<LmcsReshaper>,
+    lmcs: Option<LmcsReshaper16>,
     lmcs_on: bool,
     sao: Vec<[filter::SaoType; 3]>,
     ctu_cols: usize,
@@ -390,6 +392,16 @@ enum AlfLumaMode {
 }
 
 impl<'a> Gen<'a> {
+    /// Maximum legal sample value `(1 << BitDepth) - 1`.
+    fn max_val(&self) -> i32 {
+        (1i32 << u32::from(self.bit_depth.clamp(8, 12))) - 1
+    }
+
+    /// Unavailable-reference default sample `1 << (BitDepth - 1)`.
+    fn dc(&self) -> i32 {
+        1i32 << (u32::from(self.bit_depth.clamp(8, 12)) - 1)
+    }
+
     fn lcell(&self, x: usize, y: usize) -> Option<LumaCell> {
         if x >= self.pic_w || y >= self.pic_h {
             return None;
@@ -664,9 +676,9 @@ struct CuPlan {
 }
 
 pub(crate) struct GeneralPicture {
-    pub y: Plane,
-    pub u: Plane,
-    pub v: Plane,
+    pub y: Plane16,
+    pub u: Plane16,
+    pub v: Plane16,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -682,9 +694,9 @@ pub(crate) fn decode_general_intra_picture(
     qp_cr: i32,
     qp_joint: i32,
 ) -> Result<GeneralPicture, VvcError> {
-    if sps.info.chroma_format_idc != 1 || sps.info.bit_depth_luma != 8 {
+    if sps.info.chroma_format_idc != 1 || !matches!(sps.info.bit_depth_luma, 8 | 10) {
         return Err(VvcError::Unsupported(
-            "general coding-tree decoding is implemented for 8-bit 4:2:0",
+            "general coding-tree decoding is implemented for 8/10-bit 4:2:0",
         ));
     }
     if sps.palette_enabled || sps.ibc_enabled || sps.act_enabled {
@@ -736,10 +748,11 @@ pub(crate) fn decode_general_intra_picture(
     let lmcs = if lmcs_on {
         aps.lmcs[usize::from(ph.lmcs_aps_id & 7)]
             .as_ref()
-            .map(LmcsReshaper::from_aps_8bit)
+            .map(|a| LmcsReshaper16::from_aps(a, sps.info.bit_depth_luma))
     } else {
         None
     };
+    let bit_depth = sps.info.bit_depth_luma;
     let mut g = Gen {
         sps,
         sh,
@@ -750,14 +763,15 @@ pub(crate) fn decode_general_intra_picture(
         vis_w,
         vis_h,
         ctu,
+        bit_depth,
         lgrid: vec![LumaCell::default(); lgrid_w * lgrid_h],
         lgrid_w,
         cgrid: vec![ChromaCell::default(); cgrid_w * cgrid_h],
         cgrid_w,
         cgrid_h,
-        y: Plane::new(pic_w, pic_h),
-        u: Plane::new(cgrid_w, cgrid_h),
-        v: Plane::new(cgrid_w, cgrid_h),
+        y: Plane16::new(pic_w, pic_h, bit_depth),
+        u: Plane16::new(cgrid_w, cgrid_h, bit_depth),
+        v: Plane16::new(cgrid_w, cgrid_h, bit_depth),
         qp_y,
         qp_cb,
         qp_cr,
@@ -903,7 +917,7 @@ pub(crate) fn decode_general_intra_picture(
 
     if g.lmcs_on {
         if let Some(r) = &g.lmcs {
-            r.apply_inverse_plane(&mut g.y);
+            r.apply_inverse_plane_16(&mut g.y);
         }
     }
     let no_db = std::env::var_os("VVC_NO_DB").is_some();
@@ -1795,6 +1809,16 @@ fn transform_unit(
         if cw == 0 || ch == 0 {
             continue;
         }
+        // A transform block larger than 32 samples codes its coefficients with
+        // the full-size grouped scan of `CoeffCodingContext`, whose
+        // `scanPosLast` numbering differs from the capped 32x32 scan used by
+        // `CoeffScan`; it is not implemented here (rejected before the CABAC
+        // parse of the block would desynchronise).
+        if cbf[comp] && (cw > 32 || ch > 32) {
+            return Err(VvcError::Unsupported(
+                "general coding-tree decoding: transform block larger than 32 samples",
+            ));
+        }
         let mut levels = Vec::new();
         let mut ts = false;
         if cbf[comp] && !(comp == 2 && jccr == 3) {
@@ -2036,8 +2060,8 @@ fn reconstruct_joint_cbcr(
     } else {
         (plan.qp_cb, plan.qp_cr)
     };
-    let mut res_cb = residual_of(plan, cb, false, cw, ch, qp_cb)?;
-    let mut res_cr = residual_of(plan, cr, false, cw, ch, qp_cr)?;
+    let mut res_cb = residual_of(plan, cb, false, cw, ch, qp_cb, g.bit_depth)?;
+    let mut res_cr = residual_of(plan, cr, false, cw, ch, qp_cr, g.bit_depth)?;
     let mode = if g.ph.joint_cbcr_sign {
         match cb.joint {
             1 => -3,
@@ -2074,12 +2098,13 @@ fn reconstruct_joint_cbcr(
             r.scale_chroma_residual(&mut res_cr, avg);
         }
     }
+    let max_val = g.max_val();
     for y in 0..ch {
         for x in 0..cw {
             let v = pred_cb[y * cw + x] + res_cb[y * cw + x];
-            g.u.set(ix + x, iy + y, v.clamp(0, 255) as u8);
+            g.u.set(ix + x, iy + y, v.clamp(0, max_val) as u16);
             let v = pred_cr[y * cw + x] + res_cr[y * cw + x];
-            g.v.set(ix + x, iy + y, v.clamp(0, 255) as u8);
+            g.v.set(ix + x, iy + y, v.clamp(0, max_val) as u16);
         }
     }
     mark_tu(g, cb);
@@ -2107,7 +2132,14 @@ fn reconstruct_tu(g: &mut Gen<'_>, plan: &CuPlan, t: &TuData) -> Result<(), VvcE
     let pred = if luma {
         if let Some((transposed, mip_idx)) = plan.mip {
             let refs = g.gather_avail(true, ix, iy, cw, ch);
-            predict::predict_mip(&refs, cw, ch, mip_idx as u8, transposed)
+            predict::predict_mip_with_bit_depth(
+                &refs,
+                cw,
+                ch,
+                mip_idx as u8,
+                transposed,
+                g.bit_depth,
+            )
         } else if plan.isp == predict::IspMode::Ver && (plan.w == 4 || (plan.w == 8 && plan.h > 4))
         {
             // VTM `CU::isPredRegDiffFromTB` / `adjustPredArea`:
@@ -2153,7 +2185,7 @@ fn reconstruct_tu(g: &mut Gen<'_>, plan: &CuPlan, t: &TuData) -> Result<(), VvcE
     } else {
         plan.qp_cr
     };
-    let mut residual = residual_of(plan, t, t.component == 0, cw, ch, qp)?;
+    let mut residual = residual_of(plan, t, t.component == 0, cw, ch, qp, g.bit_depth)?;
     if t.component == 0 && plan.bdpcm_l != 0 {
         residual = predict::apply_bdpcm_inverse(&residual, cw, ch, plan.bdpcm_l == 2);
     }
@@ -2179,6 +2211,7 @@ fn reconstruct_tu(g: &mut Gen<'_>, plan: &CuPlan, t: &TuData) -> Result<(), VvcE
             r.scale_chroma_residual(&mut residual, avg);
         }
     }
+    let max_val = g.max_val();
     let plane = if t.component == 0 {
         &mut g.y
     } else if t.component == 1 {
@@ -2189,7 +2222,7 @@ fn reconstruct_tu(g: &mut Gen<'_>, plan: &CuPlan, t: &TuData) -> Result<(), VvcE
     for y in 0..ch {
         for x in 0..cw {
             let v = i32::from(pred[y * cw + x]) + residual[y * cw + x];
-            plane.set(ix + x, iy + y, v.clamp(0, 255) as u8);
+            plane.set(ix + x, iy + y, v.clamp(0, max_val) as u16);
         }
     }
     mark_tu(g, t);
@@ -2205,18 +2238,22 @@ fn residual_of(
     cw: usize,
     ch: usize,
     qp: i32,
+    bit_depth: u8,
 ) -> Result<Vec<i32>, VvcError> {
     if !t.cbf {
         return Ok(vec![0i32; cw * ch]);
     }
     if t.ts {
+        // VTM `TrQuant::xITransformSkip` dequantises with `Qp′` (the slice QP
+        // plus `QpBdOffset`, H.266 Eq. 29).
+        let qp_scaled = (qp + dct::qp_bd_offset(bit_depth)).clamp(0, 63 + 6 * 4) as u8;
         return Ok(t
             .levels
             .iter()
-            .map(|&l| transform::dequantize_ts(l, qp.clamp(0, 63) as u8))
+            .map(|&l| transform::dequantize_ts(l, qp_scaled))
             .collect());
     }
-    inverse_residual(plan, t, luma, cw, ch, qp)
+    inverse_residual(plan, t, luma, cw, ch, qp, bit_depth)
 }
 
 fn inverse_residual(
@@ -2226,11 +2263,15 @@ fn inverse_residual(
     cw: usize,
     ch: usize,
     qp: i32,
+    bit_depth: u8,
 ) -> Result<Vec<i32>, VvcError> {
     let cw_coded = cw.min(32);
     let ch_coded = ch.min(32);
     let scan = CoeffScan::new(cw_coded, ch_coded);
-    let qp = qp.clamp(0, 63) as u8;
+    // `Qp′ = Qp + QpBdOffset` (H.266 Eq. 29); the dequantisers expect the
+    // scaled value and apply `qp_bd_offset` internally only for the transform
+    // shift, not for the QP itself (`Quant.cpp:64-103`).
+    let qp = (qp + dct::qp_bd_offset(bit_depth)).clamp(0, 63 + 6 * 4) as u8;
     // `t.levels` is already raster-indexed: `residual::decode_residual_*`
     // writes each coefficient at `scan.raster[scan_pos]`.
     let full = t.levels.clone();
@@ -2243,11 +2284,11 @@ fn inverse_residual(
     }
     let used_mts = luma && plan.mts != 0;
     let dequant = if g_dep_quant(plan) {
-        dct::dequantize_dep_quant_bd(cw, ch, &full, &scan.raster, qp, 8).map_err(|_e| {
+        dct::dequantize_dep_quant_bd(cw, ch, &full, &scan.raster, qp, bit_depth).map_err(|_e| {
             VvcError::Unsupported("unsupported transform dimensions or transform type")
         })?
     } else {
-        dct::dequantize_rect_bd(cw, ch, &full, qp, 8).map_err(|_e| {
+        dct::dequantize_rect_bd(cw, ch, &full, qp, bit_depth).map_err(|_e| {
             VvcError::Unsupported("unsupported transform dimensions or transform type")
         })?
     };
@@ -2289,7 +2330,7 @@ fn inverse_residual(
     } else {
         primary_skips(cw, ch, th, tv)
     };
-    dct::inverse_transform_rect_bd(cw, ch, &dequant, th, tv, sw, sh, 8)
+    dct::inverse_transform_rect_bd(cw, ch, &dequant, th, tv, sw, sh, bit_depth)
         .map_err(|_e| VvcError::Unsupported("unsupported transform dimensions or transform type"))
 }
 
@@ -2354,7 +2395,7 @@ impl Gen<'_> {
     /// `nCbH + nTbH` left samples (`IntraPrediction.cpp:814-829`).
     fn gather_len(
         &self,
-        plane: &Plane,
+        plane: &Plane16,
         is_luma: bool,
         x: usize,
         y: usize,
@@ -2444,18 +2485,18 @@ impl Gen<'_> {
         h: usize,
     ) -> predict::RefSamples {
         let plane = if is_luma { &self.y } else { &self.u };
-        self.gather_len(plane, is_luma, x, y, 2 * w, 2 * h, 128)
+        self.gather_len(plane, is_luma, x, y, 2 * w, 2 * h, self.dc())
     }
 
     fn gather_chroma(
         &self,
-        plane: &Plane,
+        plane: &Plane16,
         x: usize,
         y: usize,
         w: usize,
         h: usize,
     ) -> predict::RefSamples {
-        self.gather_len(plane, false, x, y, 2 * w, 2 * h, 128)
+        self.gather_len(plane, false, x, y, 2 * w, 2 * h, self.dc())
     }
 
     /// Cross-component linear model prediction for one chroma transform block
@@ -2473,7 +2514,8 @@ impl Gen<'_> {
         w: usize,
         h: usize,
     ) -> Vec<i32> {
-        let mid = 128i32;
+        let mid = self.dc();
+        let max_val = self.max_val();
         let chroma = if comp == 1 { &self.u } else { &self.v };
         let luma = &self.y;
         let xtb = xc * 2;
@@ -2597,7 +2639,8 @@ impl Gen<'_> {
         if count == 0 {
             return vec![mid; w * h];
         }
-        let params = predict::derive_cclm_params_from_4_samples(sel_luma, sel_chroma, count, 8);
+        let params =
+            predict::derive_cclm_params_from_4_samples(sel_luma, sel_chroma, count, self.bit_depth);
 
         let mut out = vec![0i32; w * h];
         for y in 0..h {
@@ -2623,7 +2666,7 @@ impl Gen<'_> {
                         >> 3
                 };
                 let pred = ((ds * params.a) >> params.shift) + params.b;
-                out[y * w + x] = pred.clamp(0, 255);
+                out[y * w + x] = pred.clamp(0, max_val);
             }
         }
         out
@@ -2641,7 +2684,7 @@ impl Gen<'_> {
         mrl: usize,
     ) -> predict::MrlRefSamples {
         let plane = &self.y;
-        let dc = 128;
+        let dc = self.dc();
         let offset = 1 + mrl;
         let above_len = 2 * w;
         let left_len = 2 * h;
@@ -2737,7 +2780,7 @@ fn isp_refs(
     // sub-partition. The references themselves are the reconstructed samples
     // around the sub-partition, which for later sub-partitions include the
     // previously decoded part of the same CU.
-    g.gather_len(&g.y, true, x, y, plan.w + w, plan.h + h, 128)
+    g.gather_len(&g.y, true, x, y, plan.w + w, plan.h + h, g.dc())
 }
 
 fn predict_luma(
@@ -2807,9 +2850,9 @@ fn predict_luma(
                     base_refs.clone()
                 };
                 let m = predict::MrlRefSamples::from_ref_samples(&used);
-                predict::predict_angular_with_params(&m, w, h, true, &params)
+                predict::predict_angular_with_params_bd(&m, w, h, true, &params, g.bit_depth)
             } else {
-                predict::predict_angular_with_params(&mrl_refs, w, h, true, &params)
+                predict::predict_angular_with_params_bd(&mrl_refs, w, h, true, &params, g.bit_depth)
             }
         }
     }
@@ -2860,7 +2903,9 @@ fn predict_chroma(
             }
             p
         }
-        IntraMode::Angular(dir) => predict::predict_angular(&refs, w, h, false, dir),
+        IntraMode::Angular(dir) => {
+            predict::predict_angular_bd(&refs, w, h, false, dir, g.bit_depth)
+        }
     }
 }
 
@@ -2897,10 +2942,10 @@ fn chroma_adj_luma(g: &mut Gen<'_>, t: &TuData) -> i32 {
         }
     }
     let avg = match count {
-        0 => 128,
+        0 => g.dc(),
         c if c == n => (sum + (1 << (n.trailing_zeros() - 1))) >> n.trailing_zeros(),
         c if c == 2 * n => (sum + (1 << n.trailing_zeros())) >> (n.trailing_zeros() + 1),
-        _ => 128,
+        _ => g.dc(),
     };
     g.vpdu_scale.insert((vx, vy), avg);
     avg
@@ -3002,6 +3047,8 @@ fn chroma_lens(size_p: u16, size_q: u16, ctb_boundary: bool) -> (usize, usize) {
 }
 
 fn apply_deblock(g: &mut Gen<'_>) {
+    let max_val = g.max_val();
+    let bd = g.bit_depth;
     let qp_y = i32::from(g.qp_y.clamp(0, 63)) as u8;
     let beta = g.sh.luma_beta_offset_div2 as i8;
     let tc = g.sh.luma_tc_offset_div2 as i8;
@@ -3024,14 +3071,14 @@ fn apply_deblock(g: &mut Gen<'_>) {
                         *v = i32::from(g.y.get(xx, yy));
                     }
                 }
-                filter::deblock_luma_edge_normative(
-                    &mut lines, qp_y, qp_y, 2, beta, tc, lp, lq, false,
+                filter::deblock_luma_edge_normative_bd(
+                    &mut lines, qp_y, qp_y, 2, beta, tc, lp, lq, false, bd,
                 );
                 for (i, line) in lines.iter().enumerate() {
                     let yy = (y + i).min(h - 1);
                     for k in 0..16 {
                         let xx = (x as isize - 8 + k as isize).clamp(0, w as isize - 1) as usize;
-                        g.y.set(xx, yy, line[k].clamp(0, 255) as u8);
+                        g.y.set(xx, yy, line[k].clamp(0, max_val) as u16);
                     }
                 }
             }
@@ -3059,7 +3106,7 @@ fn apply_deblock(g: &mut Gen<'_>) {
                         *v = i32::from(g.y.get(xx, yy));
                     }
                 }
-                filter::deblock_luma_edge_normative(
+                filter::deblock_luma_edge_normative_bd(
                     &mut lines,
                     qp_y,
                     qp_y,
@@ -3069,12 +3116,13 @@ fn apply_deblock(g: &mut Gen<'_>) {
                     lp,
                     lq,
                     y.is_multiple_of(g.ctu),
+                    bd,
                 );
                 for (i, line) in lines.iter().enumerate() {
                     let xx = (x + i).min(w - 1);
                     for k in 0..16 {
                         let yy = (y as isize - 8 + k as isize).clamp(0, h as isize - 1) as usize;
-                        g.y.set(xx, yy, line[k].clamp(0, 255) as u8);
+                        g.y.set(xx, yy, line[k].clamp(0, max_val) as u16);
                     }
                 }
             }
@@ -3137,14 +3185,14 @@ fn apply_deblock(g: &mut Gen<'_>) {
                         tc_c,
                         lp,
                         lq,
-                        8,
+                        bd,
                     );
                     for (i, line) in lines.iter().enumerate() {
                         let yy = (y + i).min(ch - 1);
                         for k in 0..8 {
                             let xx =
                                 (x as isize - 4 + k as isize).clamp(0, cw as isize - 1) as usize;
-                            plane.set(xx, yy, line[k].clamp(0, 255) as u8);
+                            plane.set(xx, yy, line[k].clamp(0, max_val) as u16);
                         }
                     }
                 }
@@ -3182,14 +3230,14 @@ fn apply_deblock(g: &mut Gen<'_>) {
                         tc_c,
                         lp,
                         lq,
-                        8,
+                        bd,
                     );
                     for (i, line) in lines.iter().enumerate() {
                         let xx = (x + i).min(cw - 1);
                         for k in 0..8 {
                             let yy =
                                 (y as isize - 4 + k as isize).clamp(0, ch as isize - 1) as usize;
-                            plane.set(xx, yy, line[k].clamp(0, 255) as u8);
+                            plane.set(xx, yy, line[k].clamp(0, max_val) as u16);
                         }
                     }
                 }
@@ -3216,7 +3264,7 @@ fn apply_sao(g: &mut Gen<'_>) {
             let y0 = gy * ctu;
             let w = ctu.min(g.vis_w - x0);
             let h = ctu.min(g.vis_h - y0);
-            filter::apply_sao_region_bounded(
+            filter::apply_sao_region_bounded_16(
                 &src_y, &mut g.y, x0, y0, w, h, g.vis_w, g.vis_h, sao[0],
             );
             if g.sh.sao_chroma_used {
@@ -3225,10 +3273,10 @@ fn apply_sao(g: &mut Gen<'_>) {
                 let cw_here = (ctu / 2).min(cvis_w.saturating_sub(cx0));
                 let ch_here = (ctu / 2).min(cvis_h.saturating_sub(cy0));
                 if cw_here > 0 && ch_here > 0 {
-                    filter::apply_sao_region_bounded(
+                    filter::apply_sao_region_bounded_16(
                         &src_u, &mut g.u, cx0, cy0, cw_here, ch_here, cvis_w, cvis_h, sao[1],
                     );
-                    filter::apply_sao_region_bounded(
+                    filter::apply_sao_region_bounded_16(
                         &src_v, &mut g.v, cx0, cy0, cw_here, ch_here, cvis_w, cvis_h, sao[2],
                     );
                 }
@@ -3269,6 +3317,7 @@ fn apply_alf(g: &mut Gen<'_>) {
                     ctu.saturating_sub(4),
                     mode,
                     aps,
+                    g.bit_depth,
                 );
             }
             for comp in 1..3usize {
@@ -3298,6 +3347,7 @@ fn apply_alf(g: &mut Gen<'_>) {
                             cvis_h,
                             ctu / 2,
                             (ctu / 2).saturating_sub(2),
+                            g.bit_depth,
                         );
                     }
                 }
@@ -3348,6 +3398,7 @@ fn apply_alf(g: &mut Gen<'_>) {
                     g.vis_w,
                     g.vis_h,
                     ctu,
+                    g.bit_depth,
                 );
             }
         }
@@ -3358,8 +3409,8 @@ fn apply_alf(g: &mut Gen<'_>) {
 /// `filterBlkCcAlf`). The luma tap positions are fixed for `4:2:0`.
 #[allow(clippy::too_many_arguments)]
 fn ccalf_block(
-    src_y: &Plane,
-    chroma: &mut Plane,
+    src_y: &Plane16,
+    chroma: &mut Plane16,
     coeffs: &[i16; 7],
     x0: usize,
     y0: usize,
@@ -3370,7 +3421,11 @@ fn ccalf_block(
     vis_lw: usize,
     vis_lh: usize,
     ctu_l: usize,
+    bit_depth: u8,
 ) {
+    let bd = bit_depth.clamp(8, 12);
+    let max_val = chroma.max_sample();
+    let offset = 1i32 << (bd - 1);
     let lw = vis_lw.min(src_y.width) as isize;
     let lh = vis_lh.min(src_y.height) as isize;
     let get = |x: isize, y: isize| -> i32 {
@@ -3408,18 +3463,17 @@ fn ccalf_block(
             sum += c[4] * (get(lx, below) - cur);
             sum += c[5] * (get(lx + 1, below) - cur);
             sum += c[6] * (get(lx, below2) - cur);
-            let mut v = (sum + 64) >> 7;
-            v = (v + 128).clamp(0, 255) - 128;
+            let v = ((sum + 64) >> 7).clamp(-offset, offset - 1);
             let out = i32::from(chroma.get(x, y)) + v;
-            chroma.set(x, y, out.clamp(0, 255) as u8);
+            chroma.set(x, y, out.clamp(0, max_val) as u16);
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn alf_luma_block(
-    src: &Plane,
-    dst: &mut Plane,
+    src: &Plane16,
+    dst: &mut Plane16,
     x0: usize,
     y0: usize,
     w: usize,
@@ -3430,7 +3484,17 @@ fn alf_luma_block(
     vb_pos: usize,
     mode: AlfLumaMode,
     aps: Option<&super::hls::VvcAlfAps>,
+    bit_depth: u8,
 ) {
+    let bd = bit_depth.clamp(8, 12);
+    let max_val = dst.max_sample();
+    let clip_table = if bd >= 12 {
+        filter::ALF_CLIP_VALS_12BIT
+    } else if bd >= 10 {
+        filter::ALF_CLIP_VALS_10BIT
+    } else {
+        filter::ALF_CLIP_VALS_8BIT
+    };
     let bw = vis_w.min(src.width) as isize;
     let bh = vis_h.min(src.height) as isize;
     let get_src = |x: isize, y: isize| -> i32 {
@@ -3442,7 +3506,7 @@ fn alf_luma_block(
     while by < y0 + h {
         let mut bx = x0;
         while bx < x0 + w {
-            let (class_idx, transpose) = filter::derive_alf_class_4x4_vb(
+            let (class_idx, transpose) = filter::derive_alf_class_4x4_vb_16(
                 src,
                 bx,
                 by,
@@ -3476,7 +3540,6 @@ fn alf_luma_block(
                 }
             };
             let perm = &filter::ALF_TRANSPOSE_PERM[transpose & 3];
-            let clip_table = filter::ALF_CLIP_VALS_8BIT;
             let mut fc = [0i32; 12];
             let mut fclip = [0i32; 12];
             for k in 0..12 {
@@ -3555,7 +3618,7 @@ fn alf_luma_block(
                     }
                     let shift = if near { 10 } else { 7 };
                     let val = cur + ((sum + (1 << (shift - 1))) >> shift);
-                    dst.set(x, y, val.clamp(0, 255) as u8);
+                    dst.set(x, y, val.clamp(0, max_val) as u16);
                 }
             }
             bx += 4;
@@ -3566,8 +3629,8 @@ fn alf_luma_block(
 
 #[allow(clippy::too_many_arguments)]
 fn alf_chroma_block(
-    src: &Plane,
-    dst: &mut Plane,
+    src: &Plane16,
+    dst: &mut Plane16,
     aps: &super::hls::VvcAlfAps,
     alt: usize,
     x0: usize,
@@ -3578,6 +3641,7 @@ fn alf_chroma_block(
     vis_h: usize,
     vb_h: usize,
     vb_pos: usize,
+    bit_depth: u8,
 ) {
     if aps.chroma_filters.is_empty() {
         return;
@@ -3585,7 +3649,15 @@ fn alf_chroma_block(
     let idx = alt.min(aps.chroma_filters.len() - 1);
     let c = aps.chroma_filters[idx];
     let cl = aps.chroma_clip_idx.get(idx).copied().unwrap_or([0u8; 6]);
-    let table = filter::ALF_CLIP_VALS_8BIT;
+    let bd = bit_depth.clamp(8, 12);
+    let max_val = dst.max_sample();
+    let table = if bd >= 12 {
+        filter::ALF_CLIP_VALS_12BIT
+    } else if bd >= 10 {
+        filter::ALF_CLIP_VALS_10BIT
+    } else {
+        filter::ALF_CLIP_VALS_8BIT
+    };
     let bw = vis_w.min(src.width) as isize;
     let bh = vis_h.min(src.height) as isize;
     let get = |x: isize, y: isize| -> i32 {
@@ -3645,7 +3717,7 @@ fn alf_chroma_block(
             }
             let shift = if near { 10 } else { 7 };
             let val = cur + ((sum + (1 << (shift - 1))) >> shift);
-            dst.set(x, y, val.clamp(0, 255) as u8);
+            dst.set(x, y, val.clamp(0, max_val) as u16);
         }
     }
 }
