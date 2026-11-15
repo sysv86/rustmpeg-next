@@ -1,5 +1,79 @@
 # H.266 / VVC Implementation Status (`rustmpeg-video::vvc`)
 
+## 0d. In-loop filters for the general decode path (2026-11-15)
+
+The general coding-tree decoder now applies the complete in-loop filter chain:
+LMCS (luma inverse mapping and chroma residual scaling), SAO, ALF, CCALF, and
+deblocking. Verified byte-exact (`cmp`, full Y+U+V, 3 frames, QP26,
+`encoder_intra_vtm.cfg`) against VTM 24.0 `DecoderApp` for 64x64 and 128x128
+pictures, using the 3-frame 4:2:0 sources `s64.source.yuv` and
+`ctu128.source.yuv`:
+
+| Stage | 64x64 | 128x128 |
+| :--- | :--- | :--- |
+| base (all filters off) | byte-exact | byte-exact |
+| +LMCS | byte-exact | byte-exact |
+| +SAO | byte-exact | byte-exact |
+| +ALF (no CCALF) | byte-exact | byte-exact |
+| +CCALF | byte-exact | byte-exact |
+| +deblocking (full chain) | byte-exact | byte-exact |
+
+Because the committed general path still has pre-existing reconstruction
+differences unrelated to filtering, these streams disable the orthogonal tools:
+`--MIP=0 --LFNST=0 --MTS=0 --ISP=0 --MRL=0 --LMChroma=0 --JointCbCr=0 --SBT=0`.
+The source for both sizes is 4:2:0 8-bit; the exact commands are in
+[`VERIFICATION_DEBT.md`](../../VERIFICATION_DEBT.md).
+
+Stock `encoder_intra_vtm.cfg` (all tools on) is **not** byte-exact at the first
+combination, `base` with every filter disabled: with only `--LFNST=1` enabled the
+stream differs, and with only `--ISP=1` enabled it differs. The failing
+reconstructions are LFNST-coded `16x8` transform units and ISP prediction
+regions, i.e. decode bugs that predate this change and are not filter stages.
+No filter result is claimed for that stock configuration.
+
+Fixes in this change:
+
+- **LMCS chroma residual scaling** (`filter.rs`, `decode_general.rs`): the chroma
+  residual is scaled with symmetric round-half-up around zero and clipped to
+  `[-256, 255]` first (`AreaBuf<Pel>::scaleSignal(dir = false)`); the previous
+  arithmetic shift rounded negative samples the wrong way. The average reshaped
+  luma is derived once per VPDU from the left/top neighbours of the top-left
+  luma CU (`Reshape::calculateChromaAdjVpduNei`) and cached as the *average*, not
+  as the already-mapped scale. Joint CbCr TUs scale both ICT components whenever
+  the TU is joint (`DecCu.cpp:289-292`).
+- **PDPC for ISP**: planar/DC prediction applies PDPC for ISP sub-partitions of a
+  prediction region of at least `4x4` samples; it was previously skipped for all
+  ISP blocks (`IntraPrediction.cpp:390-411`).
+- **SAO on the visible picture**: SAO regions are clipped to the visible
+  `width x height`, and edge offsets are skipped when a neighbour falls outside
+  the visible picture instead of reading the padded allocation
+  (`SampleAdaptiveOffset.cpp:308-310`, `:453-515`).
+- **ALF**: `clipALF` clips both taps around the current sample, not around each
+  other (`AdaptiveLoopFilter.h:72-75`); the inferred ALF virtual boundary at
+  `CtbSizeY - 4` (luma) and `CtbSizeY/2 - 2` (chroma) is honoured in both
+  classification and filtering, including the `96/64` activity scale and the
+  reduced-precision rounding on the two rows adjacent to the boundary
+  (`AdaptiveLoopFilter.cpp:884-891`, `:992-1002`, `:1251-1272`); boundary reads
+  clamp to the visible picture.
+- **CCALF**: per-CTU `ccAlfFilterControlIdc` is parsed with the Cb/Cr context
+  groups (`CABACReader.cpp:296-330`), each CTU applies the selected APS filter to
+  the ALF-filtered chroma using the pre-ALF luma with the luma virtual-boundary
+  row rules, and the `[-128, 127]` residual clip of `filterBlkCcAlf` is applied.
+- **Chroma deblocking**: the chroma deblock grid is two chroma samples, each
+  decision group spans two lines, chroma beta/tc offsets are taken per component,
+  and `pps_chroma_tool_offsets_present_flag == 0` infers `pps_cb/cr_*_offset_div2`
+  from the luma offsets (`H.266 §7.4.3.6`). Chroma edges not on the 8-sample
+  chroma grid are skipped as in `xEdgeFilterChroma`, and the CTB-row-boundary
+  `maxFilterLengthP == 1, maxFilterLengthQ == 3` case uses the asymmetric
+  `p0/q0/q1/q2` filter (`isChromaHorCTBBoundary`). Luma deblocking is limited to
+  the visible picture.
+- **Slice/PPS syntax**: `sh_cb/cr_beta_offset_div2` and `sh_cb/cr_tc_offset_div2`
+  are now parsed and carried instead of discarded.
+
+The strict 25-case harness (rustmpeg encode → VTM 24.0 `DecoderApp` + VVdeC 3.3
+`vvdecapp`) is **50/50** after these changes. The full 266-check matrix was not
+re-run.
+
 ## 0c. Chroma dual-tree, CCLM and JCCR (2026-11-13)
 
 The general coding-tree decoder (`decode_general.rs`) now closes the chroma half

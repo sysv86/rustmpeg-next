@@ -125,7 +125,6 @@ impl LmcsReshaper {
             inv_lut,
         }
     }
-
     /// Map a luma plane forward into the reshaped domain (`Reshape.cpp:307-311`).
     pub fn apply_forward_plane(&self, plane: &mut Plane) {
         for s in &mut plane.data {
@@ -155,11 +154,20 @@ impl LmcsReshaper {
     }
 
     /// Scale a chroma residual block in-place using the LMCS chroma residual scale
-    /// (`H.266 §8.7.5.3 Eq. 1222`).
+    /// (`H.266 §8.7.5.3 Eq. 1222`, VTM `AreaBuf<Pel>::scaleSignal` with `dir == false`).
+    ///
+    /// The inverse signal scaling of `Buffer.cpp:400-410` is symmetric around
+    /// zero: the residual is first clipped to `[-maxAbs-1, maxAbs]`, then scaled
+    /// by magnitude with round-half-up, and the sign is restored. A plain
+    /// arithmetic shift of the signed product rounds towards negative infinity
+    /// and therefore does not match VTM for negative residuals.
     pub fn scale_chroma_residual(&self, residual: &mut [i32], avg_luma: i32) {
         let scale = self.chroma_scale_for_luma(avg_luma);
         for r in residual.iter_mut() {
-            *r = ((*r * scale) + (1 << (LMCS_FP_PREC - 1))) >> LMCS_FP_PREC;
+            let v = (*r).clamp(-256, 255);
+            let sign = if v < 0 { -1 } else { 1 };
+            let abs = v.abs();
+            *r = sign * ((abs * scale + (1 << (LMCS_FP_PREC - 1))) >> LMCS_FP_PREC);
         }
     }
 }
@@ -901,6 +909,7 @@ pub fn deblock_chroma_edge(
     max_len_p: usize,
     max_len_q: usize,
     bit_depth: u8,
+    ctb_boundary: bool,
 ) {
     if bs == 0 || !matches!(lines.len(), 2 | 4) {
         return;
@@ -957,7 +966,12 @@ pub fn deblock_chroma_edge(
     for line in lines.iter_mut() {
         match (len_p, len_q) {
             (3, 3) => chroma_strong_line(line, tc, max_val),
-            (1, 3) => chroma_weak_line_p1q3(line, tc, max_val),
+            // `maxFilterLengthP == 1, maxFilterLengthQ == 3` is VTM's
+            // CTB-row-boundary chroma strong filter, which updates only
+            // `p0, q0, q1, q2` (`DeblockingFilter.cpp:1593-1601`,
+            // `xPelFilterChroma` with `isChromaHorCTBBoundary`). Away from a
+            // CTB row boundary the weak filter is used instead.
+            (1, 3) if ctb_boundary => chroma_weak_line_p1q3(line, tc, max_val),
             _ => chroma_weak_line(line, tc, max_val),
         }
     }
@@ -988,7 +1002,8 @@ fn chroma_strong_line(line: &mut [i32; 8], tc: i32, max_val: i32) {
 }
 
 /// Asymmetric chroma filter with `maxFilterLengthP = 1`, `maxFilterLengthQ = 3`,
-/// H.266 Eq. 1417-1420.
+/// H.266 Eq. 1417-1420; this is the CTB-row-boundary strong filter of VTM
+/// `xPelFilterChroma` (only `p0, q0, q1, q2` are modified).
 fn chroma_weak_line_p1q3(line: &mut [i32; 8], tc: i32, max_val: i32) {
     let m = *line;
     let clip = |orig: i32, val: i32| val.clamp(orig - tc, orig + tc).clamp(0, max_val);
@@ -1033,6 +1048,7 @@ pub fn deblock_chroma_edge_region(
     max_len_p: usize,
     max_len_q: usize,
     sub_sample_c: usize,
+    ctb_boundary: bool,
 ) {
     let group = if sub_sample_c == 2 { 2 } else { 4 };
     let limit = if vertical { plane.width } else { plane.height };
@@ -1061,6 +1077,7 @@ pub fn deblock_chroma_edge_region(
             max_len_p,
             max_len_q,
             8,
+            ctb_boundary,
         );
         for (k, line) in lines.iter().take(group).enumerate() {
             for (i, &sample) in line.iter().enumerate() {
@@ -1123,6 +1140,7 @@ pub fn deblock_chroma_plane(
                 len,
                 len,
                 8,
+                false,
             );
             for (k, line) in lines.iter().take(group_v).enumerate() {
                 for (i, &sample) in line.iter().enumerate() {
@@ -1160,6 +1178,7 @@ pub fn deblock_chroma_plane(
                 len_p,
                 len_q,
                 8,
+                y.is_multiple_of(ctb),
             );
             for (k, line) in lines.iter().take(group_h).enumerate() {
                 for (i, &sample) in line.iter().enumerate() {
@@ -1202,8 +1221,11 @@ pub enum SaoType {
     },
 }
 
-/// Apply SAO to a CTU region `(bx, by, w, h)` reading from `src` and writing to `dst`
-/// (`SampleAdaptiveOffset::offsetBlock`, `SampleAdaptiveOffset.cpp:285-540`).
+/// Apply one SAO type over the region `bx..bx+w`, `by..by+h`, using the whole
+/// plane as the source for neighbour samples.
+///
+/// Normative source: ITU-T Rec. H.266 §8.8.4.2–§8.8.4.3 (PDF pp. 455–460);
+/// VTM `SampleAdaptiveOffset.cpp:291-525` (`offsetBlock`).
 pub fn apply_sao_region(
     src: &Plane,
     dst: &mut Plane,
@@ -1211,6 +1233,28 @@ pub fn apply_sao_region(
     by: usize,
     w: usize,
     h: usize,
+    sao: SaoType,
+) {
+    apply_sao_region_bounded(src, dst, bx, by, w, h, src.width, src.height, sao);
+}
+
+/// Apply one SAO type over a region of a picture whose visible extent is
+/// `bw x bh`.
+///
+/// Samples on the picture boundary are left unchanged when either neighbour of
+/// an edge-offset class falls outside the visible picture
+/// (`SampleAdaptiveOffset.cpp:308-310`, `:453-455`, `:472-475`, `:513-515`).
+/// Using the padded allocation instead would read undefined border samples.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_sao_region_bounded(
+    src: &Plane,
+    dst: &mut Plane,
+    bx: usize,
+    by: usize,
+    w: usize,
+    h: usize,
+    bw: usize,
+    bh: usize,
     sao: SaoType,
 ) {
     match sao {
@@ -1239,8 +1283,8 @@ pub fn apply_sao_region(
                 2 => (1, 1),
                 _ => (-1, 1),
             };
-            let pw = src.width as isize;
-            let ph = src.height as isize;
+            let pw = bw.min(src.width) as isize;
+            let ph = bh.min(src.height) as isize;
 
             for y in by..(by + h).min(src.height) {
                 for x in bx..(bx + w).min(src.width) {
@@ -1440,12 +1484,45 @@ pub const ALF_CLIP_VALS_8BIT: [i32; 4] = [256, 32, 8, 2];
 /// Derive the ALF class index (`0..25`) and transpose index (`0..4`) for a `4x4` luma
 /// block at `(bx, by)` using the 1D Laplacian gradients (`AdaptiveLoopFilter.cpp:829-1045`).
 pub fn derive_alf_class_4x4(plane: &Plane, bx: usize, by: usize) -> (usize, usize) {
+    derive_alf_class_4x4_bounded(plane, bx, by, plane.width, plane.height)
+}
+
+/// Derive the ALF class and transpose index for a `4x4` luma block while
+/// clamping neighbour reads to the visible picture extent `bw x bh`
+/// (VTM extends the picture border by `MAX_ALF_FILTER_LENGTH >> 1` samples
+/// before classification, `AdaptiveLoopFilter.cpp:391`). The ALF virtual
+/// boundary at `vb_pos` samples from the top of each `vb_h`-high CTU row is
+/// not crossed (`AdaptiveLoopFilter.cpp:884-891`).
+pub fn derive_alf_class_4x4_bounded(
+    plane: &Plane,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+) -> (usize, usize) {
+    derive_alf_class_4x4_vb(plane, bx, by, bw, bh, 0, 0)
+}
+
+/// Derive the ALF class and transpose index with the inferred ALF virtual
+/// boundary active (`vb_h == 0` disables the boundary handling).
+#[allow(clippy::too_many_arguments)]
+pub fn derive_alf_class_4x4_vb(
+    plane: &Plane,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+    vb_h: usize,
+    vb_pos: usize,
+) -> (usize, usize) {
     const TH: [usize; 16] = [0, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4];
     const TRANSPOSE_TABLE: [usize; 8] = [0, 1, 0, 2, 2, 3, 1, 3];
 
+    let lw = bw.min(plane.width) as isize;
+    let lh = bh.min(plane.height) as isize;
     let get_p = |x: isize, y: isize| -> i32 {
-        let cx = x.clamp(0, plane.width as isize - 1) as usize;
-        let cy = y.clamp(0, plane.height as isize - 1) as usize;
+        let cx = x.clamp(0, lw - 1) as usize;
+        let cy = y.clamp(0, lh - 1) as usize;
         i32::from(plane.get(cx, cy))
     };
 
@@ -1454,27 +1531,63 @@ pub fn derive_alf_class_4x4(plane: &Plane, bx: usize, by: usize) -> (usize, usiz
     let mut sum_d0 = 0i32;
     let mut sum_d1 = 0i32;
 
+    let cls_row_vb = if vb_h > 0 && by % vb_h == vb_pos.wrapping_sub(4) {
+        1 // use rows dy = -2, 0, 2
+    } else if vb_h > 0 && by % vb_h == vb_pos {
+        2 // use rows dy = 0, 2, 4
+    } else {
+        0
+    };
     for dy in (-2..6isize).step_by(2) {
+        if (cls_row_vb == 1 && dy == 4) || (cls_row_vb == 2 && dy == -2) {
+            continue;
+        }
         for dx in (-2..6isize).step_by(2) {
             let x = bx as isize + dx;
             let y = by as isize + dy;
+            // ALF virtual boundary: do not let the 3-tap Laplacian cross the
+            // boundary at `vb_pos` samples from the top of a `vb_h`-high CTU row
+            // (`AdaptiveLoopFilter.cpp:884-891`).
+            let (down, up, up2) = if vb_h > 0 && y > 0 {
+                let yy = (y as usize) % vb_h;
+                if vb_pos >= 2 && yy == vb_pos - 2 {
+                    (y - 1, y + 1, y + 1)
+                } else if yy == vb_pos {
+                    (y, y + 1, y + 2)
+                } else {
+                    (y - 1, y + 1, y + 2)
+                }
+            } else {
+                (y - 1, y + 1, y + 2)
+            };
             let y0 = get_p(x, y) << 1;
             let yup1 = get_p(x + 1, y + 1) << 1;
 
-            sum_v += (y0 - get_p(x, y - 1) - get_p(x, y + 1)).abs()
-                + (yup1 - get_p(x + 1, y) - get_p(x + 1, y + 2)).abs();
+            sum_v += (y0 - get_p(x, down) - get_p(x, up)).abs()
+                + (yup1 - get_p(x + 1, y) - get_p(x + 1, up2)).abs();
             sum_h += (y0 - get_p(x + 1, y) - get_p(x - 1, y)).abs()
                 + (yup1 - get_p(x + 2, y + 1) - get_p(x, y + 1)).abs();
-            sum_d0 += (y0 - get_p(x - 1, y - 1) - get_p(x + 1, y + 1)).abs()
-                + (yup1 - get_p(x, y) - get_p(x + 2, y + 2)).abs();
-            sum_d1 += (y0 - get_p(x - 1, y + 1) - get_p(x + 1, y - 1)).abs()
-                + (yup1 - get_p(x, y + 2) - get_p(x + 2, y)).abs();
+            sum_d0 += (y0 - get_p(x - 1, down) - get_p(x + 1, up)).abs()
+                + (yup1 - get_p(x, y) - get_p(x + 2, up2)).abs();
+            sum_d1 += (y0 - get_p(x - 1, up) - get_p(x + 1, down)).abs()
+                + (yup1 - get_p(x, up2) - get_p(x + 2, y)).abs();
         }
     }
 
     let temp_act = sum_v + sum_h;
-    // shift = bitDepth + 4 = 12 for 8-bit
-    let activity = ((temp_act * 64) >> 12).clamp(0, 15) as usize;
+    // shift = bitDepth + 4 = 12 for 8-bit; rows adjacent to the virtual
+    // boundary use a 96/64 scaling (`AdaptiveLoopFilter.cpp:992-1002`).
+    let activity_scale = if vb_h > 0 && vb_pos >= 4 {
+        let yy = by % vb_h;
+        if yy == vb_pos - 4 || yy == vb_pos {
+            96
+        } else {
+            64
+        }
+    } else {
+        64
+    };
+    let activity = ((temp_act * activity_scale) >> 12).clamp(0, 15) as usize;
     let mut class_idx = TH[activity];
 
     let (hv1, hv0, dir_temp_hv) = if sum_v > sum_h {
@@ -2204,6 +2317,7 @@ pub fn deblock_chroma_plane_16(
                 len,
                 len,
                 bd,
+                false,
             );
             for (k, line) in lines.iter().take(group_v).enumerate() {
                 for (i, &sample) in line.iter().enumerate() {
@@ -2241,6 +2355,7 @@ pub fn deblock_chroma_plane_16(
                 len_p,
                 len_q,
                 bd,
+                y.is_multiple_of(ctb),
             );
             for (k, line) in lines.iter().take(group_h).enumerate() {
                 for (i, &sample) in line.iter().enumerate() {

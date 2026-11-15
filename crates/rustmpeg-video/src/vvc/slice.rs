@@ -2394,6 +2394,7 @@ fn apply_inter_loop_filters(
                         chroma_len,
                         chroma_len,
                         2,
+                        false,
                     );
                 }
 
@@ -2424,6 +2425,7 @@ fn apply_inter_loop_filters(
                         chroma_len,
                         chroma_len,
                         2,
+                        false,
                     );
                 }
             }
@@ -2513,6 +2515,7 @@ fn apply_inter_loop_filters(
                         1,
                         chroma_len,
                         2,
+                        cy.is_multiple_of(ctu / 2),
                     );
                 }
 
@@ -2543,6 +2546,7 @@ fn apply_inter_loop_filters(
                         1,
                         chroma_len,
                         2,
+                        cy.is_multiple_of(ctu / 2),
                     );
                 }
             }

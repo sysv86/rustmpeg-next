@@ -1,7 +1,65 @@
 # Verification Debt (`rustmpeg-next` H.266/VVC)
 
-Last updated: 2026-11-13 (general intra decoder verification; 266-check matrix last run 2026-10-28).
+Last updated: 2026-11-15 (general in-loop filter chain; 266-check matrix last run 2026-10-28).
 
+## 0b. General in-loop filter verification (2026-11-15)
+
+Executed after enabling LMCS, SAO, ALF, CCALF, and deblocking in the general
+coding-tree decoder. Oracles: VTM 24.0 `DecoderApp` (`-d 8`) and VVdeC 3.3
+`vvdecapp`; `rustmpeg` decoder: `target/release/examples/vvc_stateful_decode`.
+
+Sources (4:2:0, 8-bit, 3 frames): `~/vvc-conf/s64.source.yuv` (64x64) and
+`~/vvc-conf-full/ctu128.source.yuv` (128x128).
+
+Encoder (`encoder_intra_vtm.cfg`, QP26, `--InternalBitDepth=8`,
+`--TemporalSubsampleRatio=1 --FrameRate=30 -f 3`), with the orthogonal tools
+disabled so that the pre-filter reconstruction is byte-exact:
+
+```bash
+TOOLS="--MIP=0 --LFNST=0 --MTS=0 --ISP=0 --MRL=0 --LMChroma=0 --JointCbCr=0 --SBT=0"
+BASE="--DeblockingFilterDisable=1 --SAO=0 --ALF=0 --CCALF=0 --LMCSEnable=0"
+# lmcs: $BASE with --LMCSEnable=1
+# sao:  $BASE with --SAO=1 --LMCSEnable=1
+# alf:  $BASE with --SAO=1 --ALF=1 --LMCSEnable=1
+# ccalf:$BASE with --SAO=1 --ALF=1 --CCALF=1 --LMCSEnable=1
+# db:   --DeblockingFilterDisable=0 --SAO=1 --ALF=1 --CCALF=1 --LMCSEnable=1
+```
+
+Result (`cmp` on full Y+U+V, 3 frames, both picture sizes):
+
+```text
+base/64   OK    base/128   OK
+lmcs/64   OK    lmcs/128   OK
+sao/64    OK    sao/128    OK
+alf/64    OK    alf/128    OK
+ccalf/64  OK    ccalf/128  OK
+db/64     OK    db/128     OK
+```
+
+The same twelve combinations were reproduced byte-exactly on a second 3-frame
+source (64x64 and 128x128, VTM `EncoderApp`, same flags).
+
+Stock configuration without the tool isolation flags is **not** byte-exact at
+the first combination (`base`, every filter disabled). The first failing cases
+are streams where only one of the following tools is re-enabled:
+
+- `--LFNST=1`: mismatch in a `16x8` transform unit with `lfnst_idx == 2`;
+- `--ISP=1`: mismatch in an ISP prediction region.
+
+Both are pre-existing reconstruction defects outside the filter stages; the
+filters are not implicated because they are disabled in those streams. Do not
+claim filter conformance for the full-tool stock configuration until these are
+fixed.
+
+Other results in this run:
+
+- `cargo fmt --all -- --check`: OK.
+- `cargo clippy --workspace --all-targets -- -D warnings`: OK.
+- `cargo test --workspace`: OK.
+- `python3 scripts/check-licenses.py`: OK (all packages permissive).
+- Strict 25-case harness (`run_conformance.sh`, VTM 24.0 + VVdeC 3.3):
+  **50/50** (25 cases on both decoders), including the inter P cases with
+  deblocking after the chroma CTB-boundary filter fix.
 
 ## 0a. General intra decoder verification (2026-11-13)
 

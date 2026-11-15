@@ -2425,6 +2425,14 @@ pub fn parse_full_pps_rbsp(rbsp: &[u8]) -> Result<VvcPps, VvcError> {
                 cb_tc_offset_div2 = hls_bit("PPS", br.read_se())?;
                 cr_beta_offset_div2 = hls_bit("PPS", br.read_se())?;
                 cr_tc_offset_div2 = hls_bit("PPS", br.read_se())?;
+            } else {
+                // H.266 §7.4.3.6: when `pps_chroma_tool_offsets_present_flag`
+                // is 0 the chroma deblocking offsets are inferred equal to the
+                // luma ones.
+                cb_beta_offset_div2 = luma_beta_offset_div2;
+                cb_tc_offset_div2 = luma_tc_offset_div2;
+                cr_beta_offset_div2 = luma_beta_offset_div2;
+                cr_tc_offset_div2 = luma_tc_offset_div2;
             }
         }
     }
@@ -3405,6 +3413,14 @@ pub struct VvcSliceHeader {
     pub luma_beta_offset_div2: i32,
     /// `sh_luma_tc_offset_div2`.
     pub luma_tc_offset_div2: i32,
+    /// `sh_cb_beta_offset_div2` (defaults to the PPS value).
+    pub cb_beta_offset_div2: i32,
+    /// `sh_cb_tc_offset_div2` (defaults to the PPS value).
+    pub cb_tc_offset_div2: i32,
+    /// `sh_cr_beta_offset_div2` (defaults to the PPS value).
+    pub cr_beta_offset_div2: i32,
+    /// `sh_cr_tc_offset_div2` (defaults to the PPS value).
+    pub cr_tc_offset_div2: i32,
     /// `sh_dep_quant_used_flag`.
     pub dep_quant_used: bool,
     /// `sh_sign_data_hiding_used_flag`.
@@ -3448,6 +3464,10 @@ impl Default for VvcSliceHeader {
             deblocking_disabled: true,
             luma_beta_offset_div2: 0,
             luma_tc_offset_div2: 0,
+            cb_beta_offset_div2: 0,
+            cb_tc_offset_div2: 0,
+            cr_beta_offset_div2: 0,
+            cr_tc_offset_div2: 0,
             dep_quant_used: false,
             sign_data_hiding_used: false,
             ts_residual_coding_disabled: false,
@@ -3803,6 +3823,10 @@ pub fn parse_full_slice_header(
     let mut deblocking_disabled = pps.deblocking_disabled;
     let mut luma_beta_offset_div2 = pps.luma_beta_offset_div2;
     let mut luma_tc_offset_div2 = pps.luma_tc_offset_div2;
+    let mut cb_beta_offset_div2 = pps.cb_beta_offset_div2;
+    let mut cb_tc_offset_div2 = pps.cb_tc_offset_div2;
+    let mut cr_beta_offset_div2 = pps.cr_beta_offset_div2;
+    let mut cr_tc_offset_div2 = pps.cr_tc_offset_div2;
     if pps.deblocking_control_present && pps.deblocking_override_enabled && !pps.dbf_info_in_ph {
         if hls_bit("SH", br.read_bit())? {
             if !pps.deblocking_disabled {
@@ -3812,10 +3836,10 @@ pub fn parse_full_slice_header(
                 luma_beta_offset_div2 = hls_bit("SH", br.read_se())?;
                 luma_tc_offset_div2 = hls_bit("SH", br.read_se())?;
                 if pps.chroma_tool_offsets_present {
-                    let _ = hls_bit("SH", br.read_se())?;
-                    let _ = hls_bit("SH", br.read_se())?;
-                    let _ = hls_bit("SH", br.read_se())?;
-                    let _ = hls_bit("SH", br.read_se())?;
+                    cb_beta_offset_div2 = hls_bit("SH", br.read_se())?;
+                    cb_tc_offset_div2 = hls_bit("SH", br.read_se())?;
+                    cr_beta_offset_div2 = hls_bit("SH", br.read_se())?;
+                    cr_tc_offset_div2 = hls_bit("SH", br.read_se())?;
                 }
             }
         }
@@ -3911,6 +3935,10 @@ pub fn parse_full_slice_header(
             deblocking_disabled,
             luma_beta_offset_div2,
             luma_tc_offset_div2,
+            cb_beta_offset_div2,
+            cb_tc_offset_div2,
+            cr_beta_offset_div2,
+            cr_tc_offset_div2,
             dep_quant_used,
             sign_data_hiding_used,
             ts_residual_coding_disabled,
@@ -4983,6 +5011,12 @@ mod tests {
             deblocking_disabled: false,
             luma_beta_offset_div2: -1,
             luma_tc_offset_div2: 1,
+            // `pps_chroma_tool_offsets_present_flag` is 0, so the chroma
+            // deblocking offsets are inferred equal to the luma ones.
+            cb_beta_offset_div2: -1,
+            cb_tc_offset_div2: 1,
+            cr_beta_offset_div2: -1,
+            cr_tc_offset_div2: 1,
             ..VvcPps::default()
         };
         let pps_rbsp = build_full_pps_rbsp(&pps);

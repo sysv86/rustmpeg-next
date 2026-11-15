@@ -362,6 +362,9 @@ struct Gen<'a> {
     alf_luma: Vec<Option<AlfLumaMode>>,
     alf_cb: Vec<Option<usize>>,
     alf_cr: Vec<Option<usize>>,
+    /// Per-CTU CCALF filter index (`0` = off) for Cb and Cr.
+    ccalf_cb: Vec<u8>,
+    ccalf_cr: Vec<u8>,
     /// Luma transform-block boundaries: per 4x4 cell id, u32::MAX = none.
     tu_y: Vec<u32>,
     tu_u: Vec<u32>,
@@ -766,17 +769,19 @@ pub(crate) fn decode_general_intra_picture(
         alf_luma: vec![None; ctu_cols * ctu_rows],
         alf_cb: vec![None; ctu_cols * ctu_rows],
         alf_cr: vec![None; ctu_cols * ctu_rows],
+        ccalf_cb: vec![0; ctu_cols * ctu_rows],
+        ccalf_cr: vec![0; ctu_cols * ctu_rows],
         tu_y_w: lgrid_w,
         tu_y_h: lgrid_h,
-        tu_c_w: cgrid_w.div_ceil(4),
-        tu_c_h: cgrid_h.div_ceil(4),
+        tu_c_w: cgrid_w.div_ceil(2),
+        tu_c_h: cgrid_h.div_ceil(2),
         tu_y: vec![u32::MAX; lgrid_w * lgrid_h],
-        tu_u: vec![u32::MAX; cgrid_w.div_ceil(4) * cgrid_h.div_ceil(4)],
-        tu_v: vec![u32::MAX; cgrid_w.div_ceil(4) * cgrid_h.div_ceil(4)],
+        tu_u: vec![u32::MAX; cgrid_w.div_ceil(2) * cgrid_h.div_ceil(2)],
+        tu_v: vec![u32::MAX; cgrid_w.div_ceil(2) * cgrid_h.div_ceil(2)],
         tu_wy: vec![0; lgrid_w * lgrid_h],
         tu_hy: vec![0; lgrid_w * lgrid_h],
-        tu_wc: vec![0; cgrid_w.div_ceil(4) * cgrid_h.div_ceil(4)],
-        tu_hc: vec![0; cgrid_w.div_ceil(4) * cgrid_h.div_ceil(4)],
+        tu_wc: vec![0; cgrid_w.div_ceil(2) * cgrid_h.div_ceil(2)],
+        tu_hc: vec![0; cgrid_w.div_ceil(2) * cgrid_h.div_ceil(2)],
         dec_y: vec![false; lgrid_w * lgrid_h],
         dec_c: vec![false; cgrid_w * cgrid_h],
         next_tu_id: 0,
@@ -1145,6 +1150,60 @@ fn decode_alf_ctu(
                 g.alf_cb[idx] = Some(alt);
             } else {
                 g.alf_cr[idx] = Some(alt);
+            }
+        }
+    }
+    if g.sps.ccalf_enabled && g.sh.alf_enabled {
+        for comp in 1..3usize {
+            let aps_id = if comp == 1 {
+                g.sh.cc_alf_cb_aps_id
+            } else {
+                g.sh.cc_alf_cr_aps_id
+            };
+            let Some(aps_id) = aps_id else { continue };
+            let count = g.aps.alf[usize::from(aps_id & 7)].as_ref().map_or(0, |a| {
+                if comp == 1 {
+                    a.cc_cb_filters.len()
+                } else {
+                    a.cc_cr_filters.len()
+                }
+            });
+            if count == 0 {
+                continue;
+            }
+            // VTM `CABACReader.cpp:296-330` (`ccAlfFilterControlIdc`).
+            let left_on = if gx > 0 {
+                let v = if comp == 1 {
+                    g.ccalf_cb[idx - 1]
+                } else {
+                    g.ccalf_cr[idx - 1]
+                };
+                v != 0
+            } else {
+                false
+            };
+            let up_on = if gy > 0 {
+                let v = if comp == 1 {
+                    g.ccalf_cb[idx - g.ctu_cols]
+                } else {
+                    g.ccalf_cr[idx - g.ctu_cols]
+                };
+                v != 0
+            } else {
+                false
+            };
+            let ctxt = usize::from(left_on) + usize::from(up_on) + if comp == 2 { 3 } else { 0 };
+            let mut idc =
+                u8::from(dec.decode_bin(&mut ctx.models[ctx::CC_ALF_FILTER_CONTROL_FLAG + ctxt]));
+            if idc != 0 {
+                while usize::from(idc) != count && dec.decode_bin_ep() {
+                    idc += 1;
+                }
+            }
+            if comp == 1 {
+                g.ccalf_cb[idx] = idc;
+            } else {
+                g.ccalf_cr[idx] = idc;
             }
         }
     }
@@ -1980,23 +2039,13 @@ fn reconstruct_joint_cbcr(
         }
     }
     if g.lmcs_on && g.ph.chroma_residual_scale && (cb.cbf || cr.cbf) && cw * ch > 4 {
-        let avg_cb = if cb.cbf {
-            Some(chroma_adj_luma(g, cb))
-        } else {
-            None
-        };
-        let avg_cr = if cr.cbf {
-            Some(chroma_adj_luma(g, cr))
-        } else {
-            None
-        };
+        // VTM `DecCu.cpp:289-292`: with `tu.jointCbCr != 0` both chroma
+        // residuals are scaled, including the component derived by ICT whose
+        // own CBF may be zero.
+        let avg = chroma_adj_luma(g, cb);
         if let Some(r) = &g.lmcs {
-            if let Some(avg) = avg_cb {
-                r.scale_chroma_residual(&mut res_cb, avg);
-            }
-            if let Some(avg) = avg_cr {
-                r.scale_chroma_residual(&mut res_cr, avg);
-            }
+            r.scale_chroma_residual(&mut res_cb, avg);
+            r.scale_chroma_residual(&mut res_cr, avg);
         }
     }
     for y in 0..ch {
@@ -2715,7 +2764,7 @@ fn predict_luma(
                 base_refs.clone()
             };
             let mut p = predict::predict_planar(&used, w, h);
-            if mrl == 0 && !isp {
+            if mrl == 0 && w >= 4 && h >= 4 {
                 predict::apply_pdpc(&mut p, &used, w, h);
             }
             p
@@ -2728,7 +2777,7 @@ fn predict_luma(
                     base_refs.clone()
                 };
             let mut p = predict::predict_dc(&used, w, h);
-            if mrl == 0 && !isp {
+            if mrl == 0 && w >= 4 && h >= 4 {
                 predict::apply_pdpc(&mut p, &used, w, h);
             }
             p
@@ -2811,8 +2860,8 @@ fn chroma_adj_luma(g: &mut Gen<'_>, t: &TuData) -> i32 {
     let vpdu = if g.ctu == 128 { 64 } else { g.ctu };
     let vx = (t.x / vpdu) * vpdu;
     let vy = (t.y / vpdu) * vpdu;
-    if let Some(&scale) = g.vpdu_scale.get(&(vx, vy)) {
-        return scale;
+    if let Some(&avg) = g.vpdu_scale.get(&(vx, vy)) {
+        return avg;
     }
     let n = 64usize.min(vpdu);
     let mut sum = 0i32;
@@ -2837,12 +2886,8 @@ fn chroma_adj_luma(g: &mut Gen<'_>, t: &TuData) -> i32 {
         c if c == 2 * n => (sum + (1 << n.trailing_zeros())) >> (n.trailing_zeros() + 1),
         _ => 128,
     };
-    let scale = g
-        .lmcs
-        .as_ref()
-        .map_or(1 << 11, |r| r.chroma_scale_for_luma(avg));
-    g.vpdu_scale.insert((vx, vy), scale);
-    scale
+    g.vpdu_scale.insert((vx, vy), avg);
+    avg
 }
 
 fn mark_tu(g: &mut Gen<'_>, t: &TuData) {
@@ -2885,9 +2930,12 @@ fn mark_tu(g: &mut Gen<'_>, t: &TuData) {
             t.h / 2,
         )
     };
-    for yy in y..(y + h).min(mh * 4) {
-        for xx in x..(x + w).min(mw * 4) {
-            let cell = (yy / 4) * mw + xx / 4;
+    // Chroma deblocking uses a 2-sample grid (4 luma samples at 4:2:0); the
+    // luma grid is 4 samples (`LOG_GRID_SIZE = 2`, VTM `DeblockingFilter.h:55`).
+    let cell_size = if t.component == 0 { 4 } else { 2 };
+    for yy in y..(y + h).min(mh * cell_size) {
+        for xx in x..(x + w).min(mw * cell_size) {
+            let cell = (yy / cell_size) * mw + xx / cell_size;
             if cell < map.len() {
                 map[cell] = id;
                 wmap[cell] = w as u16;
@@ -2928,8 +2976,8 @@ fn apply_deblock(g: &mut Gen<'_>) {
     let qp_y = i32::from(g.qp_y.clamp(0, 63)) as u8;
     let beta = g.sh.luma_beta_offset_div2 as i8;
     let tc = g.sh.luma_tc_offset_div2 as i8;
-    let w = g.pic_w;
-    let h = g.pic_h;
+    let w = g.vis_w;
+    let h = g.vis_h;
     // Luma vertical edges.
     let mut x = 4usize;
     while x < w {
@@ -3008,28 +3056,45 @@ fn apply_deblock(g: &mut Gen<'_>) {
         y += 4;
     }
     // Chroma.
+    let cvis_w = g.vis_w.div_ceil(2);
+    let cvis_h = g.vis_h.div_ceil(2);
     for comp in 1..3usize {
         let qp = if comp == 1 { g.qp_cb } else { g.qp_cr };
         let qp = qp.clamp(0, 63) as u8;
+        let (beta_c, tc_c) = if comp == 1 {
+            (g.sh.cb_beta_offset_div2 as i8, g.sh.cb_tc_offset_div2 as i8)
+        } else {
+            (g.sh.cr_beta_offset_div2 as i8, g.sh.cr_tc_offset_div2 as i8)
+        };
         let (plane, wmap, hmap, cmap, cw, ch, tuw, tuh) = if comp == 1 {
             (
-                &mut g.u, &g.tu_wc, &g.tu_hc, &g.tu_u, g.cgrid_w, g.cgrid_h, g.tu_c_w, g.tu_c_h,
+                &mut g.u, &g.tu_wc, &g.tu_hc, &g.tu_u, cvis_w, cvis_h, g.tu_c_w, g.tu_c_h,
             )
         } else {
             (
-                &mut g.v, &g.tu_wc, &g.tu_hc, &g.tu_v, g.cgrid_w, g.cgrid_h, g.tu_c_w, g.tu_c_h,
+                &mut g.v, &g.tu_wc, &g.tu_hc, &g.tu_v, cvis_w, cvis_h, g.tu_c_w, g.tu_c_h,
             )
         };
-        let mut x = 4usize;
+        // Chroma edges live on a 2-sample grid (4 luma samples at 4:2:0) and
+        // each decision group spans two samples along the edge
+        // (VTM `xEdgeFilterChroma`, `loopLength = pelsInPartChromaV = 2`).
+        let mut x = 2usize;
         while x < cw {
             let mut y = 0usize;
-            while y < ch {
-                let lc = (y / 4) * tuw + (x / 4 - 1);
-                let rc = (y / 4) * tuw + x / 4;
+            // VTM `xEdgeFilterChroma` skips chroma edges that are not on the
+            // 8-sample chroma grid when the minimum chroma part is smaller than
+            // `GRID_SIZE_CHR` (`DeblockingFilter.cpp:1221-1229`).
+            if (2 * x) % 16 != 0 {
+                x += 2;
+                continue;
+            }
+            while y + 2 <= ch {
+                let lc = (y / 2) * tuw + (x / 2 - 1);
+                let rc = (y / 2) * tuw + x / 2;
                 if cmap[lc] != u32::MAX && cmap[rc] != u32::MAX && cmap[lc] != cmap[rc] {
                     let lp = chroma_len(wmap[lc]);
                     let lq = chroma_len(wmap[rc]);
-                    let mut lines = [[0i32; 8]; 4];
+                    let mut lines = [[0i32; 8]; 2];
                     for (i, line) in lines.iter_mut().enumerate() {
                         let yy = (y + i).min(ch - 1);
                         for (k, v) in line.iter_mut().enumerate() {
@@ -3038,7 +3103,17 @@ fn apply_deblock(g: &mut Gen<'_>) {
                             *v = i32::from(plane.get(xx, yy));
                         }
                     }
-                    filter::deblock_chroma_edge(&mut lines, i32::from(qp), 2, 0, 0, lp, lq, 8);
+                    filter::deblock_chroma_edge(
+                        &mut lines,
+                        i32::from(qp),
+                        2,
+                        beta_c,
+                        tc_c,
+                        lp,
+                        lq,
+                        8,
+                        false,
+                    );
                     for (i, line) in lines.iter().enumerate() {
                         let yy = (y + i).min(ch - 1);
                         for k in 0..8 {
@@ -3048,20 +3123,24 @@ fn apply_deblock(g: &mut Gen<'_>) {
                         }
                     }
                 }
-                y += 4;
+                y += 2;
             }
-            x += 4;
+            x += 2;
         }
-        let mut y = 4usize;
+        let mut y = 2usize;
         while y < ch {
+            if (2 * y) % 16 != 0 {
+                y += 2;
+                continue;
+            }
             let mut x = 0usize;
-            while x < cw {
-                let tc_cell = ((y / 4 - 1) * tuw) + x / 4;
-                let bc = (y / 4) * tuw + x / 4;
+            while x + 2 <= cw {
+                let tc_cell = ((y / 2 - 1) * tuw) + x / 2;
+                let bc = (y / 2) * tuw + x / 2;
                 if cmap[tc_cell] != u32::MAX && cmap[bc] != u32::MAX && cmap[tc_cell] != cmap[bc] {
                     let lp = chroma_len(hmap[tc_cell]);
                     let lq = chroma_len(hmap[bc]);
-                    let mut lines = [[0i32; 8]; 4];
+                    let mut lines = [[0i32; 8]; 2];
                     for (i, line) in lines.iter_mut().enumerate() {
                         let xx = (x + i).min(cw - 1);
                         for (k, v) in line.iter_mut().enumerate() {
@@ -3070,7 +3149,17 @@ fn apply_deblock(g: &mut Gen<'_>) {
                             *v = i32::from(plane.get(xx, yy));
                         }
                     }
-                    filter::deblock_chroma_edge(&mut lines, i32::from(qp), 2, 0, 0, lp, lq, 8);
+                    filter::deblock_chroma_edge(
+                        &mut lines,
+                        i32::from(qp),
+                        2,
+                        beta_c,
+                        tc_c,
+                        lp,
+                        lq,
+                        8,
+                        y.is_multiple_of(g.ctu / 2),
+                    );
                     for (i, line) in lines.iter().enumerate() {
                         let xx = (x + i).min(cw - 1);
                         for k in 0..8 {
@@ -3080,9 +3169,9 @@ fn apply_deblock(g: &mut Gen<'_>) {
                         }
                     }
                 }
-                x += 4;
+                x += 2;
             }
-            y += 4;
+            y += 2;
         }
         let _ = tuh;
     }
@@ -3090,37 +3179,33 @@ fn apply_deblock(g: &mut Gen<'_>) {
 
 fn apply_sao(g: &mut Gen<'_>) {
     let ctu = g.ctu;
-    let cw = g.cgrid_w.min(ctu / 2);
-    let ch = g.cgrid_h.min(ctu / 2);
     let src_y = g.y.clone();
     let src_u = g.u.clone();
     let src_v = g.v.clone();
-    for gy in 0..g.pic_h.div_ceil(ctu) {
-        for gx in 0..g.pic_w.div_ceil(ctu) {
+    let cvis_w = g.vis_w.div_ceil(2);
+    let cvis_h = g.vis_h.div_ceil(2);
+    for gy in 0..g.vis_h.div_ceil(ctu) {
+        for gx in 0..g.vis_w.div_ceil(ctu) {
             let idx = gy * g.ctu_cols + gx;
             let sao = g.sao[idx];
-            filter::apply_sao_region(&src_y, &mut g.y, gx * ctu, gy * ctu, ctu, ctu, sao[0]);
+            let x0 = gx * ctu;
+            let y0 = gy * ctu;
+            let w = ctu.min(g.vis_w - x0);
+            let h = ctu.min(g.vis_h - y0);
+            filter::apply_sao_region_bounded(
+                &src_y, &mut g.y, x0, y0, w, h, g.vis_w, g.vis_h, sao[0],
+            );
             if g.sh.sao_chroma_used {
-                let cw_here = cw.min(g.cgrid_w.saturating_sub(gx * ctu / 2));
-                let ch_here = ch.min(g.cgrid_h.saturating_sub(gy * ctu / 2));
+                let cx0 = x0 / 2;
+                let cy0 = y0 / 2;
+                let cw_here = (ctu / 2).min(cvis_w.saturating_sub(cx0));
+                let ch_here = (ctu / 2).min(cvis_h.saturating_sub(cy0));
                 if cw_here > 0 && ch_here > 0 {
-                    filter::apply_sao_region(
-                        &src_u,
-                        &mut g.u,
-                        gx * ctu / 2,
-                        gy * ctu / 2,
-                        cw_here,
-                        ch_here,
-                        sao[1],
+                    filter::apply_sao_region_bounded(
+                        &src_u, &mut g.u, cx0, cy0, cw_here, ch_here, cvis_w, cvis_h, sao[1],
                     );
-                    filter::apply_sao_region(
-                        &src_v,
-                        &mut g.v,
-                        gx * ctu / 2,
-                        gy * ctu / 2,
-                        cw_here,
-                        ch_here,
-                        sao[2],
+                    filter::apply_sao_region_bounded(
+                        &src_v, &mut g.v, cx0, cy0, cw_here, ch_here, cvis_w, cvis_h, sao[2],
                     );
                 }
             }
@@ -3133,21 +3218,34 @@ fn apply_alf(g: &mut Gen<'_>) {
     let src_u = g.u.clone();
     let src_v = g.v.clone();
     let ctu = g.ctu;
-    for gy in 0..g.pic_h.div_ceil(ctu) {
-        for gx in 0..g.pic_w.div_ceil(ctu) {
+    let cvis_w = g.vis_w.div_ceil(2);
+    let cvis_h = g.vis_h.div_ceil(2);
+    for gy in 0..g.vis_h.div_ceil(ctu) {
+        for gx in 0..g.vis_w.div_ceil(ctu) {
             let idx = gy * g.ctu_cols + gx;
             let x0 = gx * ctu;
             let y0 = gy * ctu;
-            let w = ctu.min(g.pic_w - x0);
-            let h = ctu.min(g.pic_h - y0);
+            let w = ctu.min(g.vis_w - x0);
+            let h = ctu.min(g.vis_h - y0);
             if let Some(mode) = g.alf_luma[idx] {
-                let aps_idx = usize::from(g.sh.alf_aps_id_chroma & 7);
-                let _ = aps_idx;
                 let aps =
                     g.sh.alf_aps_ids_luma
                         .first()
                         .and_then(|&id| g.aps.alf[usize::from(id & 7)].as_ref());
-                alf_luma_block(&src_y, &mut g.y, x0, y0, w, h, mode, aps);
+                alf_luma_block(
+                    &src_y,
+                    &mut g.y,
+                    x0,
+                    y0,
+                    w,
+                    h,
+                    g.vis_w,
+                    g.vis_h,
+                    ctu,
+                    ctu.saturating_sub(4),
+                    mode,
+                    aps,
+                );
             }
             for comp in 1..3usize {
                 let alt = if comp == 1 {
@@ -3172,14 +3270,129 @@ fn apply_alf(g: &mut Gen<'_>) {
                             y0 / 2,
                             (w / 2).max(1),
                             (h / 2).max(1),
+                            cvis_w,
+                            cvis_h,
+                            ctu / 2,
+                            (ctu / 2).saturating_sub(2),
                         );
                     }
                 }
+            }
+            // CCALF: apply after this CTU's chroma ALF, using the pre-ALF luma
+            // (`AdaptiveLoopFilter.cpp:505-521`).
+            for comp in 1..3usize {
+                let idc = if comp == 1 {
+                    g.ccalf_cb[idx]
+                } else {
+                    g.ccalf_cr[idx]
+                };
+                if idc == 0 {
+                    continue;
+                }
+                let aps_id = if comp == 1 {
+                    g.sh.cc_alf_cb_aps_id
+                } else {
+                    g.sh.cc_alf_cr_aps_id
+                };
+                let Some(aps_id) = aps_id else { continue };
+                let Some(aps) = g.aps.alf[usize::from(aps_id & 7)].as_ref() else {
+                    continue;
+                };
+                let filters = if comp == 1 {
+                    &aps.cc_cb_filters
+                } else {
+                    &aps.cc_cr_filters
+                };
+                let Some(coeffs) = filters.get(usize::from(idc) - 1) else {
+                    continue;
+                };
+                let (chroma, cw, ch) = if comp == 1 {
+                    (&mut g.u, cvis_w, cvis_h)
+                } else {
+                    (&mut g.v, cvis_w, cvis_h)
+                };
+                ccalf_block(
+                    &src_y,
+                    chroma,
+                    coeffs,
+                    x0 / 2,
+                    y0 / 2,
+                    (w / 2).max(1),
+                    (h / 2).max(1),
+                    cw,
+                    ch,
+                    g.vis_w,
+                    g.vis_h,
+                    ctu,
+                );
             }
         }
     }
 }
 
+/// Cross-component ALF for one chroma CTU (`AdaptiveLoopFilter.cpp:1333-1448`,
+/// `filterBlkCcAlf`). The luma tap positions are fixed for `4:2:0`.
+#[allow(clippy::too_many_arguments)]
+fn ccalf_block(
+    src_y: &Plane,
+    chroma: &mut Plane,
+    coeffs: &[i16; 7],
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    cw: usize,
+    ch: usize,
+    vis_lw: usize,
+    vis_lh: usize,
+    ctu_l: usize,
+) {
+    let lw = vis_lw.min(src_y.width) as isize;
+    let lh = vis_lh.min(src_y.height) as isize;
+    let get = |x: isize, y: isize| -> i32 {
+        let cx = x.clamp(0, lw - 1) as usize;
+        let cy = y.clamp(0, lh - 1) as usize;
+        i32::from(src_y.get(cx, cy))
+    };
+    let vb_pos = ctu_l.saturating_sub(4);
+    let c = [
+        i32::from(coeffs[0]),
+        i32::from(coeffs[1]),
+        i32::from(coeffs[2]),
+        i32::from(coeffs[3]),
+        i32::from(coeffs[4]),
+        i32::from(coeffs[5]),
+        i32::from(coeffs[6]),
+    ];
+    for y in y0..(y0 + h).min(ch) {
+        let ly = (y * 2) as isize;
+        let pos = (ly as usize) & (ctu_l - 1);
+        let (above, below, below2) = if pos == vb_pos.saturating_sub(2) || pos == vb_pos + 1 {
+            (ly - 1, ly + 1, ly + 1)
+        } else if pos == vb_pos.saturating_sub(1) || pos == vb_pos {
+            (ly, ly, ly)
+        } else {
+            (ly - 1, ly + 1, ly + 2)
+        };
+        for x in x0..(x0 + w).min(cw) {
+            let lx = (x * 2) as isize;
+            let cur = get(lx, ly);
+            let mut sum = c[0] * (get(lx, above) - cur);
+            sum += c[1] * (get(lx - 1, ly) - cur);
+            sum += c[2] * (get(lx + 1, ly) - cur);
+            sum += c[3] * (get(lx - 1, below) - cur);
+            sum += c[4] * (get(lx, below) - cur);
+            sum += c[5] * (get(lx + 1, below) - cur);
+            sum += c[6] * (get(lx, below2) - cur);
+            let mut v = (sum + 64) >> 7;
+            v = (v + 128).clamp(0, 255) - 128;
+            let out = i32::from(chroma.get(x, y)) + v;
+            chroma.set(x, y, out.clamp(0, 255) as u8);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn alf_luma_block(
     src: &Plane,
     dst: &mut Plane,
@@ -3187,19 +3400,33 @@ fn alf_luma_block(
     y0: usize,
     w: usize,
     h: usize,
+    vis_w: usize,
+    vis_h: usize,
+    vb_h: usize,
+    vb_pos: usize,
     mode: AlfLumaMode,
     aps: Option<&super::hls::VvcAlfAps>,
 ) {
+    let bw = vis_w.min(src.width) as isize;
+    let bh = vis_h.min(src.height) as isize;
     let get_src = |x: isize, y: isize| -> i32 {
-        let cx = x.clamp(0, src.width as isize - 1) as usize;
-        let cy = y.clamp(0, src.height as isize - 1) as usize;
+        let cx = x.clamp(0, bw - 1) as usize;
+        let cy = y.clamp(0, bh - 1) as usize;
         i32::from(src.get(cx, cy))
     };
     let mut by = y0;
     while by < y0 + h {
         let mut bx = x0;
         while bx < x0 + w {
-            let (class_idx, transpose) = filter::derive_alf_class_4x4(src, bx, by);
+            let (class_idx, transpose) = filter::derive_alf_class_4x4_vb(
+                src,
+                bx,
+                by,
+                bw as usize,
+                bh as usize,
+                vb_h,
+                vb_pos,
+            );
             let (coeffs, clips): ([i16; 12], [u8; 12]) = match mode {
                 AlfLumaMode::Fixed(set) => {
                     let fi = usize::from(
@@ -3232,6 +3459,23 @@ fn alf_luma_block(
                 fc[k] = i32::from(coeffs[perm[k]]);
                 fclip[k] = clip_table[usize::from(clips[perm[k]] & 3)];
             }
+            // Tap coordinates: `(column offset, index into the seven row
+            // pointers)` where row 0 is the current row, 1/+1, 2/-1, 3/+2,
+            // 4/-2, 5/+3, 6/-3 (`AdaptiveLoopFilter.cpp:1230-1243`).
+            const TERMS: [(isize, usize, isize, usize); 12] = [
+                (0, 5, 0, 6),
+                (1, 3, -1, 4),
+                (0, 3, 0, 4),
+                (-1, 3, 1, 4),
+                (2, 1, -2, 2),
+                (1, 1, -1, 2),
+                (0, 1, 0, 2),
+                (-1, 1, 1, 2),
+                (-2, 1, 2, 2),
+                (3, 0, -3, 0),
+                (2, 0, -2, 0),
+                (1, 0, -1, 0),
+            ];
             let xe = (bx + 4).min(x0 + w);
             let ye = (by + 4).min(y0 + h);
             for y in by..ye {
@@ -3239,28 +3483,54 @@ fn alf_luma_block(
                 for x in bx..xe {
                     let ix = x as isize;
                     let cur = get_src(ix, iy);
+                    // ALF virtual boundary at `vb_pos` samples from the top of a
+                    // `vb_h`-high CTU row (`AdaptiveLoopFilter.cpp:1251-1272`).
+                    let yv = if vb_h > 0 { y % vb_h } else { usize::MAX };
+                    let mut rows = [iy, iy + 1, iy - 1, iy + 2, iy - 2, iy + 3, iy - 3];
+                    if vb_h > 0 && yv < vb_pos && yv + 4 >= vb_pos {
+                        if yv == vb_pos - 1 {
+                            rows[1] = rows[0];
+                            rows[2] = rows[0];
+                        }
+                        if yv + 2 >= vb_pos {
+                            rows[3] = rows[1];
+                            rows[4] = rows[2];
+                        }
+                        if yv + 3 >= vb_pos {
+                            rows[5] = rows[3];
+                            rows[6] = rows[4];
+                        }
+                    } else if vb_h > 0 && yv >= vb_pos && yv <= vb_pos + 3 {
+                        if yv == vb_pos {
+                            rows[2] = rows[0];
+                            rows[1] = rows[0];
+                        }
+                        if yv <= vb_pos + 1 {
+                            rows[4] = rows[2];
+                            rows[3] = rows[1];
+                        }
+                        if yv <= vb_pos + 2 {
+                            rows[6] = rows[4];
+                            rows[5] = rows[3];
+                        }
+                    }
+                    let near = if vb_h > 0 {
+                        (yv < vb_pos && yv + 1 >= vb_pos) || yv == vb_pos
+                    } else {
+                        false
+                    };
                     let mut sum = 0i32;
-                    let terms = [
-                        (ix, iy + 3, ix, iy - 3),
-                        (ix + 1, iy + 2, ix - 1, iy - 2),
-                        (ix, iy + 2, ix, iy - 2),
-                        (ix - 1, iy + 2, ix + 1, iy - 2),
-                        (ix + 2, iy + 1, ix - 2, iy - 1),
-                        (ix + 1, iy + 1, ix - 1, iy - 1),
-                        (ix, iy + 1, ix, iy - 1),
-                        (ix - 1, iy + 1, ix + 1, iy - 1),
-                        (ix - 2, iy + 1, ix + 2, iy - 1),
-                        (ix + 3, iy, ix - 3, iy),
-                        (ix + 2, iy, ix - 2, iy),
-                        (ix + 1, iy, ix - 1, iy),
-                    ];
-                    for (k, &(ax, ay, bx2, by2)) in terms.iter().enumerate() {
-                        let a = get_src(ax, ay);
-                        let b = get_src(bx2, by2);
-                        let v = (a - b).clamp(-fclip[k], fclip[k]);
+                    for (k, &(cax, ra, cbx, rb)) in TERMS.iter().enumerate() {
+                        let a = get_src(ix + cax, rows[ra]);
+                        let b = get_src(ix + cbx, rows[rb]);
+                        // VTM `AdaptiveLoopFilter.h:72-75` (`clipALF`): both taps are
+                        // clipped around the current sample, not around each other.
+                        let v = (a - cur).clamp(-fclip[k], fclip[k])
+                            + (b - cur).clamp(-fclip[k], fclip[k]);
                         sum += fc[k] * v;
                     }
-                    let val = cur + ((sum + 64) >> 7);
+                    let shift = if near { 10 } else { 7 };
+                    let val = cur + ((sum + (1 << (shift - 1))) >> shift);
                     dst.set(x, y, val.clamp(0, 255) as u8);
                 }
             }
@@ -3270,6 +3540,7 @@ fn alf_luma_block(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn alf_chroma_block(
     src: &Plane,
     dst: &mut Plane,
@@ -3279,6 +3550,10 @@ fn alf_chroma_block(
     y0: usize,
     w: usize,
     h: usize,
+    vis_w: usize,
+    vis_h: usize,
+    vb_h: usize,
+    vb_pos: usize,
 ) {
     if aps.chroma_filters.is_empty() {
         return;
@@ -3287,32 +3562,65 @@ fn alf_chroma_block(
     let c = aps.chroma_filters[idx];
     let cl = aps.chroma_clip_idx.get(idx).copied().unwrap_or([0u8; 6]);
     let table = filter::ALF_CLIP_VALS_8BIT;
+    let bw = vis_w.min(src.width) as isize;
+    let bh = vis_h.min(src.height) as isize;
     let get = |x: isize, y: isize| -> i32 {
-        let cx = x.clamp(0, src.width as isize - 1) as usize;
-        let cy = y.clamp(0, src.height as isize - 1) as usize;
+        let cx = x.clamp(0, bw - 1) as usize;
+        let cy = y.clamp(0, bh - 1) as usize;
         i32::from(src.get(cx, cy))
     };
+    // `(column offset, row pointer)` with rows 0 = current, 1/+1, 2/-1,
+    // 3/+2, 4/-2 (`AdaptiveLoopFilter.cpp:1276-1289`).
+    const TERMS: [(isize, usize, isize, usize); 6] = [
+        (0, 3, 0, 4),
+        (1, 1, -1, 2),
+        (0, 1, 0, 2),
+        (-1, 1, 1, 2),
+        (2, 0, -2, 0),
+        (1, 0, -1, 0),
+    ];
     for y in y0..(y0 + h).min(dst.height) {
         for x in x0..(x0 + w).min(dst.width) {
             let (ix, iy) = (x as isize, y as isize);
             let cur = get(ix, iy);
+            // Chroma ALF virtual boundary at two samples above each CTU-row
+            // boundary (`AdaptiveLoopFilter.cpp:1251-1272`, chroma variant).
+            let yv = if vb_h > 0 { y % vb_h } else { usize::MAX };
+            let mut rows = [iy, iy + 1, iy - 1, iy + 2, iy - 2];
+            if vb_h > 0 && yv < vb_pos && yv + 2 >= vb_pos {
+                if yv + 1 == vb_pos {
+                    rows[1] = rows[0];
+                    rows[2] = rows[0];
+                }
+                if yv + 2 >= vb_pos {
+                    rows[3] = rows[1];
+                    rows[4] = rows[2];
+                }
+            } else if vb_h > 0 && yv >= vb_pos && yv <= vb_pos + 1 {
+                if yv == vb_pos {
+                    rows[2] = rows[0];
+                    rows[1] = rows[0];
+                }
+                if yv <= vb_pos + 1 {
+                    rows[4] = rows[2];
+                    rows[3] = rows[1];
+                }
+            }
+            let near = if vb_h > 0 {
+                (yv < vb_pos && yv + 1 >= vb_pos) || yv == vb_pos
+            } else {
+                false
+            };
             let mut sum = 0i32;
-            let terms = [
-                (ix, iy + 2, ix, iy - 2),
-                (ix + 1, iy + 1, ix - 1, iy - 1),
-                (ix, iy + 1, ix, iy - 1),
-                (ix - 1, iy + 1, ix + 1, iy - 1),
-                (ix + 2, iy, ix - 2, iy),
-                (ix + 1, iy, ix - 1, iy),
-            ];
-            for (k, &(ax, ay, bx, by)) in terms.iter().enumerate() {
-                let v = (get(ax, ay) - get(bx, by)).clamp(
-                    -table[usize::from(cl[k] & 3)],
-                    table[usize::from(cl[k] & 3)],
-                );
+            for (k, &(cax, ra, cbx, rb)) in TERMS.iter().enumerate() {
+                let a = get(ix + cax, rows[ra]);
+                let b = get(ix + cbx, rows[rb]);
+                let clk = table[usize::from(cl[k] & 3)];
+                let v = (a - cur).clamp(-clk, clk) + (b - cur).clamp(-clk, clk);
                 sum += i32::from(c[k]) * v;
             }
-            let val = cur + ((sum + 64) >> 7);
+            let shift = if near { 10 } else { 7 };
+            let val = cur + ((sum + (1 << (shift - 1))) >> shift);
             dst.set(x, y, val.clamp(0, 255) as u8);
         }
     }
