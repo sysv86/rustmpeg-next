@@ -1,5 +1,52 @@
 # H.266 / VVC Implementation Status (`rustmpeg-video::vvc`)
 
+## 0f. Deblocking on full-tool intra streams (2026-11-15)
+
+The deblocking filter now derives `maxFilterLengthP`/`maxFilterLengthQ` pair-wise
+from the two transform blocks that share an edge (H.266 §8.8.3.3, Eq. 1227 ff.).
+The previous code derived each side independently, which admitted unresolved
+non-normative edges:
+
+- **Luma.** The rule is "a transform side of at most four samples forces *both*
+  lengths to `1`; only otherwise is each side `7` (>= 32 samples) or `3`".
+  Independent derivation produced pairs such as `(7, 1)`: the long-tap decision
+  was then entered because `maxFilterLengthP > 3`, and a 7/3 long filter was
+  applied across a 4-sample transform block where the reference decoders apply
+  nothing.
+- **Chroma.** The pair is `3/3` only when *both* transform sides span at least
+  eight chroma samples, and `1/3` when such an edge also coincides with the upper
+  chroma CTB boundary (§8.8.3.3, Eq. 1417-1420). Independent derivation produced
+  `(1, 3)` pairs whenever the P side alone was small, which selected the
+  asymmetric strong filter instead of the weak filter.
+
+Both defects show up only with the full tool chain: ISP, MRL, MTS, LFNST and SBT
+create the 4-sample transform blocks that the reduced-tool configurations never
+produce. The first divergent sample of the stock 64x64 QP37 stream is
+`(x=12, y=30)`; a VTM deblock trace built from the same source shows the
+horizontal edge at `(12, 32)` carrying `maxFilterLengthP = maxFilterLengthQ = 1`
+(`sizeQSide = 4`), which the previous derivation turned into a long-tap filter.
+
+Fix: `decode_general.rs` (`luma_lens`, `chroma_lens`, `apply_deblock`) derives the
+lengths pair-wise; `filter::deblock_chroma_edge` selects the chroma filter form
+from that pair alone (`3/3` strong, `1/3` Eq. 1417-1420, otherwise weak), so the
+now-redundant CTB-boundary flag is gone from the chroma edge helpers.
+
+Verified with `cmp` on full Y+U+V, 3 frames, VTM 24.0 `DecoderApp`, stock
+`encoder_intra_vtm.cfg` (every tool enabled), 4:2:0 8-bit:
+
+| Stream | 64x64 | 128x128 |
+| :--- | :--- | :--- |
+| stock, full filter chain, QP22/26/32/37/42 | 5/5 byte-exact | 5/5 byte-exact |
+| stock, filters off, QP22/26/32/37/42 | 5/5 byte-exact | 5/5 byte-exact |
+| stock, stage chain `base`/`+LMCS`/`+SAO`/`+ALF`/`+CCALF`/`+deblock` at QP26/37 | 12/12 byte-exact | 12/12 byte-exact |
+
+The QP37 64x64 full-chain case that sections 0d and 0e recorded as failing is
+byte-exact. Strict 25-case harness (VTM 24.0 `DecoderApp` + VVdeC 3.3 `vvdecapp`):
+**50/50**. Full 266-check matrix: **261 passed / 5 failed / 0 skipped**, the same
+five documented residual failures (12-bit VVdeC oracle limit, the CTU-16 typed
+rejection, and the three VTM-encoder streams outside the decoder subset). No new
+failure. `cargo test --workspace` passes (two new deblocking unit tests).
+
 ## 0e. LFNST and ISP reconstruction for the stock configuration (2026-11-15)
 
 The general coding-tree decoder now reconstructs the stock `encoder_intra_vtm.cfg`
@@ -48,11 +95,10 @@ Verification after the fix: strict 25-case harness (rustmpeg encode → VTM 24.0
 (338 VVC tests, 4 new); the full 266-check matrix was not re-run.
 
 Not covered by this change: at QP37 (stock tools, full filter chain) the output
-still differs from VTM in 23 of 18432 luma samples of a 64x64 picture, and the
-difference is introduced by the deblocking stage (`base` through `CCALF` are
-byte-exact, and the reduced-tool configuration is byte-exact with deblocking at
-the same QP). That is a separate, pre-existing deblocking defect; QP26 — the
-configuration recorded above — is unaffected.
+still differed from VTM in 23 of 18432 luma samples of a 64x64 picture, and the
+difference was introduced by the deblocking stage. That pre-existing deblocking
+defect is fixed in section 0f, which also records the QP sweep that supersedes
+this paragraph.
 
 ## 0d. In-loop filters for the general decode path (2026-11-15)
 

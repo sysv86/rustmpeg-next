@@ -896,9 +896,11 @@ fn chroma_sample_decision(
 /// four lines when `subSampleC == 1` (`4:4:4`, and `4:2:2` vertical edges).
 ///
 /// `max_len_p`/`max_len_q` are `maxFilterLengthP`/`maxFilterLengthQ` from
-/// H.266 §8.8.3.5: `3` when both transform sides are at least 8 chroma samples,
-/// `1` otherwise. On a horizontal chroma CTB boundary the P side is `1` and the
-/// Q side `3`, which is exactly the asymmetric `1/3` filter of Eq. 1417-1420.
+/// H.266 §8.8.3.3: `3`/`3` when both transform sides are at least 8 chroma
+/// samples, `1`/`3` on a horizontal edge that coincides with the upper chroma CTB
+/// boundary, and `1`/`1` otherwise. The filter form follows only that pair
+/// (§8.8.3.6.10): `3`/`3` is the strong filter, `1`/`3` the asymmetric Eq.
+/// 1417-1420 filter, everything else is the weak filter.
 #[allow(clippy::too_many_arguments)]
 pub fn deblock_chroma_edge(
     lines: &mut [[i32; 8]],
@@ -909,7 +911,6 @@ pub fn deblock_chroma_edge(
     max_len_p: usize,
     max_len_q: usize,
     bit_depth: u8,
-    ctb_boundary: bool,
 ) {
     if bs == 0 || !matches!(lines.len(), 2 | 4) {
         return;
@@ -966,12 +967,10 @@ pub fn deblock_chroma_edge(
     for line in lines.iter_mut() {
         match (len_p, len_q) {
             (3, 3) => chroma_strong_line(line, tc, max_val),
-            // `maxFilterLengthP == 1, maxFilterLengthQ == 3` is VTM's
-            // CTB-row-boundary chroma strong filter, which updates only
-            // `p0, q0, q1, q2` (`DeblockingFilter.cpp:1593-1601`,
-            // `xPelFilterChroma` with `isChromaHorCTBBoundary`). Away from a
-            // CTB row boundary the weak filter is used instead.
-            (1, 3) if ctb_boundary => chroma_weak_line_p1q3(line, tc, max_val),
+            // `maxFilterLengthP == 1, maxFilterLengthQ == 3` only arises on the
+            // upper chroma CTB row boundary and updates `p0, q0, q1, q2`
+            // (H.266 Eq. 1417-1420).
+            (1, 3) => chroma_weak_line_p1q3(line, tc, max_val),
             _ => chroma_weak_line(line, tc, max_val),
         }
     }
@@ -1033,7 +1032,9 @@ fn chroma_weak_line(line: &mut [i32; 8], tc: i32, max_val: i32) {
 /// `vertical` selects a vertical edge at column `edge` (rows `start..end`) or a
 /// horizontal edge at row `edge` (columns `start..end`). `sub_sample_c` is
 /// `SubHeightC` for a vertical edge and `SubWidthC` for a horizontal edge and
-/// selects whether a decision group spans two or four lines.
+/// selects whether a decision group spans two or four lines. The filter form
+/// follows `max_len_p`/`max_len_q`, so a horizontal chroma CTB-row boundary is
+/// requested by passing `1`/`3` (H.266 §8.8.3.3 and Eq. 1417-1420).
 #[allow(clippy::too_many_arguments)]
 pub fn deblock_chroma_edge_region(
     plane: &mut Plane,
@@ -1048,7 +1049,6 @@ pub fn deblock_chroma_edge_region(
     max_len_p: usize,
     max_len_q: usize,
     sub_sample_c: usize,
-    ctb_boundary: bool,
 ) {
     let group = if sub_sample_c == 2 { 2 } else { 4 };
     let limit = if vertical { plane.width } else { plane.height };
@@ -1077,7 +1077,6 @@ pub fn deblock_chroma_edge_region(
             max_len_p,
             max_len_q,
             8,
-            ctb_boundary,
         );
         for (k, line) in lines.iter().take(group).enumerate() {
             for (i, &sample) in line.iter().enumerate() {
@@ -1140,7 +1139,6 @@ pub fn deblock_chroma_plane(
                 len,
                 len,
                 8,
-                false,
             );
             for (k, line) in lines.iter().take(group_v).enumerate() {
                 for (i, &sample) in line.iter().enumerate() {
@@ -1178,7 +1176,6 @@ pub fn deblock_chroma_plane(
                 len_p,
                 len_q,
                 8,
-                y.is_multiple_of(ctb),
             );
             for (k, line) in lines.iter().take(group_h).enumerate() {
                 for (i, &sample) in line.iter().enumerate() {
@@ -2317,7 +2314,6 @@ pub fn deblock_chroma_plane_16(
                 len,
                 len,
                 bd,
-                false,
             );
             for (k, line) in lines.iter().take(group_v).enumerate() {
                 for (i, &sample) in line.iter().enumerate() {
@@ -2355,7 +2351,6 @@ pub fn deblock_chroma_plane_16(
                 len_p,
                 len_q,
                 bd,
-                y.is_multiple_of(ctb),
             );
             for (k, line) in lines.iter().take(group_h).enumerate() {
                 for (i, &sample) in line.iter().enumerate() {

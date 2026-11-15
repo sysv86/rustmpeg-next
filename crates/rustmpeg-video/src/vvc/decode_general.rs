@@ -2974,18 +2974,31 @@ fn mark_tu(g: &mut Gen<'_>, t: &TuData) {
     }
 }
 
-fn luma_len(v: u16) -> usize {
-    if v <= 4 {
-        1
-    } else if v >= 32 {
-        7
-    } else {
-        3
+/// `maxFilterLengthP`/`maxFilterLengthQ` of a luma block edge from the transform
+/// block heights or widths on both sides (H.266 §8.8.3.3, Eq. 1227 ff.).
+///
+/// A side of at most four samples forces *both* lengths to `1`; only then is the
+/// per-side `7`/`3` selection applied. Deriving the two sides independently would
+/// admit a long filter against a 4-sample transform block.
+fn luma_lens(size_p: u16, size_q: u16) -> (usize, usize) {
+    if size_p <= 4 || size_q <= 4 {
+        return (1, 1);
     }
+    let side = |v: u16| if v >= 32 { 7 } else { 3 };
+    (side(size_p), side(size_q))
 }
 
-fn chroma_len(v: u16) -> usize {
-    if v >= 8 { 3 } else { 1 }
+/// `maxFilterLengthP`/`maxFilterLengthQ` of a chroma block edge (H.266 §8.8.3.3).
+///
+/// Both sides must span at least eight chroma samples for the strong filter; on a
+/// horizontal edge that coincides with the upper chroma CTB boundary the pair is
+/// `1`/`3` (Eq. 1417-1420), otherwise `3`/`3`. Any smaller side forces both to `1`.
+fn chroma_lens(size_p: u16, size_q: u16, ctb_boundary: bool) -> (usize, usize) {
+    if size_p >= 8 && size_q >= 8 {
+        if ctb_boundary { (1, 3) } else { (3, 3) }
+    } else {
+        (1, 1)
+    }
 }
 
 fn apply_deblock(g: &mut Gen<'_>) {
@@ -3002,8 +3015,7 @@ fn apply_deblock(g: &mut Gen<'_>) {
             let lc = ((y / 4) * g.tu_y_w) + (x / 4 - 1);
             let rc = (y / 4) * g.tu_y_w + x / 4;
             if g.tu_y[lc] != u32::MAX && g.tu_y[rc] != u32::MAX && g.tu_y[lc] != g.tu_y[rc] {
-                let lp = luma_len(g.tu_wy[lc]);
-                let lq = luma_len(g.tu_wy[rc]);
+                let (lp, lq) = luma_lens(g.tu_wy[lc], g.tu_wy[rc]);
                 let mut lines = [[0i32; 16]; 4];
                 for (i, line) in lines.iter_mut().enumerate() {
                     let yy = (y + i).min(h - 1);
@@ -3038,8 +3050,7 @@ fn apply_deblock(g: &mut Gen<'_>) {
                 && g.tu_y[bc] != u32::MAX
                 && g.tu_y[tc_cell] != g.tu_y[bc]
             {
-                let lp = luma_len(g.tu_hy[tc_cell]);
-                let lq = luma_len(g.tu_hy[bc]);
+                let (lp, lq) = luma_lens(g.tu_hy[tc_cell], g.tu_hy[bc]);
                 let mut lines = [[0i32; 16]; 4];
                 for (i, line) in lines.iter_mut().enumerate() {
                     let xx = (x + i).min(w - 1);
@@ -3108,8 +3119,7 @@ fn apply_deblock(g: &mut Gen<'_>) {
                 let lc = (y / 2) * tuw + (x / 2 - 1);
                 let rc = (y / 2) * tuw + x / 2;
                 if cmap[lc] != u32::MAX && cmap[rc] != u32::MAX && cmap[lc] != cmap[rc] {
-                    let lp = chroma_len(wmap[lc]);
-                    let lq = chroma_len(wmap[rc]);
+                    let (lp, lq) = chroma_lens(wmap[lc], wmap[rc], false);
                     let mut lines = [[0i32; 8]; 2];
                     for (i, line) in lines.iter_mut().enumerate() {
                         let yy = (y + i).min(ch - 1);
@@ -3128,7 +3138,6 @@ fn apply_deblock(g: &mut Gen<'_>) {
                         lp,
                         lq,
                         8,
-                        false,
                     );
                     for (i, line) in lines.iter().enumerate() {
                         let yy = (y + i).min(ch - 1);
@@ -3154,8 +3163,8 @@ fn apply_deblock(g: &mut Gen<'_>) {
                 let tc_cell = ((y / 2 - 1) * tuw) + x / 2;
                 let bc = (y / 2) * tuw + x / 2;
                 if cmap[tc_cell] != u32::MAX && cmap[bc] != u32::MAX && cmap[tc_cell] != cmap[bc] {
-                    let lp = chroma_len(hmap[tc_cell]);
-                    let lq = chroma_len(hmap[bc]);
+                    let (lp, lq) =
+                        chroma_lens(hmap[tc_cell], hmap[bc], y.is_multiple_of(g.ctu / 2));
                     let mut lines = [[0i32; 8]; 2];
                     for (i, line) in lines.iter_mut().enumerate() {
                         let xx = (x + i).min(cw - 1);
@@ -3174,7 +3183,6 @@ fn apply_deblock(g: &mut Gen<'_>) {
                         lp,
                         lq,
                         8,
-                        y.is_multiple_of(g.ctu / 2),
                     );
                     for (i, line) in lines.iter().enumerate() {
                         let xx = (x + i).min(cw - 1);
@@ -3691,6 +3699,29 @@ mod tests {
         assert_eq!(idx, 6);
         assert_eq!(lfnst::lfnst_set(idx), Ok(1));
         assert!(!lfnst::transposes(idx));
+    }
+
+    /// H.266 §8.8.3.3: a luma transform side of at most four samples forces both
+    /// maximum filter lengths to `1`; the `7`/`3` selection is per side otherwise.
+    #[test]
+    fn luma_max_filter_lengths_are_derived_pairwise() {
+        assert_eq!(luma_lens(4, 32), (1, 1));
+        assert_eq!(luma_lens(32, 4), (1, 1));
+        assert_eq!(luma_lens(8, 8), (3, 3));
+        assert_eq!(luma_lens(32, 8), (7, 3));
+        assert_eq!(luma_lens(8, 64), (3, 7));
+        assert_eq!(luma_lens(16, 16), (3, 3));
+    }
+
+    /// H.266 §8.8.3.3: the chroma pair is `3`/`3` only when both sides span at
+    /// least eight samples, and `1`/`3` on the upper chroma CTB row boundary.
+    #[test]
+    fn chroma_max_filter_lengths_are_derived_pairwise() {
+        assert_eq!(chroma_lens(8, 8, false), (3, 3));
+        assert_eq!(chroma_lens(16, 8, false), (3, 3));
+        assert_eq!(chroma_lens(8, 8, true), (1, 3));
+        assert_eq!(chroma_lens(4, 16, false), (1, 1));
+        assert_eq!(chroma_lens(16, 4, true), (1, 1));
     }
 
     /// H.266 §8.7.4.1, Eq. 1169/1170: the primary transform only uses the

@@ -1,6 +1,59 @@
 # Verification Debt (`rustmpeg-next` H.266/VVC)
 
-Last updated: 2026-11-15 (LFNST/ISP reconstruction; stock configuration byte-exact at QP26).
+Last updated: 2026-11-15 (deblocking of full-tool intra streams byte-exact at every tested QP).
+
+## 0d. Deblocking on full-tool intra streams (2026-11-15)
+
+Executed after fixing the pair-wise `maxFilterLengthP`/`maxFilterLengthQ`
+derivation (H.266 §8.8.3.3). Oracles: VTM 24.0 `DecoderApp` and VVdeC 3.3
+`vvdecapp`; `rustmpeg` decoder: `target/release/examples/vvc_stateful_decode`.
+
+Sources (4:2:0, 8-bit, 3 frames): `~/vvc-conf/s64.source.yuv` (64x64) and
+`~/vvc-conf-full/ctu128.source.yuv` (128x128). Encoder: VTM 24.0 `EncoderApp`
+with `encoder_intra_vtm.cfg` (stock, every tool enabled), `-q <QP>
+--InternalBitDepth=8 --TemporalSubsampleRatio=1 --FrameRate=30 -f 3`.
+
+```bash
+FILTERS_OFF="--DeblockingFilterDisable=1 --SAO=0 --ALF=0 --CCALF=0 --LMCSEnable=0"
+FILTERS_ON="--DeblockingFilterDisable=0 --SAO=1 --ALF=1 --CCALF=1 --LMCSEnable=1"
+# stages: $FILTERS_OFF plus, in order, --LMCSEnable=1, --SAO=1, --ALF=1, --CCALF=1
+```
+
+Result (`cmp` on full Y+U+V, 3 frames):
+
+```text
+stock+filters 64  QP22/26/32/37/42   OK  (5/5)
+stock+filters 128 QP22/26/32/37/42   OK  (5/5)
+stock         64  QP22/26/32/37/42   OK  (5/5, filters off)
+stock         128 QP22/26/32/37/42   OK  (5/5, filters off)
+stages 64  QP26/37 base/lmcs/sao/alf/ccalf/db   OK (12/12)
+stages 128 QP26/37 base/lmcs/sao/alf/ccalf/db   OK (12/12)
+```
+
+First divergence of the previously failing case (stock 64x64 QP37, full chain)
+was luma `(x=12, y=30)`, introduced by the horizontal edge at `(12, 32)`. A
+scratch VTM `DecoderApp` build with an env-guarded print in
+`xEdgeFilterLuma` reported `maxFilterLengthP = maxFilterLengthQ = FilterLen::_1`
+for that edge (the Q-side transform block is 4 samples high); the previous
+per-side derivation produced `(7, 1)` and entered the long-tap path. The oracle
+binary was afterwards rebuilt from the unmodified source and re-checked to
+produce byte-identical output on the recorded streams.
+
+Other results in this run:
+
+- Strict 25-case harness (`run_conformance.sh`, VTM 24.0 + VVdeC 3.3): **50/50**
+  (25 cases on both decoders). Run from a copy with `VTM`/`VVDEC` pointed at the
+  recorded builds, since the script's hardcoded paths are stale.
+- Full 266-check matrix (`run_conformance_full.sh`): **261 passed / 5 failed /
+  0 skipped**, identical to the section 0b baseline; the five failures are the
+  documented ones (`b12_420` VVdeC 12-bit limit, `ctu16` typed rejection,
+  `d_i8`/`d_i10`/`d_ra8` VTM-encoder streams outside the decoder subset).
+- `cargo test --workspace`: OK (two new tests: `luma_lens`, `chroma_lens`).
+- `cargo clippy --workspace --all-targets -- -D warnings`: OK.
+- `cargo fmt --all -- --check`: OK.
+- `python3 scripts/check-licenses.py`: OK.
+- Not re-run: 10/12-bit and 4:2:2/4:4:4 full-tool streams, VTM-encoder interop
+  (`d_i8`, `d_i10`, `d_ra8`), tiles/WPP/slices/RPR, and GPU paths.
 
 ## 0c. LFNST and ISP reconstruction for the stock configuration (2026-11-15)
 
@@ -36,11 +89,9 @@ stock+filters/64 OK    stock+filters/128 OK
 Additional sweep (stock tools, both filter settings, same 3-frame sources):
 64x64 QP22/QP32/QP37 and 128x128 QP32 are byte-exact with filters off; with the
 full filter chain 64x64 QP22, 128x128 QP32 are byte-exact. **64x64 QP37 with the
-full filter chain is not**: 23 of 18432 luma samples differ, and the difference
-is introduced by deblocking (`base`, `+LMCS`, `+SAO`, `+ALF`, `+CCALF` are all
-byte-exact for that stream; the same QP with the tool-isolation flags and
-deblocking is byte-exact). This is a separate pre-existing deblocking defect, not
-claimed fixed and not covered by the QP26 results above.
+full filter chain was not**: 23 of 18432 luma samples differed, and the difference
+was introduced by deblocking. That defect is fixed and re-verified in section 0d,
+which sweeps QP22/26/32/37/42 at both picture sizes with the full chain.
 
 Other results in this run:
 
