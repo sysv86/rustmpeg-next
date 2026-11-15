@@ -1095,7 +1095,7 @@ fn decode_sao_ctu(
         g.sh.sao_chroma_used,
         left,
         up,
-        8,
+        g.bit_depth,
     );
     g.sao[idx] = params;
 }
@@ -1648,11 +1648,21 @@ fn transform_tree(
     } else {
         (node.w, node.h)
     };
-    let can_max_split = w > lim.max_tb || h > lim.max_tb;
+    // `QTBTPartitioner::canSplit( TU_MAX_TR_SPLIT )` compares the **luma** area
+    // against `MaxTbSize`, capped at 64 for areas larger than 64x64
+    // (`UnitPartitioner.cpp:528-544`), and `PartitionerImpl::getMaxTuTiling`
+    // divides every component by the luma-derived tile counts
+    // (`UnitPartitioner.cpp:1155-1195`). Comparing the chroma dimensions against
+    // the luma limit desynchronises 4:2:0 streams whose `MaxTbSize` is 32.
+    let (lw, lh) = (node.w, node.h);
+    let max_tr = if lw > 64 || lh > 64 { 64 } else { lim.max_tb };
+    let nx = (lw / max_tr).max(1);
+    let ny = (lh / max_tr).max(1);
+    let can_max_split = nx > 1 || ny > 1;
     let isp_split = tr_depth == 0 && !chroma_tree && plan.isp != predict::IspMode::None;
     if can_max_split || isp_split {
         let parts: Vec<(usize, usize, usize, usize)> = if can_max_split {
-            max_tu_tiles(w, h, lim.max_tb)
+            max_tu_tiles(w, h, nx, ny)
         } else {
             predict::isp_subpartitions(0, 0, w, h, plan.isp)
         };
@@ -1699,35 +1709,18 @@ fn transform_tree(
     )
 }
 
-fn max_tu_tiles(w: usize, h: usize, max_tb: usize) -> Vec<(usize, usize, usize, usize)> {
-    let nx = (w / max_tb).max(1);
-    let ny = (h / max_tb).max(1);
+/// Transform-block tiling when the area exceeds `MaxTbSize`
+/// (VTM `PartitionerImpl::getMaxTuTiling`, `UnitPartitioner.cpp:1155-1195`).
+///
+/// `nx`/`ny` are the luma tile counts; the parts are returned in raster order
+/// over that grid, which is what the `g_rsScanToZ`/`g_zScanTo*` tables produce.
+fn max_tu_tiles(w: usize, h: usize, nx: usize, ny: usize) -> Vec<(usize, usize, usize, usize)> {
     let tw = w / nx;
     let th = h / ny;
-    let mut out = Vec::new();
-    fn rec(
-        x: usize,
-        y: usize,
-        nx: usize,
-        ny: usize,
-        tw: usize,
-        th: usize,
-        out: &mut Vec<(usize, usize, usize, usize)>,
-    ) {
-        if nx == 1 && ny == 1 {
-            out.push((x, y, tw, th));
-            return;
-        }
-        if nx >= ny {
-            rec(x, y, nx / 2, ny, tw, th, out);
-            rec(x + (nx / 2) * tw, y, nx - nx / 2, ny, tw, th, out);
-        } else {
-            rec(x, y, nx, ny / 2, tw, th, out);
-            rec(x, y + (ny / 2) * th, nx, ny - ny / 2, tw, th, out);
-        }
+    let mut out = Vec::with_capacity(nx * ny);
+    for i in 0..nx * ny {
+        out.push(((i % nx) * tw, (i / nx) * th, tw, th));
     }
-    // z-order for a power-of-two grid
-    rec(0, 0, nx, ny, tw, th, &mut out);
     out
 }
 
