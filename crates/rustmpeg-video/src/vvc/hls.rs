@@ -843,6 +843,52 @@ pub struct VvcSpsInfo {
     pub ref_pic_resampling: bool,
     /// `sps_res_change_in_clvs_allowed_flag` (RPR only).
     pub res_change_in_clvs_allowed: bool,
+    /// `sps_gdr_enabled_flag`.
+    pub gdr_enabled: bool,
+    /// `sps_entropy_coding_sync_enabled_flag` (WPP).
+    pub wpp_enabled: bool,
+    /// `sps_entry_point_offsets_present_flag`.
+    pub entry_points_present: bool,
+    /// `sps_log2_max_pic_order_cnt_lsb_minus4 + 4` (`4..=16`).
+    pub poc_lsb_bits: u8,
+    /// `sps_max_sub_layers_minus1` (`0..=6`).
+    pub max_sub_layers_minus1: u8,
+    /// `sps_sublayer_dpb_params_flag` (only read when
+    /// `max_sub_layers_minus1 > 0`).
+    pub sub_layer_dpb_params: bool,
+    /// `dpb_max_dec_pic_buffering_minus1[i] + 1` per temporal sub-layer.
+    pub max_dec_pic_buffering: Vec<u32>,
+    /// `dpb_max_num_reorder_pics[i]` per temporal sub-layer.
+    pub max_num_reorder_pics: Vec<u32>,
+    /// `dpb_max_latency_increase_plus1[i]` per temporal sub-layer.
+    pub max_latency_increase_plus1: Vec<u32>,
+    /// `sps_poc_msb_cycle_flag`.
+    pub poc_msb_cycle: bool,
+    /// `sps_poc_msb_cycle_len_minus1 + 1` (0 when the flag is absent).
+    pub poc_msb_cycle_len: u8,
+    /// `sps_extra_ph_bit_present_flag[i]`.
+    pub extra_ph_bits: Vec<bool>,
+    /// `sps_extra_sh_bit_present_flag[i]`.
+    pub extra_sh_bits: Vec<bool>,
+}
+
+impl VvcSpsInfo {
+    /// `MaxDecPicBufferingMinus1[ tid ]` (`H.266 §7.4.3.4`).
+    pub fn max_dec_pic_buffering_minus1(&self, temporal_id: u8) -> u32 {
+        self.max_dec_pic_buffering
+            .get(usize::from(temporal_id))
+            .or(self.max_dec_pic_buffering.last())
+            .map_or(0, |&buffering| buffering.saturating_sub(1))
+    }
+
+    /// `MaxNumReorderPics[ tid ]` (`H.266 §7.4.3.4`).
+    pub fn max_num_reorder_pics(&self, temporal_id: u8) -> u32 {
+        self.max_num_reorder_pics
+            .get(usize::from(temporal_id))
+            .or(self.max_num_reorder_pics.last())
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// Map a bit-reader failure onto a malformed-bitstream error.
@@ -855,25 +901,28 @@ fn hls_bit<T>(prefix: &str, value: Result<T, &'static str>) -> Result<T, VvcErro
     value.map_err(|err| VvcError::Bitstream(format!("{prefix}: {err}")))
 }
 
-/// Parse the leading fields of an SPS RBSP (no emulation-prevention bytes).
-pub fn parse_sps_info(rbsp: &[u8]) -> Result<VvcSpsInfo, VvcError> {
-    let mut br = BitReader::new(rbsp);
-    let sps_id = sps_bit(br.read_bits(4))? as u8;
-    let vps_id = sps_bit(br.read_bits(4))? as u8;
-    let max_sub_layers_minus1 = sps_bit(br.read_bits(3))?;
-    let chroma_format_idc = sps_bit(br.read_bits(2))? as u8;
-    let log2_ctu_size_minus5 = sps_bit(br.read_bits(2))? as u8;
-    if max_sub_layers_minus1 != 0 {
-        return Err(VvcError::Unsupported(
-            "SPS: more than one temporal sub-layer",
-        ));
-    }
-    let ptl_present = sps_bit(br.read_bit())?;
-    if !ptl_present {
-        return Err(VvcError::Unsupported("SPS: profile_tier_level is absent"));
-    }
+/// `profile_tier_level( profileTierPresentFlag, maxNumSubLayersMinus1 )`
+/// (H.266 §7.3.3, VTM `VLCReader.cpp:4672-4736`).
+///
+/// The constraint-info bits are preserved verbatim because
+/// `gci_intra_only_constraint_flag` selects the picture coding path. The
+/// per-sub-layer level idcs carry nothing the decoder needs, but they must be
+/// consumed to keep the RBSP aligned.
+struct VvcPtlBits {
+    profile_idc: u8,
+    tier_flag: bool,
+    level_idc: u8,
+    frame_only_constraint: bool,
+    multilayer_enabled: bool,
+    gci_bits: Vec<bool>,
+    num_sub_profiles: u8,
+    sub_profile_idc: Vec<u32>,
+}
 
-    // profile_tier_level(1, max_sub_layers_minus1)
+fn parse_profile_tier_level_fields(
+    br: &mut BitReader<'_>,
+    max_sub_layers_minus1: u8,
+) -> Result<VvcPtlBits, VvcError> {
     let profile_idc = sps_bit(br.read_bits(7))? as u8;
     let tier_flag = sps_bit(br.read_bit())?;
     let level_idc = sps_bit(br.read_bits(8))? as u8;
@@ -909,13 +958,94 @@ pub fn parse_sps_info(rbsp: &[u8]) -> Result<VvcSpsInfo, VvcError> {
         }
     }
 
+    // `sub_layer_level_present_flag[i]` for `i = maxSubLayersMinus1 - 1 ..= 0`,
+    // then `ptl_reserved_zero_bit` alignment, then the sub-layer level idcs.
+    let mut level_present = [false; 7];
+    for idx in (0..usize::from(max_sub_layers_minus1)).rev() {
+        level_present[idx] = sps_bit(br.read_bit())?;
+    }
+    while !br.is_byte_aligned() {
+        if sps_bit(br.read_bit())? {
+            return Err(VvcError::Bitstream(
+                "SPS: ptl_reserved_zero_bit is set".to_string(),
+            ));
+        }
+    }
+    for idx in (0..usize::from(max_sub_layers_minus1)).rev() {
+        if level_present[idx] {
+            let _ = sps_bit(br.read_bits(8))?;
+        }
+    }
+
     let num_sub_profiles = sps_bit(br.read_bits(8))? as u8;
     let mut sub_profile_idc = Vec::with_capacity(num_sub_profiles as usize);
     for _ in 0..num_sub_profiles {
         sub_profile_idc.push(sps_bit(br.read_bits(32))?);
     }
+    Ok(VvcPtlBits {
+        profile_idc,
+        tier_flag,
+        level_idc,
+        frame_only_constraint,
+        multilayer_enabled,
+        gci_bits,
+        num_sub_profiles,
+        sub_profile_idc,
+    })
+}
 
-    let _gdr_enabled = sps_bit(br.read_bit())?;
+/// `dpb_parameters()` values per temporal sub-layer:
+/// `(max_dec_pic_buffering, max_num_reorder_pics, max_latency_increase_plus1)`.
+type VvcDpbParameters = (Vec<u32>, Vec<u32>, Vec<u32>);
+
+/// `dpb_parameters( maxSubLayersMinus1, subLayerInfoFlag )` (H.266 §7.3.3,
+/// VTM `VLCReader.cpp:1337-1362`).
+fn parse_dpb_parameters(
+    br: &mut BitReader<'_>,
+    max_sub_layers_minus1: u8,
+    sub_layer_info: bool,
+) -> Result<VvcDpbParameters, VvcError> {
+    let last = usize::from(max_sub_layers_minus1);
+    let mut buffering = vec![0u32; last + 1];
+    let mut reorder = vec![0u32; last + 1];
+    let mut latency = vec![0u32; last + 1];
+    let first = if sub_layer_info { 0 } else { last };
+    for idx in first..=last {
+        buffering[idx] = sps_bit(br.read_ue())?.saturating_add(1);
+        reorder[idx] = sps_bit(br.read_ue())?;
+        latency[idx] = sps_bit(br.read_ue())?.saturating_add(1);
+    }
+    if !sub_layer_info {
+        for idx in 0..last {
+            buffering[idx] = buffering[last];
+            reorder[idx] = reorder[last];
+            latency[idx] = latency[last];
+        }
+    }
+    Ok((buffering, reorder, latency))
+}
+
+/// Parse the SPS fields up to and including `dpb_parameters()`.
+fn parse_sps_header(br: &mut BitReader<'_>) -> Result<VvcSpsInfo, VvcError> {
+    let sps_id = sps_bit(br.read_bits(4))? as u8;
+    let vps_id = sps_bit(br.read_bits(4))? as u8;
+    let max_sub_layers_minus1 = sps_bit(br.read_bits(3))?;
+    if max_sub_layers_minus1 > 6 {
+        return Err(VvcError::Bitstream(format!(
+            "SPS: sps_max_sub_layers_minus1 value {max_sub_layers_minus1} is out of range"
+        )));
+    }
+    let max_sub_layers_minus1 = max_sub_layers_minus1 as u8;
+    let chroma_format_idc = sps_bit(br.read_bits(2))? as u8;
+    let log2_ctu_size_minus5 = sps_bit(br.read_bits(2))? as u8;
+    let ptl_present = sps_bit(br.read_bit())?;
+    if !ptl_present {
+        return Err(VvcError::Unsupported("SPS: profile_tier_level is absent"));
+    }
+
+    let ptl = parse_profile_tier_level_fields(br, max_sub_layers_minus1)?;
+
+    let gdr_enabled = sps_bit(br.read_bit())?;
     let ref_pic_resampling = sps_bit(br.read_bit())?;
     // `sps_res_change_in_clvs_allowed_flag` is present only when RPR is enabled.
     // Same-resolution streams decode without resampling; actual resolution
@@ -944,7 +1074,7 @@ pub fn parse_sps_info(rbsp: &[u8]) -> Result<VvcSpsInfo, VvcError> {
     if subpic_info {
         let num_subpics_minus1 = sps_bit(br.read_ue())?;
         let num_subpics = num_subpics_minus1.saturating_add(1);
-        let ctu_size = 1u32 << (log2_ctu_size_minus5.min(3) + 5);
+        let ctu_size = 1u32 << (log2_ctu_size_minus5 + 5);
         let max_pic_w_ctu = coded_width.max(ctu_size).div_ceil(ctu_size);
         let max_pic_h_ctu = coded_height.max(ctu_size).div_ceil(ctu_size);
         if num_subpics > 1 {
@@ -1013,6 +1143,34 @@ pub fn parse_sps_info(rbsp: &[u8]) -> Result<VvcSpsInfo, VvcError> {
         VvcError::Bitstream("SPS: conformance window exceeds picture height".to_string())
     })?;
 
+    let wpp_enabled = sps_bit(br.read_bit())?;
+    let entry_points_present = sps_bit(br.read_bit())?;
+    let poc_lsb_bits = (sps_bit(br.read_bits(4))? as u8) + 4;
+    let poc_msb_cycle = sps_bit(br.read_bit())?;
+    let poc_msb_cycle_len = if poc_msb_cycle {
+        (sps_bit(br.read_ue())? as u8).saturating_add(1)
+    } else {
+        0
+    };
+    let num_extra_ph_bytes = sps_bit(br.read_bits(2))?;
+    let mut extra_ph_bits = Vec::with_capacity(num_extra_ph_bytes as usize * 8);
+    for _ in 0..(num_extra_ph_bytes * 8) {
+        extra_ph_bits.push(sps_bit(br.read_bit())?);
+    }
+    let num_extra_sh_bytes = sps_bit(br.read_bits(2))?;
+    let mut extra_sh_bits = Vec::with_capacity(num_extra_sh_bytes as usize * 8);
+    for _ in 0..(num_extra_sh_bytes * 8) {
+        extra_sh_bits.push(sps_bit(br.read_bit())?);
+    }
+
+    let sub_layer_dpb_params = if max_sub_layers_minus1 > 0 {
+        sps_bit(br.read_bit())?
+    } else {
+        false
+    };
+    let (max_dec_pic_buffering, max_num_reorder_pics, max_latency_increase_plus1) =
+        parse_dpb_parameters(br, max_sub_layers_minus1, sub_layer_dpb_params)?;
+
     Ok(VvcSpsInfo {
         sps_id,
         vps_id,
@@ -1023,17 +1181,36 @@ pub fn parse_sps_info(rbsp: &[u8]) -> Result<VvcSpsInfo, VvcError> {
         coded_width,
         coded_height,
         ctu_log2: log2_ctu_size_minus5 + 5,
-        profile_idc,
-        tier_flag,
-        level_idc,
-        frame_only_constraint,
-        multilayer_enabled,
-        gci_bits,
-        num_sub_profiles,
-        sub_profile_idc,
+        profile_idc: ptl.profile_idc,
+        tier_flag: ptl.tier_flag,
+        level_idc: ptl.level_idc,
+        frame_only_constraint: ptl.frame_only_constraint,
+        multilayer_enabled: ptl.multilayer_enabled,
+        gci_bits: ptl.gci_bits,
+        num_sub_profiles: ptl.num_sub_profiles,
+        sub_profile_idc: ptl.sub_profile_idc,
         ref_pic_resampling,
         res_change_in_clvs_allowed,
+        gdr_enabled,
+        wpp_enabled,
+        entry_points_present,
+        poc_lsb_bits,
+        max_sub_layers_minus1,
+        sub_layer_dpb_params,
+        max_dec_pic_buffering,
+        max_num_reorder_pics,
+        max_latency_increase_plus1,
+        poc_msb_cycle,
+        poc_msb_cycle_len,
+        extra_ph_bits,
+        extra_sh_bits,
     })
+}
+
+/// Parse the leading fields of an SPS RBSP (no emulation-prevention bytes).
+pub fn parse_sps_info(rbsp: &[u8]) -> Result<VvcSpsInfo, VvcError> {
+    let mut br = BitReader::new(rbsp);
+    parse_sps_header(&mut br)
 }
 
 // ============================================================================
@@ -1554,6 +1731,18 @@ pub struct VvcSps {
     pub dmvr_enabled: bool,
     /// `sps_mmvd_enabled_flag`.
     pub mmvd_enabled: bool,
+    /// `sps_mmvd_fullpel_only_flag`.
+    pub fpel_mmvd_enabled: bool,
+    /// `sps_bdof_control_present_in_ph_flag`.
+    pub bdof_control_present_in_ph: bool,
+    /// `sps_dmvr_control_present_in_ph_flag`.
+    pub dmvr_control_present_in_ph: bool,
+    /// `sps_prof_control_present_in_ph_flag`.
+    pub prof_control_present_in_ph: bool,
+    /// `sps_virtual_boundaries_enabled_flag`.
+    pub virtual_boundaries_enabled: bool,
+    /// `sps_loop_filter_across_virtual_boundaries_present_flag`.
+    pub virtual_boundaries_present: bool,
     /// `MaxNumMergeCand` (`6 - sps_six_minus_max_num_merge_cand`, `1..=6`).
     pub max_num_merge_cand: u8,
     /// `sps_sbt_enabled_flag`.
@@ -1634,65 +1823,12 @@ impl VvcSps {
 
 /// Parse a complete SPS RBSP (`H.266 §7.3.2.4`, `VLCReader.cpp:1363-2195`).
 pub fn parse_full_sps_rbsp(rbsp: &[u8]) -> Result<VvcSps, VvcError> {
-    let info = parse_sps_info(rbsp)?;
     let mut br = BitReader::new(rbsp);
-    // Advance past header + PTL using exact bit structure verified in parse_sps_info.
-    let _ = sps_bit(br.read_bits(15))?;
-    let _ptl_present = sps_bit(br.read_bit())?;
-    let _ = sps_bit(br.read_bits(18))?;
-    let gci_present = sps_bit(br.read_bit())?;
-    if gci_present {
-        for _ in 0..71 {
-            let _ = sps_bit(br.read_bit())?;
-        }
-        let add = sps_bit(br.read_bits(8))?;
-        for _ in 0..add {
-            let _ = sps_bit(br.read_bit())?;
-        }
-    }
-    while !br.is_byte_aligned() {
-        let _ = sps_bit(br.read_bit())?;
-    }
-    let num_sub = sps_bit(br.read_bits(8))?;
-    for _ in 0..num_sub {
-        let _ = sps_bit(br.read_bits(32))?;
-    }
-
-    let gdr_enabled = sps_bit(br.read_bit())?;
-    let _rpr = sps_bit(br.read_bit())?;
-    if _rpr {
-        // `sps_res_change_in_clvs_allowed_flag` (H.266 §7.3.2.4).
-        let _ = sps_bit(br.read_bit())?;
-    }
-    let _w = sps_bit(br.read_ue())?;
-    let _h = sps_bit(br.read_ue())?;
-    if sps_bit(br.read_bit())? {
-        for _ in 0..4 {
-            let _ = sps_bit(br.read_ue())?;
-        }
-    }
-    let _subpic = sps_bit(br.read_bit())?;
-    let _bd = sps_bit(br.read_ue())?;
-
-    let wpp_enabled = sps_bit(br.read_bit())?;
-    let entry_points_present = sps_bit(br.read_bit())?;
-    let poc_lsb_bits = (sps_bit(br.read_bits(4))? as u8) + 4;
-    let poc_msb_cycle = sps_bit(br.read_bit())?;
-    if poc_msb_cycle {
-        let _ = sps_bit(br.read_ue())?;
-    }
-    let extra_ph = sps_bit(br.read_bits(2))?;
-    for _ in 0..(extra_ph * 8) {
-        let _ = sps_bit(br.read_bit())?;
-    }
-    let extra_sh = sps_bit(br.read_bits(2))?;
-    for _ in 0..(extra_sh * 8) {
-        let _ = sps_bit(br.read_bit())?;
-    }
-    // dpb_parameters (maxSubLayersMinus1 == 0)
-    for _ in 0..3 {
-        let _ = sps_bit(br.read_ue())?;
-    }
+    let info = parse_sps_header(&mut br)?;
+    let gdr_enabled = info.gdr_enabled;
+    let wpp_enabled = info.wpp_enabled;
+    let entry_points_present = info.entry_points_present;
+    let poc_lsb_bits = info.poc_lsb_bits;
     let min_cb_log2 = (sps_bit(br.read_ue())? as u8).saturating_add(2);
     let partition_constraints_override_enabled = sps_bit(br.read_bit())?;
     let log2_diff_min_qt_min_cb_intra_luma = sps_bit(br.read_ue())? as u8;
@@ -1847,18 +1983,24 @@ pub fn parse_full_sps_rbsp(rbsp: &[u8]) -> Result<VvcSps, VvcError> {
     };
     let amvr_enabled = sps_bit(br.read_bit())?;
     let bdof_enabled = sps_bit(br.read_bit())?;
-    if bdof_enabled {
-        let _bdof_ph = sps_bit(br.read_bit())?;
-    }
+    let bdof_control_present_in_ph = if bdof_enabled {
+        sps_bit(br.read_bit())?
+    } else {
+        false
+    };
     let smvd_enabled = sps_bit(br.read_bit())?;
     let dmvr_enabled = sps_bit(br.read_bit())?;
-    if dmvr_enabled {
-        let _dmvr_ph = sps_bit(br.read_bit())?;
-    }
+    let dmvr_control_present_in_ph = if dmvr_enabled {
+        sps_bit(br.read_bit())?
+    } else {
+        false
+    };
     let mmvd_enabled = sps_bit(br.read_bit())?;
-    if mmvd_enabled {
-        let _fpel_mmvd = sps_bit(br.read_bit())?;
-    }
+    let fpel_mmvd_enabled = if mmvd_enabled {
+        sps_bit(br.read_bit())?
+    } else {
+        false
+    };
     let six_minus_merge = sps_bit(br.read_ue())?;
     if six_minus_merge > 5 {
         return Err(VvcError::Bitstream(
@@ -1874,6 +2016,7 @@ pub fn parse_full_sps_rbsp(rbsp: &[u8]) -> Result<VvcSps, VvcError> {
         mut affine_amvr_enabled,
         mut affine_prof_enabled,
     ) = (if sbtmvp_enabled { 1 } else { 0 }, false, false, false);
+    let mut prof_control_present_in_ph = false;
     if affine_enabled {
         let five_minus_aff = sps_bit(br.read_ue())?;
         if five_minus_aff > 4 {
@@ -1888,7 +2031,7 @@ pub fn parse_full_sps_rbsp(rbsp: &[u8]) -> Result<VvcSps, VvcError> {
         }
         affine_prof_enabled = sps_bit(br.read_bit())?;
         if affine_prof_enabled {
-            let _prof_ph = sps_bit(br.read_bit())?;
+            prof_control_present_in_ph = sps_bit(br.read_bit())?;
         }
     }
     let bcw_enabled = sps_bit(br.read_bit())?;
@@ -1953,6 +2096,12 @@ pub fn parse_full_sps_rbsp(rbsp: &[u8]) -> Result<VvcSps, VvcError> {
     };
     let dep_quant_enabled = sps_bit(br.read_bit())?;
     let sign_data_hiding_enabled = sps_bit(br.read_bit())?;
+    let virtual_boundaries_enabled = sps_bit(br.read_bit())?;
+    let virtual_boundaries_present = if virtual_boundaries_enabled {
+        sps_bit(br.read_bit())?
+    } else {
+        false
+    };
 
     Ok(VvcSps {
         info,
@@ -2003,6 +2152,12 @@ pub fn parse_full_sps_rbsp(rbsp: &[u8]) -> Result<VvcSps, VvcError> {
         smvd_enabled,
         dmvr_enabled,
         mmvd_enabled,
+        fpel_mmvd_enabled,
+        bdof_control_present_in_ph,
+        dmvr_control_present_in_ph,
+        prof_control_present_in_ph,
+        virtual_boundaries_enabled,
+        virtual_boundaries_present,
         max_num_merge_cand,
         sbt_enabled,
         affine_enabled,
@@ -2119,6 +2274,15 @@ pub struct VvcPps {
     pub wp_info_in_ph: bool,
     /// `pps_qp_delta_info_in_ph_flag`.
     pub qp_delta_info_in_ph: bool,
+    /// `pps_cu_chroma_qp_offset_list_enabled_flag`.
+    ///
+    /// The bitstream writer does not emit a chroma QP offset list, so only the
+    /// parser can produce `true`.
+    pub cu_chroma_qp_offset_list_enabled: bool,
+    /// `pps_picture_header_extension_present_flag`.
+    pub picture_header_extension_present: bool,
+    /// `pps_slice_header_extension_present_flag`.
+    pub slice_header_extension_present: bool,
 }
 
 impl Default for VvcPps {
@@ -2166,6 +2330,9 @@ impl Default for VvcPps {
             alf_info_in_ph: false,
             wp_info_in_ph: false,
             qp_delta_info_in_ph: false,
+            cu_chroma_qp_offset_list_enabled: false,
+            picture_header_extension_present: false,
+            slice_header_extension_present: false,
         }
     }
 }
@@ -2236,7 +2403,9 @@ pub fn build_full_pps_rbsp(pps: &VvcPps) -> Vec<u8> {
             bw.write_se(j_off);
         }
         bw.write_bit(pps.slice_chroma_qp_offsets_present);
-        bw.write_bit(false); // pps_cu_chroma_qp_offset_list_enabled_flag
+        // The writer does not emit a chroma QP offset list, so the flag stays
+        // unset (`pps_cu_chroma_qp_offset_list_enabled_flag`).
+        bw.write_bit(false);
     }
     bw.write_bit(pps.deblocking_control_present);
     if pps.deblocking_control_present {
@@ -2265,8 +2434,8 @@ pub fn build_full_pps_rbsp(pps: &VvcPps) -> Vec<u8> {
         }
         bw.write_bit(pps.qp_delta_info_in_ph);
     }
-    bw.write_bit(false); // pps_picture_header_extension_present_flag
-    bw.write_bit(false); // pps_slice_header_extension_present_flag
+    bw.write_bit(pps.picture_header_extension_present);
+    bw.write_bit(pps.slice_header_extension_present);
     bw.write_bit(false); // pps_extension_flag
     bw.rbsp_trailing_bits();
     bw.into_bytes()
@@ -2380,6 +2549,7 @@ pub fn parse_full_pps_rbsp(rbsp: &[u8]) -> Result<VvcPps, VvcError> {
     let (mut cb_qp_offset, mut cr_qp_offset) = (0, 0);
     let mut joint_cbcr_qp_offset = None;
     let mut slice_chroma_qp_offsets_present = false;
+    let mut cu_chroma_qp_offset_list_enabled = false;
     if chroma_tool_offsets_present {
         cb_qp_offset = hls_bit("PPS", br.read_se())?;
         cr_qp_offset = hls_bit("PPS", br.read_se())?;
@@ -2387,7 +2557,8 @@ pub fn parse_full_pps_rbsp(rbsp: &[u8]) -> Result<VvcPps, VvcError> {
             joint_cbcr_qp_offset = Some(hls_bit("PPS", br.read_se())?);
         }
         slice_chroma_qp_offsets_present = hls_bit("PPS", br.read_bit())?;
-        if hls_bit("PPS", br.read_bit())? {
+        cu_chroma_qp_offset_list_enabled = hls_bit("PPS", br.read_bit())?;
+        if cu_chroma_qp_offset_list_enabled {
             let list_len = (hls_bit("PPS", br.read_ue())? as usize) + 1;
             for _ in 0..list_len {
                 let _ = hls_bit("PPS", br.read_se())?;
@@ -2453,6 +2624,11 @@ pub fn parse_full_pps_rbsp(rbsp: &[u8]) -> Result<VvcPps, VvcError> {
         }
         qp_delta_info_in_ph = hls_bit("PPS", br.read_bit())?;
     }
+    let picture_header_extension_present = hls_bit("PPS", br.read_bit())?;
+    let slice_header_extension_present = hls_bit("PPS", br.read_bit())?;
+    if hls_bit("PPS", br.read_bit())? {
+        return Err(VvcError::Unsupported("PPS: pps_extension_flag"));
+    }
 
     Ok(VvcPps {
         pps_id,
@@ -2497,6 +2673,9 @@ pub fn parse_full_pps_rbsp(rbsp: &[u8]) -> Result<VvcPps, VvcError> {
         alf_info_in_ph,
         wp_info_in_ph,
         qp_delta_info_in_ph,
+        cu_chroma_qp_offset_list_enabled,
+        picture_header_extension_present,
+        slice_header_extension_present,
     })
 }
 
@@ -3054,6 +3233,10 @@ pub struct VvcPictureHeader {
     pub pps_id: u8,
     /// `ph_pic_order_cnt_lsb`.
     pub poc_lsb: u32,
+    /// `ph_poc_msb_present_flag`.
+    pub poc_msb_present: bool,
+    /// `ph_poc_msb_cycle_val` (`sps_poc_msb_cycle_len` bits).
+    pub poc_msb: u32,
     /// `ph_recovery_poc_cnt` when `gdr_pic == true`.
     pub recovery_poc_cnt: u32,
     /// `ph_lmcs_enabled_flag`.
@@ -3066,12 +3249,71 @@ pub struct VvcPictureHeader {
     pub explicit_scaling_list_enabled: bool,
     /// `ph_scaling_list_aps_id`.
     pub scaling_list_aps_id: u8,
+    /// `ph_pic_output_flag`.
+    pub pic_output: bool,
+    /// Reference picture lists carried by the PH when
+    /// `pps_rpl_info_in_ph_flag == 1` (`H.266 §7.3.2.8`).
+    pub rpl: [VvcRefPicListStruct; 2],
+    /// `RplsIdx[l]`; `-1` when the list is signalled inline in the PH.
+    pub rpl_idx: [i32; 2],
+    /// `ph_partition_constraints_override_flag`.
+    pub partition_constraints_override: bool,
+    /// Effective `log2_diff_min_qt_min_cb_*` for (intra luma, inter, intra chroma).
+    pub log2_diff_min_qt_min_cb: [u8; 3],
+    /// Effective `max_mtt_hierarchy_depth_*` for (intra luma, inter, intra chroma).
+    pub max_mtt_depth: [u8; 3],
+    /// Effective `log2_diff_max_bt_min_qt_*` for (intra luma, inter, intra chroma).
+    pub log2_diff_max_bt_min_qt: [u8; 3],
+    /// Effective `log2_diff_max_tt_min_qt_*` for (intra luma, inter, intra chroma).
+    pub log2_diff_max_tt_min_qt: [u8; 3],
+    /// `ph_cu_qp_delta_subdiv_intra_slice`.
+    pub cu_qp_delta_subdiv_intra: u32,
+    /// `ph_cu_qp_delta_subdiv_inter_slice`.
+    pub cu_qp_delta_subdiv_inter: u32,
+    /// `ph_cu_chroma_qp_offset_subdiv_intra_slice`.
+    pub cu_chroma_qp_offset_subdiv_intra: u32,
+    /// `ph_cu_chroma_qp_offset_subdiv_inter_slice`.
+    pub cu_chroma_qp_offset_subdiv_inter: u32,
     /// `ph_temporal_mvp_enabled_flag`.
     pub temporal_mvp_enabled: bool,
+    /// `ph_collocated_from_l0_flag`.
+    pub collocated_from_l0: bool,
+    /// `ph_collocated_ref_idx`.
+    pub collocated_ref_idx: u32,
+    /// `ph_fpel_mmvd_enabled_flag`.
+    pub fpel_mmvd: bool,
     /// `ph_mvd_l1_zero_flag`.
     pub mvd_l1_zero: bool,
+    /// `ph_bdof_disabled_flag`.
+    pub bdof_disabled: bool,
+    /// `ph_dmvr_disabled_flag`.
+    pub dmvr_disabled: bool,
+    /// `ph_prof_disabled_flag`.
+    pub prof_disabled: bool,
+    /// `ph_qp_delta`.
+    pub qp_delta: i32,
     /// `ph_joint_cbcr_sign_flag`.
     pub joint_cbcr_sign: bool,
+    /// `ph_sao_luma_enabled_flag`.
+    pub sao_luma: bool,
+    /// `ph_sao_chroma_enabled_flag` (inferred `true` when SAO info is not in the PH).
+    pub sao_chroma: bool,
+    /// `ph_deblocking_params_present_flag`.
+    pub deblocking_override: bool,
+    /// `ph_deblocking_filter_disabled_flag`.
+    pub deblocking_disabled: bool,
+    /// `ph_beta_offset_div2`.
+    pub luma_beta_offset_div2: i32,
+    /// `ph_tc_offset_div2`.
+    pub luma_tc_offset_div2: i32,
+    /// `ph_cb_beta_offset_div2`.
+    pub cb_beta_offset_div2: i32,
+    /// `ph_cb_tc_offset_div2`.
+    pub cb_tc_offset_div2: i32,
+    /// `ph_cr_beta_offset_div2`.
+    pub cr_beta_offset_div2: i32,
+    /// `ph_cr_tc_offset_div2`.
+    pub cr_tc_offset_div2: i32,
 }
 
 impl Default for VvcPictureHeader {
@@ -3084,15 +3326,49 @@ impl Default for VvcPictureHeader {
             intra_slice_allowed: true,
             pps_id: 0,
             poc_lsb: 0,
+            poc_msb_present: false,
+            poc_msb: 0,
             recovery_poc_cnt: 0,
             lmcs_enabled: false,
             lmcs_aps_id: 0,
             chroma_residual_scale: false,
             explicit_scaling_list_enabled: false,
             scaling_list_aps_id: 0,
+            pic_output: true,
+            rpl: [
+                VvcRefPicListStruct::default(),
+                VvcRefPicListStruct::default(),
+            ],
+            rpl_idx: [-1, -1],
+            partition_constraints_override: false,
+            log2_diff_min_qt_min_cb: [0; 3],
+            max_mtt_depth: [0; 3],
+            log2_diff_max_bt_min_qt: [0; 3],
+            log2_diff_max_tt_min_qt: [0; 3],
+            cu_qp_delta_subdiv_intra: 0,
+            cu_qp_delta_subdiv_inter: 0,
+            cu_chroma_qp_offset_subdiv_intra: 0,
+            cu_chroma_qp_offset_subdiv_inter: 0,
             temporal_mvp_enabled: false,
+            collocated_from_l0: true,
+            collocated_ref_idx: 0,
+            fpel_mmvd: false,
             mvd_l1_zero: false,
+            bdof_disabled: false,
+            dmvr_disabled: false,
+            prof_disabled: false,
+            qp_delta: 0,
             joint_cbcr_sign: false,
+            sao_luma: false,
+            sao_chroma: false,
+            deblocking_override: false,
+            deblocking_disabled: false,
+            luma_beta_offset_div2: 0,
+            luma_tc_offset_div2: 0,
+            cb_beta_offset_div2: 0,
+            cb_tc_offset_div2: 0,
+            cr_beta_offset_div2: 0,
+            cr_tc_offset_div2: 0,
         }
     }
 }
@@ -3118,6 +3394,17 @@ pub fn write_picture_header_structure(
     if ph.gdr_pic {
         bw.write_ue(ph.recovery_poc_cnt);
     }
+    for present in &sps.info.extra_ph_bits {
+        if *present {
+            bw.write_bit(false); // ph_extra_bit[i]
+        }
+    }
+    if sps.info.poc_msb_cycle {
+        bw.write_bit(ph.poc_msb_present);
+        if ph.poc_msb_present {
+            bw.write_bits(ph.poc_msb, u32::from(sps.info.poc_msb_cycle_len));
+        }
+    }
     if sps.alf_enabled && pps.alf_info_in_ph {
         bw.write_bit(false); // ph_alf_enabled_flag
     }
@@ -3137,39 +3424,143 @@ pub fn write_picture_header_structure(
         }
     }
     if pps.output_flag_present && !ph.non_ref_pic {
-        bw.write_bit(true); // ph_pic_output_flag
+        bw.write_bit(ph.pic_output);
+    }
+    if pps.rpl_info_in_ph {
+        let forbidden_zero = !sps.weighted_pred && !sps.weighted_bipred;
+        for l in 0..2usize {
+            let sps_lists = &sps.rpl_lists[l];
+            let rpl_sps_flag = ph.rpl_idx[l] >= 0 && !sps_lists.is_empty();
+            if !sps_lists.is_empty() && (l == 0 || pps.rpl1_idx_present) {
+                bw.write_bit(rpl_sps_flag);
+            }
+            if rpl_sps_flag {
+                let idx = ph.rpl_idx[l] as usize;
+                if sps_lists.len() > 1 && (l == 0 || pps.rpl1_idx_present) {
+                    bw.write_bits(idx as u32, ceil_log2(sps_lists.len() as u32));
+                }
+            } else {
+                write_ref_pic_list_struct(
+                    bw,
+                    &ph.rpl[l],
+                    sps.long_term_ref_pics,
+                    u32::from(sps.poc_lsb_bits),
+                    forbidden_zero,
+                    false,
+                );
+            }
+        }
     }
     if sps.partition_constraints_override_enabled {
-        bw.write_bit(false); // ph_partition_constraints_override_flag
+        bw.write_bit(ph.partition_constraints_override);
+        if ph.partition_constraints_override {
+            if ph.intra_slice_allowed {
+                bw.write_ue(u32::from(ph.log2_diff_min_qt_min_cb[0]));
+                bw.write_ue(u32::from(ph.max_mtt_depth[0]));
+                if ph.max_mtt_depth[0] != 0 {
+                    bw.write_ue(u32::from(ph.log2_diff_max_bt_min_qt[0]));
+                    bw.write_ue(u32::from(ph.log2_diff_max_tt_min_qt[0]));
+                }
+                if sps.dual_tree_intra {
+                    bw.write_ue(u32::from(ph.log2_diff_min_qt_min_cb[2]));
+                    bw.write_ue(u32::from(ph.max_mtt_depth[2]));
+                    if ph.max_mtt_depth[2] != 0 {
+                        bw.write_ue(u32::from(ph.log2_diff_max_bt_min_qt[2]));
+                        bw.write_ue(u32::from(ph.log2_diff_max_tt_min_qt[2]));
+                    }
+                }
+            }
+            if ph.inter_slice_allowed {
+                bw.write_ue(u32::from(ph.log2_diff_min_qt_min_cb[1]));
+                bw.write_ue(u32::from(ph.max_mtt_depth[1]));
+                if ph.max_mtt_depth[1] != 0 {
+                    bw.write_ue(u32::from(ph.log2_diff_max_bt_min_qt[1]));
+                    bw.write_ue(u32::from(ph.log2_diff_max_tt_min_qt[1]));
+                }
+            }
+        }
     }
     if ph.intra_slice_allowed && pps.cu_qp_delta_enabled {
-        bw.write_ue(0); // ph_cu_qp_delta_subdiv_intra_slice
+        bw.write_ue(ph.cu_qp_delta_subdiv_intra);
+    }
+    if ph.intra_slice_allowed && pps.cu_chroma_qp_offset_list_enabled {
+        bw.write_ue(ph.cu_chroma_qp_offset_subdiv_intra);
     }
     if ph.inter_slice_allowed {
         if pps.cu_qp_delta_enabled {
-            bw.write_ue(0); // ph_cu_qp_delta_subdiv_inter_slice
+            bw.write_ue(ph.cu_qp_delta_subdiv_inter);
+        }
+        if pps.cu_chroma_qp_offset_list_enabled {
+            bw.write_ue(ph.cu_chroma_qp_offset_subdiv_inter);
         }
         if sps.temporal_mvp_enabled {
             bw.write_bit(ph.temporal_mvp_enabled);
         }
-        if !pps.rpl_info_in_ph {
+        if ph.temporal_mvp_enabled && pps.rpl_info_in_ph {
+            let l1_entries = ph.rpl[1].entries.len();
+            if l1_entries > 0 {
+                bw.write_bit(ph.collocated_from_l0);
+            }
+            let collocated_entries = if ph.collocated_from_l0 {
+                ph.rpl[0].entries.len()
+            } else {
+                l1_entries
+            };
+            if collocated_entries > 1 {
+                bw.write_ue(ph.collocated_ref_idx);
+            }
+        } else if !sps.temporal_mvp_enabled {
+            // `ph_temporal_mvp_enabled_flag` is absent; nothing else to write here.
+        }
+        if sps.fpel_mmvd_enabled {
+            bw.write_bit(ph.fpel_mmvd);
+        }
+        if !pps.rpl_info_in_ph || !ph.rpl[1].entries.is_empty() {
             bw.write_bit(ph.mvd_l1_zero);
+        }
+        let has_l1 = !pps.rpl_info_in_ph || !ph.rpl[1].entries.is_empty();
+        if sps.bdof_control_present_in_ph && has_l1 {
+            bw.write_bit(ph.bdof_disabled);
+        }
+        if sps.dmvr_control_present_in_ph && has_l1 {
+            bw.write_bit(ph.dmvr_disabled);
+        }
+        if sps.prof_control_present_in_ph {
+            bw.write_bit(ph.prof_disabled);
         }
     }
     if pps.qp_delta_info_in_ph {
-        bw.write_se(0); // ph_qp_delta
+        bw.write_se(ph.qp_delta);
     }
     if sps.joint_cbcr_enabled {
         bw.write_bit(ph.joint_cbcr_sign);
     }
     if sps.sao_enabled && pps.sao_info_in_ph {
-        bw.write_bit(false);
+        bw.write_bit(ph.sao_luma);
         if sps.info.chroma_format_idc != 0 {
-            bw.write_bit(false);
+            bw.write_bit(ph.sao_chroma);
         }
     }
     if pps.deblocking_control_present && pps.dbf_info_in_ph {
-        bw.write_bit(false); // ph_deblocking_params_present_flag
+        bw.write_bit(ph.deblocking_override);
+        if ph.deblocking_override {
+            if !pps.deblocking_disabled {
+                bw.write_bit(ph.deblocking_disabled);
+            }
+            if !ph.deblocking_disabled {
+                bw.write_se(ph.luma_beta_offset_div2);
+                bw.write_se(ph.luma_tc_offset_div2);
+                if pps.chroma_tool_offsets_present {
+                    bw.write_se(ph.cb_beta_offset_div2);
+                    bw.write_se(ph.cb_tc_offset_div2);
+                    bw.write_se(ph.cr_beta_offset_div2);
+                    bw.write_se(ph.cr_tc_offset_div2);
+                }
+            }
+        }
+    }
+    if pps.picture_header_extension_present {
+        bw.write_ue(0); // ph_extension_length
     }
 }
 
@@ -3218,6 +3609,18 @@ pub fn parse_picture_header_structure(
     } else {
         0
     };
+    for present in &sps.info.extra_ph_bits {
+        if *present {
+            let _ = hls_bit("PH", br.read_bit())?; // ph_extra_bit[i]
+        }
+    }
+    let (mut poc_msb_present, mut poc_msb) = (false, 0u32);
+    if sps.info.poc_msb_cycle {
+        poc_msb_present = hls_bit("PH", br.read_bit())?;
+        if poc_msb_present {
+            poc_msb = hls_bit("PH", br.read_bits(u32::from(sps.info.poc_msb_cycle_len)))?;
+        }
+    }
     if sps.alf_enabled && pps.alf_info_in_ph {
         let alf_en = hls_bit("PH", br.read_bit())?;
         if alf_en {
@@ -3259,70 +3662,281 @@ pub fn parse_picture_header_structure(
             scaling_list_aps_id = hls_bit("PH", br.read_bits(3))? as u8;
         }
     }
-    if pps.output_flag_present && !non_ref_pic {
-        let _ = hls_bit("PH", br.read_bit())?;
+    let pic_output = if pps.output_flag_present && !non_ref_pic {
+        hls_bit("PH", br.read_bit())?
+    } else {
+        true
+    };
+    if sps.virtual_boundaries_enabled && !sps.virtual_boundaries_present {
+        if hls_bit("PH", br.read_bit())? {
+            return Err(VvcError::Unsupported(
+                "PH: virtual boundaries signalled in the picture header",
+            ));
+        }
     }
-    if sps.partition_constraints_override_enabled {
-        let ovr = hls_bit("PH", br.read_bit())?;
-        if ovr {
-            if intra_slice_allowed {
-                let _ = hls_bit("PH", br.read_ue())?;
-                let mtt_y = hls_bit("PH", br.read_ue())?;
-                if mtt_y != 0 {
-                    let _ = hls_bit("PH", br.read_ue())?;
-                    let _ = hls_bit("PH", br.read_ue())?;
-                }
-                if sps.dual_tree_intra {
-                    let _ = hls_bit("PH", br.read_ue())?;
-                    let mtt_c = hls_bit("PH", br.read_ue())?;
-                    if mtt_c != 0 {
-                        let _ = hls_bit("PH", br.read_ue())?;
-                        let _ = hls_bit("PH", br.read_ue())?;
-                    }
-                }
+
+    let mut rpl = [
+        VvcRefPicListStruct::default(),
+        VvcRefPicListStruct::default(),
+    ];
+    let mut rpl_idx = [-1i32; 2];
+    if pps.rpl_info_in_ph {
+        let forbidden_zero = !sps.weighted_pred && !sps.weighted_bipred;
+        let mut rpl_sps_flag0 = false;
+        let mut rpl_idx0 = -1i32;
+        for l in 0..2usize {
+            let num_in_sps = sps.rpl_lists[l].len();
+            let rpl_sps_flag = if num_in_sps == 0 {
+                false
+            } else if l == 0 || pps.rpl1_idx_present {
+                hls_bit("PH", br.read_bit())?
+            } else {
+                rpl_sps_flag0
+            };
+            if l == 0 {
+                rpl_sps_flag0 = rpl_sps_flag;
             }
-            if inter_slice_allowed {
-                let _ = hls_bit("PH", br.read_ue())?;
-                let mtt_inter = hls_bit("PH", br.read_ue())?;
-                if mtt_inter != 0 {
-                    let _ = hls_bit("PH", br.read_ue())?;
-                    let _ = hls_bit("PH", br.read_ue())?;
+            if rpl_sps_flag {
+                let idx = if num_in_sps > 1 && (l == 0 || pps.rpl1_idx_present) {
+                    let bits = ceil_log2(num_in_sps as u32);
+                    hls_bit("PH", br.read_bits(bits))? as usize
+                } else if num_in_sps == 1 {
+                    0
+                } else {
+                    usize::try_from(rpl_idx0).map_err(|_| {
+                        VvcError::Bitstream("PH: missing list-0 RPL for list 1".to_string())
+                    })?
+                };
+                if l == 0 {
+                    rpl_idx0 = idx as i32;
                 }
+                rpl[l] = sps.rpl_lists[l]
+                    .get(idx)
+                    .cloned()
+                    .ok_or_else(|| VvcError::Bitstream("PH: rpl_idx out of bounds".to_string()))?;
+                rpl_idx[l] = idx as i32;
+            } else {
+                rpl[l] = parse_ref_pic_list_struct(
+                    br,
+                    sps.long_term_ref_pics,
+                    u32::from(sps.poc_lsb_bits),
+                    forbidden_zero,
+                    false,
+                )?;
+                rpl_idx[l] = -1;
             }
         }
     }
-    if intra_slice_allowed && pps.cu_qp_delta_enabled {
-        let _ = hls_bit("PH", br.read_ue())?;
+
+    let partition_constraints_override = if sps.partition_constraints_override_enabled {
+        hls_bit("PH", br.read_bit())?
+    } else {
+        false
+    };
+    let mut log2_diff_min_qt_min_cb = [
+        sps.log2_diff_min_qt_min_cb_intra_luma,
+        sps.log2_diff_min_qt_min_cb_inter,
+        sps.log2_diff_min_qt_min_cb_intra_chroma,
+    ];
+    let mut max_mtt_depth = [
+        sps.max_mtt_depth_intra_luma,
+        sps.max_mtt_depth_inter,
+        sps.max_mtt_depth_intra_chroma,
+    ];
+    let mut log2_diff_max_bt_min_qt = [
+        sps.log2_diff_max_bt_min_qt_intra_luma,
+        sps.log2_diff_max_bt_min_qt_inter,
+        sps.log2_diff_max_bt_min_qt_intra_chroma,
+    ];
+    let mut log2_diff_max_tt_min_qt = [
+        sps.log2_diff_max_tt_min_qt_intra_luma,
+        sps.log2_diff_max_tt_min_qt_inter,
+        sps.log2_diff_max_tt_min_qt_intra_chroma,
+    ];
+    if intra_slice_allowed && partition_constraints_override {
+        log2_diff_min_qt_min_cb[0] = hls_bit("PH", br.read_ue())?.min(u32::from(u8::MAX)) as u8;
+        max_mtt_depth[0] = hls_bit("PH", br.read_ue())?.min(u32::from(u8::MAX)) as u8;
+        if max_mtt_depth[0] != 0 {
+            log2_diff_max_bt_min_qt[0] = hls_bit("PH", br.read_ue())?.min(u32::from(u8::MAX)) as u8;
+            log2_diff_max_tt_min_qt[0] = hls_bit("PH", br.read_ue())?.min(u32::from(u8::MAX)) as u8;
+        }
+        if sps.dual_tree_intra {
+            log2_diff_min_qt_min_cb[2] = hls_bit("PH", br.read_ue())?.min(u32::from(u8::MAX)) as u8;
+            max_mtt_depth[2] = hls_bit("PH", br.read_ue())?.min(u32::from(u8::MAX)) as u8;
+            if max_mtt_depth[2] != 0 {
+                log2_diff_max_bt_min_qt[2] =
+                    hls_bit("PH", br.read_ue())?.min(u32::from(u8::MAX)) as u8;
+                log2_diff_max_tt_min_qt[2] =
+                    hls_bit("PH", br.read_ue())?.min(u32::from(u8::MAX)) as u8;
+            }
+        }
     }
+    // The override values for inter slices follow the intra ones directly
+    // (`H.266 §7.3.2.8`), before `ph_cu_qp_delta_subdiv_intra_slice`.
+    if inter_slice_allowed && partition_constraints_override {
+        log2_diff_min_qt_min_cb[1] = hls_bit("PH", br.read_ue())?.min(u32::from(u8::MAX)) as u8;
+        max_mtt_depth[1] = hls_bit("PH", br.read_ue())?.min(u32::from(u8::MAX)) as u8;
+        if max_mtt_depth[1] != 0 {
+            log2_diff_max_bt_min_qt[1] = hls_bit("PH", br.read_ue())?.min(u32::from(u8::MAX)) as u8;
+            log2_diff_max_tt_min_qt[1] = hls_bit("PH", br.read_ue())?.min(u32::from(u8::MAX)) as u8;
+        }
+    }
+    let mut cu_qp_delta_subdiv_intra = 0u32;
+    if intra_slice_allowed && pps.cu_qp_delta_enabled {
+        cu_qp_delta_subdiv_intra = hls_bit("PH", br.read_ue())?;
+    }
+    let mut cu_chroma_qp_offset_subdiv_intra = 0u32;
+    if intra_slice_allowed && pps.cu_chroma_qp_offset_list_enabled {
+        cu_chroma_qp_offset_subdiv_intra = hls_bit("PH", br.read_ue())?;
+    }
+
     let mut temporal_mvp_enabled = false;
-    let mut mvd_l1_zero = false;
+    let mut collocated_from_l0 = false;
+    let mut collocated_ref_idx = 0u32;
+    let mut fpel_mmvd = false;
+    let mut mvd_l1_zero = true;
+    let mut bdof_disabled = !sps.bdof_enabled;
+    let mut dmvr_disabled = !sps.dmvr_enabled;
+    let mut prof_disabled = !sps.affine_prof_enabled;
+    let mut cu_qp_delta_subdiv_inter = 0u32;
+    let mut cu_chroma_qp_offset_subdiv_inter = 0u32;
     if inter_slice_allowed {
         if pps.cu_qp_delta_enabled {
-            let _ = hls_bit("PH", br.read_ue())?;
+            cu_qp_delta_subdiv_inter = hls_bit("PH", br.read_ue())?;
+        }
+        if pps.cu_chroma_qp_offset_list_enabled {
+            cu_chroma_qp_offset_subdiv_inter = hls_bit("PH", br.read_ue())?;
         }
         if sps.temporal_mvp_enabled {
             temporal_mvp_enabled = hls_bit("PH", br.read_bit())?;
         }
-        if !pps.rpl_info_in_ph {
+        if temporal_mvp_enabled && pps.rpl_info_in_ph {
+            let l1_entries = rpl[1].entries.len();
+            if l1_entries > 0 {
+                collocated_from_l0 = hls_bit("PH", br.read_bit())?;
+            } else {
+                collocated_from_l0 = true;
+            }
+            let collocated_entries = if collocated_from_l0 {
+                rpl[0].entries.len()
+            } else {
+                l1_entries
+            };
+            if collocated_entries > 1 {
+                collocated_ref_idx = hls_bit("PH", br.read_ue())?;
+            }
+        }
+        if sps.fpel_mmvd_enabled {
+            fpel_mmvd = hls_bit("PH", br.read_bit())?;
+        }
+        if !pps.rpl_info_in_ph || !rpl[1].entries.is_empty() {
             mvd_l1_zero = hls_bit("PH", br.read_bit())?;
         }
+        let has_l1 = !pps.rpl_info_in_ph || !rpl[1].entries.is_empty();
+        if sps.bdof_control_present_in_ph && has_l1 {
+            bdof_disabled = hls_bit("PH", br.read_bit())?;
+        } else if sps.bdof_control_present_in_ph {
+            bdof_disabled = true;
+        }
+        if sps.dmvr_control_present_in_ph && has_l1 {
+            dmvr_disabled = hls_bit("PH", br.read_bit())?;
+        } else if sps.dmvr_control_present_in_ph {
+            dmvr_disabled = true;
+        }
+        if sps.prof_control_present_in_ph {
+            prof_disabled = hls_bit("PH", br.read_bit())?;
+        }
+        if (pps.weighted_pred || pps.weighted_bipred) && pps.wp_info_in_ph {
+            return Err(VvcError::Unsupported(
+                "PH: weighted prediction parameters in the picture header",
+            ));
+        }
     }
-    if pps.qp_delta_info_in_ph {
-        let _ = hls_bit("PH", br.read_se())?;
-    }
+
+    let qp_delta = if pps.qp_delta_info_in_ph {
+        hls_bit("PH", br.read_se())?
+    } else {
+        0
+    };
     let joint_cbcr_sign = if sps.joint_cbcr_enabled {
         hls_bit("PH", br.read_bit())?
     } else {
         false
     };
-    if sps.sao_enabled && pps.sao_info_in_ph {
-        let _ = hls_bit("PH", br.read_bit())?;
-        if sps.info.chroma_format_idc != 0 {
-            let _ = hls_bit("PH", br.read_bit())?;
+    let (mut sao_luma, mut sao_chroma) = (false, false);
+    if sps.sao_enabled {
+        if pps.sao_info_in_ph {
+            sao_luma = hls_bit("PH", br.read_bit())?;
+            if sps.info.chroma_format_idc != 0 {
+                sao_chroma = hls_bit("PH", br.read_bit())?;
+            }
+        } else {
+            sao_luma = true;
+            sao_chroma = sps.info.chroma_format_idc != 0;
         }
     }
-    if pps.deblocking_control_present && pps.dbf_info_in_ph {
-        let _ = hls_bit("PH", br.read_bit())?;
+    let mut deblocking_override = false;
+    let mut deblocking_disabled = pps.deblocking_disabled;
+    let (
+        mut luma_beta_offset_div2,
+        mut luma_tc_offset_div2,
+        mut cb_beta_offset_div2,
+        mut cb_tc_offset_div2,
+        mut cr_beta_offset_div2,
+        mut cr_tc_offset_div2,
+    ) = (
+        pps.luma_beta_offset_div2,
+        pps.luma_tc_offset_div2,
+        pps.cb_beta_offset_div2,
+        pps.cb_tc_offset_div2,
+        pps.cr_beta_offset_div2,
+        pps.cr_tc_offset_div2,
+    );
+    if pps.deblocking_control_present {
+        if pps.dbf_info_in_ph {
+            deblocking_override = hls_bit("PH", br.read_bit())?;
+        }
+        if deblocking_override {
+            if !pps.deblocking_disabled {
+                deblocking_disabled = hls_bit("PH", br.read_bit())?;
+            } else {
+                deblocking_disabled = false;
+            }
+            if !deblocking_disabled {
+                luma_beta_offset_div2 = hls_bit("PH", br.read_se())?;
+                luma_tc_offset_div2 = hls_bit("PH", br.read_se())?;
+                if pps.chroma_tool_offsets_present {
+                    cb_beta_offset_div2 = hls_bit("PH", br.read_se())?;
+                    cb_tc_offset_div2 = hls_bit("PH", br.read_se())?;
+                    cr_beta_offset_div2 = hls_bit("PH", br.read_se())?;
+                    cr_tc_offset_div2 = hls_bit("PH", br.read_se())?;
+                } else {
+                    cb_beta_offset_div2 = luma_beta_offset_div2;
+                    cb_tc_offset_div2 = luma_tc_offset_div2;
+                    cr_beta_offset_div2 = luma_beta_offset_div2;
+                    cr_tc_offset_div2 = luma_tc_offset_div2;
+                }
+            }
+        }
+    } else {
+        deblocking_disabled = false;
+        luma_beta_offset_div2 = 0;
+        luma_tc_offset_div2 = 0;
+        cb_beta_offset_div2 = 0;
+        cb_tc_offset_div2 = 0;
+        cr_beta_offset_div2 = 0;
+        cr_tc_offset_div2 = 0;
+    }
+    if pps.picture_header_extension_present {
+        let len = hls_bit("PH", br.read_ue())?;
+        if len > 256 {
+            return Err(VvcError::LimitExceeded(format!(
+                "PH: ph_extension_length {len} exceeds 256"
+            )));
+        }
+        for _ in 0..len {
+            let _ = hls_bit("PH", br.read_bits(8))?;
+        }
     }
 
     Ok(VvcPictureHeader {
@@ -3333,15 +3947,46 @@ pub fn parse_picture_header_structure(
         intra_slice_allowed,
         pps_id,
         poc_lsb,
+        poc_msb_present,
+        poc_msb,
         recovery_poc_cnt,
         lmcs_enabled,
         lmcs_aps_id,
         chroma_residual_scale,
         explicit_scaling_list_enabled,
         scaling_list_aps_id,
+        pic_output,
+        rpl,
+        rpl_idx,
+        partition_constraints_override,
+        log2_diff_min_qt_min_cb,
+        max_mtt_depth,
+        log2_diff_max_bt_min_qt,
+        log2_diff_max_tt_min_qt,
+        cu_qp_delta_subdiv_intra,
+        cu_qp_delta_subdiv_inter,
+        cu_chroma_qp_offset_subdiv_intra,
+        cu_chroma_qp_offset_subdiv_inter,
         temporal_mvp_enabled,
+        collocated_from_l0,
+        collocated_ref_idx,
+        fpel_mmvd,
         mvd_l1_zero,
+        bdof_disabled,
+        dmvr_disabled,
+        prof_disabled,
+        qp_delta,
         joint_cbcr_sign,
+        sao_luma,
+        sao_chroma,
+        deblocking_override,
+        deblocking_disabled,
+        luma_beta_offset_div2,
+        luma_tc_offset_div2,
+        cb_beta_offset_div2,
+        cb_tc_offset_div2,
+        cr_beta_offset_div2,
+        cr_tc_offset_div2,
     })
 }
 
@@ -3427,6 +4072,10 @@ pub struct VvcSliceHeader {
     pub sign_data_hiding_used: bool,
     /// `sh_ts_residual_coding_disabled_flag`.
     pub ts_residual_coding_disabled: bool,
+    /// `sh_pred_weight_table()` is present for this slice.
+    pub weighted_pred_table: bool,
+    /// `sh_cu_chroma_qp_offset_enabled_flag`.
+    pub cu_chroma_qp_offset_enabled: bool,
     /// Entry point offsets (`sh_entry_point_offset_minus1[i] + 1`).
     pub entry_point_offsets: Vec<u32>,
 }
@@ -3471,6 +4120,8 @@ impl Default for VvcSliceHeader {
             dep_quant_used: false,
             sign_data_hiding_used: false,
             ts_residual_coding_disabled: false,
+            weighted_pred_table: false,
+            cu_chroma_qp_offset_enabled: false,
             entry_point_offsets: Vec::new(),
         }
     }
@@ -3547,19 +4198,22 @@ pub fn build_full_slice_header_bits(
             );
         }
     }
-    if (sh.slice_type != VvcSliceType::I && sh.rpl[0].entries.len() > 1)
-        || (sh.slice_type == VvcSliceType::B && sh.rpl[1].entries.len() > 1)
+    // With `pps_rpl_info_in_ph_flag == 1` the active lists come from the
+    // picture header, so the override conditions use those entries.
+    let rpl_eff = if pps.rpl_info_in_ph { &ph.rpl } else { &sh.rpl };
+    if (sh.slice_type != VvcSliceType::I && rpl_eff[0].entries.len() > 1)
+        || (sh.slice_type == VvcSliceType::B && rpl_eff[1].entries.len() > 1)
     {
-        let def0 = pps.num_ref_idx_default_active[0].min(sh.rpl[0].entries.len() as u8);
-        let def1 = pps.num_ref_idx_default_active[1].min(sh.rpl[1].entries.len() as u8);
+        let def0 = pps.num_ref_idx_default_active[0].min(rpl_eff[0].entries.len() as u8);
+        let def1 = pps.num_ref_idx_default_active[1].min(rpl_eff[1].entries.len() as u8);
         let ovr = sh.num_ref_idx_active[0] != def0
             || (sh.slice_type == VvcSliceType::B && sh.num_ref_idx_active[1] != def1);
         bw.write_bit(ovr);
         if ovr {
-            if sh.rpl[0].entries.len() > 1 {
+            if rpl_eff[0].entries.len() > 1 {
                 bw.write_ue(u32::from(sh.num_ref_idx_active[0].saturating_sub(1)));
             }
-            if sh.slice_type == VvcSliceType::B && sh.rpl[1].entries.len() > 1 {
+            if sh.slice_type == VvcSliceType::B && rpl_eff[1].entries.len() > 1 {
                 bw.write_ue(u32::from(sh.num_ref_idx_active[1].saturating_sub(1)));
             }
         }
@@ -3651,6 +4305,11 @@ pub fn parse_full_slice_header(
         .as_ref()
         .ok_or_else(|| VvcError::Bitstream(format!("SH: unknown SPS {}", pps.sps_id)))?;
 
+    for present in &sps.info.extra_sh_bits {
+        if *present {
+            let _ = hls_bit("SH", br.read_bit())?; // sh_extra_bit[i]
+        }
+    }
     let slice_type = if ph.inter_slice_allowed {
         VvcSliceType::from_u32(hls_bit("SH", br.read_ue())?)?
     } else {
@@ -3708,7 +4367,9 @@ pub fn parse_full_slice_header(
         VvcRefPicListStruct::default(),
     ];
     let is_idr = matches!(nal_type, NAL_IDR_W_RADL | NAL_IDR_N_LP);
-    if !pps.rpl_info_in_ph && (!is_idr || sps.idr_rpl_present) {
+    if pps.rpl_info_in_ph {
+        rpl.clone_from(&ph.rpl);
+    } else if !is_idr || sps.idr_rpl_present {
         let forbidden_zero = !sps.weighted_pred && !sps.weighted_bipred;
         let mut rpl_sps_flag0 = false;
         let mut rpl_idx0 = 0usize;
@@ -3783,17 +4444,22 @@ pub fn parse_full_slice_header(
         if pps.cabac_init_present {
             cabac_init_flag = hls_bit("SH", br.read_bit())?;
         }
-        if ph.temporal_mvp_enabled && !pps.rpl_info_in_ph {
-            if slice_type == VvcSliceType::B {
-                collocated_from_l0 = hls_bit("SH", br.read_bit())?;
-            }
-            let active_col = if collocated_from_l0 || slice_type == VvcSliceType::P {
-                num_ref_idx_active[0]
+        if ph.temporal_mvp_enabled {
+            if pps.rpl_info_in_ph {
+                collocated_from_l0 = slice_type == VvcSliceType::P || ph.collocated_from_l0;
+                collocated_ref_idx = u8::try_from(ph.collocated_ref_idx).unwrap_or(0);
             } else {
-                num_ref_idx_active[1]
-            };
-            if active_col > 1 {
-                collocated_ref_idx = hls_bit("SH", br.read_ue())? as u8;
+                if slice_type == VvcSliceType::B {
+                    collocated_from_l0 = hls_bit("SH", br.read_bit())?;
+                }
+                let active_col = if collocated_from_l0 || slice_type == VvcSliceType::P {
+                    num_ref_idx_active[0]
+                } else {
+                    num_ref_idx_active[1]
+                };
+                if active_col > 1 {
+                    collocated_ref_idx = hls_bit("SH", br.read_ue())? as u8;
+                }
             }
         }
     }
@@ -3810,6 +4476,11 @@ pub fn parse_full_slice_header(
         if sps.joint_cbcr_enabled {
             joint_cbcr_qp_offset = hls_bit("SH", br.read_se())?;
         }
+    }
+
+    let mut cu_chroma_qp_offset_enabled = false;
+    if pps.cu_chroma_qp_offset_list_enabled {
+        cu_chroma_qp_offset_enabled = hls_bit("SH", br.read_bit())?;
     }
 
     let (mut sao_luma_used, mut sao_chroma_used) = (false, false);
@@ -3862,6 +4533,19 @@ pub fn parse_full_slice_header(
             false
         };
 
+    let wp_present = if (pps.weighted_pred && slice_type == VvcSliceType::P)
+        || (pps.weighted_bipred && slice_type == VvcSliceType::B)
+    {
+        if pps.wp_info_in_ph {
+            return Err(VvcError::Unsupported(
+                "SH: weighted prediction parameters signalled in the picture header",
+            ));
+        }
+        true
+    } else {
+        false
+    };
+
     let mut entry_point_offsets = Vec::new();
     if sps.entry_points_present {
         let tile_grid = pps.derive_tile_grid();
@@ -3888,6 +4572,18 @@ pub fn parse_full_slice_header(
                 let off_minus1 = hls_bit("SH", br.read_bits(bits))?;
                 entry_point_offsets.push(off_minus1.saturating_add(1));
             }
+        }
+    }
+
+    if pps.slice_header_extension_present {
+        let len = hls_bit("SH", br.read_ue())?;
+        if len > 256 {
+            return Err(VvcError::LimitExceeded(format!(
+                "SH: sh_slice_header_extension_length {len} exceeds 256"
+            )));
+        }
+        for _ in 0..len {
+            let _ = hls_bit("SH", br.read_bits(8))?;
         }
     }
 
@@ -3942,6 +4638,8 @@ pub fn parse_full_slice_header(
             dep_quant_used,
             sign_data_hiding_used,
             ts_residual_coding_disabled,
+            weighted_pred_table: wp_present,
+            cu_chroma_qp_offset_enabled,
             entry_point_offsets,
         },
         data_offset,
@@ -4843,6 +5541,26 @@ mod tests {
         assert!(parse_sps_info(&sps).is_ok());
     }
 
+    /// `profile_tier_level()` with `maxNumSubLayersMinus1` sub-layers, all of
+    /// which signal a sub-layer level.
+    fn write_ptl_sub_layers(bw: &mut BitWriter, level_idc: u8, sub_layers_minus1: u32) {
+        bw.write_bits(1, 7); // general_profile_idc = Main 10
+        bw.write_bit(false); // general_tier_flag
+        bw.write_bits(u32::from(level_idc), 8);
+        bw.write_bit(true); // ptl_frame_only_constraint_flag
+        bw.write_bit(false); // ptl_multilayer_enabled_flag
+        write_general_constraints_info(bw, 5, &VvcHlsTools::default());
+        debug_assert!(!sub_layers_minus1 > 7);
+        for _ in 0..sub_layers_minus1 {
+            bw.write_bit(true); // sub_layer_level_present_flag[i]
+        }
+        bw.align_zero(); // ptl_reserved_zero_bit
+        for _ in 0..sub_layers_minus1 {
+            bw.write_bits(u32::from(level_idc), 8); // sub_layer_level_idc[i]
+        }
+        bw.write_bits(0, 8); // ptl_num_sub_profiles
+    }
+
     fn synthetic_sps(
         max_sub_layers_minus1: u32,
         ref_pic_resampling: bool,
@@ -4857,7 +5575,7 @@ mod tests {
         bw.write_bits(chroma_format_idc, 2);
         bw.write_bits(0, 2);
         bw.write_bit(true);
-        write_profile_tier_level(&mut bw, 16, 5);
+        write_ptl_sub_layers(&mut bw, 16, max_sub_layers_minus1);
         bw.write_bit(false);
         bw.write_bit(ref_pic_resampling);
         if ref_pic_resampling {
@@ -4874,17 +5592,45 @@ mod tests {
             bw.write_ue(crop.3);
         }
         bw.write_bit(subpic_info);
-        bw.write_ue(0);
+        if subpic_info {
+            bw.write_ue(0); // sps_num_subpics_minus1 (deliberately truncated)
+        }
+        bw.write_ue(0); // sps_bitdepth_minus8
+        bw.write_bit(false); // sps_entropy_coding_sync_enabled_flag
+        bw.write_bit(false); // sps_entry_point_offsets_present_flag
+        bw.write_bits(0, 4); // sps_log2_max_pic_order_cnt_lsb_minus4
+        bw.write_bit(false); // sps_poc_msb_cycle_flag
+        bw.write_bits(0, 2); // sps_num_extra_ph_bytes
+        bw.write_bits(0, 2); // sps_num_extra_sh_bytes
+        if max_sub_layers_minus1 > 0 {
+            bw.write_bit(false); // sps_sublayer_dpb_params_flag
+        }
+        // `dpb_parameters()` signals only the highest sub-layer when
+        // `sps_sublayer_dpb_params_flag` is 0.
+        bw.write_ue(2); // dpb_max_dec_pic_buffering_minus1
+        bw.write_ue(1); // dpb_max_num_reorder_pics
+        bw.write_ue(0); // dpb_max_latency_increase_plus1
         bw.rbsp_trailing_bits();
         bw.into_bytes()
     }
 
     #[test]
-    fn unsupported_sps_structures_are_rejected_as_unsupported() {
-        let err = parse_sps_info(&synthetic_sps(1, false, false, (0, 0, 0, 0), 1))
-            .expect_err("multiple sub-layers");
-        assert!(matches!(err, VvcError::Unsupported(_)), "{err}");
+    fn sps_sub_layer_ptl_and_dpb_parameters_are_parsed() {
+        for sub_layers in [0u32, 1, 5] {
+            let sps = synthetic_sps(sub_layers, false, false, (0, 0, 0, 0), 1);
+            let info = parse_sps_info(&sps).expect("multi sub-layer SPS parses");
+            assert_eq!(info.max_sub_layers_minus1, sub_layers as u8);
+            assert_eq!(info.max_dec_pic_buffering.len(), sub_layers as usize + 1);
+            // The single signalled entry is replicated to every sub-layer.
+            for tid in 0..=sub_layers as u8 {
+                assert_eq!(info.max_dec_pic_buffering_minus1(tid), 2);
+                assert_eq!(info.max_num_reorder_pics(tid), 1);
+            }
+        }
+    }
 
+    #[test]
+    fn unsupported_sps_structures_are_rejected_as_unsupported() {
         assert!(
             parse_sps_info(&synthetic_sps(0, true, false, (0, 0, 0, 0), 1)).is_ok(),
             "same-resolution RPR streams are accepted"
@@ -4989,6 +5735,164 @@ mod tests {
         let vps = parse_vps_rbsp(&build_vps_rbsp(&cfg)).expect("parse VPS");
         assert_eq!(vps.vps_id, 1);
         assert_eq!(vps.level_idc, 16);
+    }
+
+    #[test]
+    fn picture_header_carries_poc_msb_rpl_and_inter_flags() {
+        let sps_rbsp = build_sps_rbsp(&reference_config());
+        let mut sps = parse_full_sps_rbsp(&sps_rbsp).expect("parse SPS");
+        sps.info.poc_msb_cycle = true;
+        sps.info.poc_msb_cycle_len = 8;
+        sps.rpl_lists[0] = vec![VvcRefPicListStruct {
+            ltrp_in_header_flag: false,
+            entries: vec![
+                VvcRefPicEntry::ShortTerm { delta_poc: -4 },
+                VvcRefPicEntry::ShortTerm { delta_poc: -8 },
+            ],
+        }];
+        sps.rpl_lists[1] = vec![VvcRefPicListStruct {
+            ltrp_in_header_flag: false,
+            entries: vec![VvcRefPicEntry::ShortTerm { delta_poc: 4 }],
+        }];
+        sps.temporal_mvp_enabled = true;
+        sps.sao_enabled = true;
+        sps.joint_cbcr_enabled = true;
+        sps.partition_constraints_override_enabled = true;
+        let pps = VvcPps {
+            rpl_info_in_ph: true,
+            output_flag_present: true,
+            sao_info_in_ph: true,
+            qp_delta_info_in_ph: true,
+            cu_qp_delta_enabled: true,
+            deblocking_control_present: true,
+            dbf_info_in_ph: true,
+            deblocking_disabled: false,
+            ..VvcPps::default()
+        };
+        let mut ph = VvcPictureHeader {
+            inter_slice_allowed: true,
+            intra_slice_allowed: true,
+            poc_lsb: 0x34,
+            poc_msb_present: true,
+            poc_msb: 1,
+            pic_output: true,
+            rpl_idx: [0, 0],
+            partition_constraints_override: true,
+            log2_diff_min_qt_min_cb: [1, 2, 0],
+            max_mtt_depth: [2, 3, 0],
+            log2_diff_max_bt_min_qt: [2, 3, 0],
+            log2_diff_max_tt_min_qt: [1, 0, 0],
+            cu_qp_delta_subdiv_intra: 2,
+            cu_qp_delta_subdiv_inter: 3,
+            temporal_mvp_enabled: true,
+            collocated_from_l0: true,
+            collocated_ref_idx: 0,
+            mvd_l1_zero: true,
+            qp_delta: -3,
+            joint_cbcr_sign: true,
+            sao_luma: true,
+            sao_chroma: false,
+            deblocking_override: true,
+            deblocking_disabled: false,
+            luma_beta_offset_div2: -2,
+            luma_tc_offset_div2: 2,
+            ..VvcPictureHeader::default()
+        };
+        ph.rpl[0] = sps.rpl_lists[0][0].clone();
+        ph.rpl[1] = sps.rpl_lists[1][0].clone();
+
+        let mut bw = BitWriter::with_capacity(16);
+        write_picture_header_structure(&mut bw, &ph, &sps, &pps);
+        bw.rbsp_trailing_bits();
+        let rbsp = bw.into_bytes();
+
+        let sps_table: [Option<VvcSps>; 16] =
+            core::array::from_fn(|i| if i == 0 { Some(sps.clone()) } else { None });
+        let pps_table: [Option<VvcPps>; 64] =
+            core::array::from_fn(|i| if i == 0 { Some(pps.clone()) } else { None });
+        let parsed = parse_full_ph_rbsp(&rbsp, &sps_table, &pps_table).expect("parse PH");
+
+        assert_eq!(parsed.poc_lsb, ph.poc_lsb);
+        assert!(parsed.poc_msb_present);
+        assert_eq!(parsed.poc_msb, ph.poc_msb);
+        assert!(parsed.pic_output);
+        assert_eq!(parsed.rpl_idx, ph.rpl_idx);
+        assert_eq!(parsed.rpl, ph.rpl);
+        assert!(parsed.partition_constraints_override);
+        assert_eq!(parsed.log2_diff_min_qt_min_cb, ph.log2_diff_min_qt_min_cb);
+        assert_eq!(parsed.max_mtt_depth, ph.max_mtt_depth);
+        assert_eq!(parsed.log2_diff_max_bt_min_qt, ph.log2_diff_max_bt_min_qt);
+        assert_eq!(parsed.log2_diff_max_tt_min_qt, ph.log2_diff_max_tt_min_qt);
+        assert_eq!(parsed.cu_qp_delta_subdiv_intra, 2);
+        assert_eq!(parsed.cu_qp_delta_subdiv_inter, 3);
+        assert!(parsed.temporal_mvp_enabled);
+        assert!(parsed.mvd_l1_zero);
+        assert_eq!(parsed.qp_delta, -3);
+        assert!(parsed.joint_cbcr_sign);
+        assert!(parsed.sao_luma);
+        assert!(!parsed.sao_chroma);
+        assert!(parsed.deblocking_override);
+        assert_eq!(parsed.luma_beta_offset_div2, -2);
+        assert_eq!(parsed.luma_tc_offset_div2, 2);
+    }
+
+    #[test]
+    fn slice_header_takes_its_reference_lists_from_the_picture_header() {
+        let sps_rbsp = build_sps_rbsp(&reference_config());
+        let mut sps = parse_full_sps_rbsp(&sps_rbsp).expect("parse SPS");
+        sps.rpl_lists[0] = vec![VvcRefPicListStruct {
+            ltrp_in_header_flag: false,
+            entries: vec![VvcRefPicEntry::ShortTerm { delta_poc: -4 }],
+        }];
+        sps.rpl_lists[1] = vec![VvcRefPicListStruct {
+            ltrp_in_header_flag: false,
+            entries: vec![
+                VvcRefPicEntry::ShortTerm { delta_poc: 4 },
+                VvcRefPicEntry::ShortTerm { delta_poc: 0 },
+            ],
+        }];
+        sps.temporal_mvp_enabled = true;
+        let pps = VvcPps {
+            rpl_info_in_ph: true,
+            sao_info_in_ph: true,
+            ..VvcPps::default()
+        };
+        let ph = VvcPictureHeader {
+            inter_slice_allowed: true,
+            intra_slice_allowed: true,
+            poc_lsb: 4,
+            rpl_idx: [0, 0],
+            rpl: [sps.rpl_lists[0][0].clone(), sps.rpl_lists[1][0].clone()],
+            temporal_mvp_enabled: true,
+            collocated_from_l0: true,
+            collocated_ref_idx: 1,
+            mvd_l1_zero: true,
+            sao_luma: true,
+            sao_chroma: true,
+            ..VvcPictureHeader::default()
+        };
+        let sh = VvcSliceHeader {
+            slice_type: VvcSliceType::B,
+            num_ref_idx_active: [1, 2],
+            ..VvcSliceHeader::default()
+        };
+
+        // `sh_picture_header_in_slice_header_flag` is 0: the picture header is
+        // supplied out of band, as when a PH NAL unit precedes the slice.
+        let rbsp = build_full_slice_header_bits(&sh, NAL_TRAIL, &ph, &sps, &pps);
+
+        let sps_table: [Option<VvcSps>; 16] =
+            core::array::from_fn(|i| if i == 0 { Some(sps.clone()) } else { None });
+        let pps_table: [Option<VvcPps>; 64] =
+            core::array::from_fn(|i| if i == 0 { Some(pps.clone()) } else { None });
+        let (parsed, _) =
+            parse_full_slice_header(&rbsp, NAL_TRAIL, Some(&ph), &sps_table, &pps_table)
+                .expect("parse SH");
+        assert_eq!(parsed.slice_type, VvcSliceType::B);
+        assert_eq!(parsed.rpl, ph.rpl);
+        assert!(parsed.collocated_from_l0);
+        assert_eq!(parsed.collocated_ref_idx, 1);
+        assert_eq!(parsed.num_ref_idx_active, [1, 2]);
     }
 
     #[test]

@@ -1786,6 +1786,14 @@ pub struct VvcDecoder {
     dpb: DecodedPictureBuffer,
     slice_options: SliceCodingOptions,
     last_vvc_frame: Option<VvcFrame>,
+    /// `prevTid0POC`: POC of the most recent temporal sub-layer 0 picture.
+    prev_tid0_poc: i32,
+    /// POC of the most recently decoded picture.
+    prev_pic_poc: Option<i32>,
+    /// Pictures held back so they can be output in POC order.
+    pending_output: Vec<(i32, VvcFrame)>,
+    /// `MaxNumReorderPics[Tid]` for the picture being decoded.
+    output_delay: usize,
 }
 
 impl Default for VvcDecoder {
@@ -1812,7 +1820,72 @@ impl VvcDecoder {
             dpb: DecodedPictureBuffer::new(4),
             slice_options,
             last_vvc_frame: None,
+            prev_tid0_poc: 0,
+            prev_pic_poc: None,
+            pending_output: Vec::new(),
+            output_delay: 0,
         }
+    }
+
+    /// Derive `PicOrderCntVal` from the picture header LSB/MSB cycle fields
+    /// (`H.266 §8.3.1`, VTM `VLCReader.cpp:3644-3690`).
+    fn derive_picture_order_count(
+        &mut self,
+        poc_lsb_bits: u8,
+        max_num_reorder_pics: u32,
+        ph: &hls::VvcPictureHeader,
+        is_idr: bool,
+        temporal_id: u8,
+    ) -> i32 {
+        let max_poc_lsb = 1i32 << poc_lsb_bits;
+        let poc_lsb = (ph.poc_lsb as i32) & (max_poc_lsb - 1);
+        let poc = if is_idr {
+            if ph.poc_msb_present {
+                ph.poc_msb as i32 * max_poc_lsb + poc_lsb
+            } else {
+                poc_lsb
+            }
+        } else {
+            let prev = self.prev_tid0_poc;
+            let prev_lsb = prev & (max_poc_lsb - 1);
+            let prev_msb = prev - prev_lsb;
+            let msb = if ph.poc_msb_present {
+                ph.poc_msb as i32 * max_poc_lsb
+            } else if poc_lsb < prev_lsb && prev_lsb - poc_lsb >= max_poc_lsb / 2 {
+                prev_msb + max_poc_lsb
+            } else if poc_lsb > prev_lsb && poc_lsb - prev_lsb > max_poc_lsb / 2 {
+                prev_msb - max_poc_lsb
+            } else {
+                prev_msb
+            };
+            msb + poc_lsb
+        };
+        if temporal_id == 0 {
+            self.prev_tid0_poc = poc;
+        }
+        self.output_delay = max_num_reorder_pics as usize;
+        self.prev_pic_poc = Some(poc);
+        poc
+    }
+
+    /// Queue one decoded picture and return the next picture to output.
+    ///
+    /// Pictures leave the buffer in increasing POC order once more than
+    /// `MaxNumReorderPics[ Tid ]` are pending (`H.266 §C.3.2`).
+    fn queue_output(&mut self, poc: i32, frame: VvcFrame) -> Option<VvcFrame> {
+        let pos = self.pending_output.partition_point(|(p, _)| *p <= poc);
+        self.pending_output.insert(pos, (poc, frame));
+        if self.pending_output.len() > self.output_delay {
+            Some(self.pending_output.remove(0).1)
+        } else {
+            None
+        }
+    }
+
+    /// Drain the pictures still held back for reordering, in POC order.
+    pub fn flush_pending_frames(&mut self) -> Vec<VvcFrame> {
+        let pending = core::mem::take(&mut self.pending_output);
+        pending.into_iter().map(|(_, frame)| frame).collect()
     }
 
     /// Decode a sequence of Annex-B access units into [`VvcFrame`]s (`bit_depth` in `8..=12`,
@@ -1827,6 +1900,7 @@ impl VvcDecoder {
                 out.push(frame);
             }
         }
+        out.extend(self.flush_pending_frames());
         Ok(out)
     }
 
@@ -1865,6 +1939,9 @@ impl VvcDecoder {
                 out.push(frame);
             }
         }
+        for frame in self.flush_pending_frames() {
+            out.push(frame.to_i420());
+        }
         Ok(out)
     }
 
@@ -1874,6 +1951,7 @@ impl VvcDecoder {
         let mut active_pps_id: Option<u8> = None;
         let mut active_inter_allowed = false;
         let mut active_poc: i32 = 0;
+        let mut active_ph: Option<hls::VvcPictureHeader> = None;
         let mut decoded_frame: Option<I420Frame> = None;
 
         for nal in &nals {
@@ -1903,6 +1981,11 @@ impl VvcDecoder {
                     validate_decoded_sps(&info)?;
                     let sps_id = usize::from(info.sps_id);
                     if let Ok(full_sps) = hls::parse_full_sps_rbsp(&nal.rbsp) {
+                        // Size the DPB from `dpb_max_dec_pic_buffering_minus1[0]`
+                        // (`H.266 §7.4.3.4`), never below the four pictures the
+                        // intra subset decoder keeps for its own reference.
+                        self.dpb.max_size =
+                            (full_sps.info.max_dec_pic_buffering_minus1(0) as usize).max(4);
                         self.full_sps_table[sps_id] = Some(full_sps);
                     }
                     self.sps_table[sps_id] = Some(info);
@@ -1943,6 +2026,7 @@ impl VvcDecoder {
                         active_pps_id = Some(ph.pps_id);
                         active_inter_allowed = ph.inter_slice_allowed;
                         active_poc = ph.poc_lsb as i32;
+                        active_ph = Some(ph);
                     } else {
                         let mut br = bits::BitReader::new(&nal.rbsp);
                         let gdr_or_irap = header_read(br.read_bit(), "PH: gdr_or_irap")?;
@@ -1989,7 +2073,7 @@ impl VvcDecoder {
                         })?),
                         None => None,
                     };
-                    let (pps_id, slice_poc, inter_allowed) = match embedded_ph {
+                    let (pps_id, poc_lsb, inter_allowed) = match embedded_ph {
                         Some(ph) => (ph.pps_id, ph.poc_lsb as i32, ph.inter_slice_allowed),
                         None => {
                             let pps_id = active_pps_id.ok_or_else(|| {
@@ -2000,14 +2084,35 @@ impl VvcDecoder {
                             (pps_id, active_poc, active_inter_allowed)
                         }
                     };
-                    if embedded_ph.is_some() && inter_allowed {
-                        return Err(VvcError::Unsupported(
-                            "inter slice with an embedded picture header",
-                        ));
-                    }
                     let pps = self.pps_table[usize::from(pps_id)].ok_or_else(|| {
                         VvcError::Bitstream(format!("PH references unknown PPS {pps_id}"))
                     })?;
+                    // `PicOrderCntVal` needs the previous temporal sub-layer 0
+                    // picture (`prevTid0POC`) plus the signalled MSB cycle
+                    // (`H.266 §8.3.1`).
+                    let slice_poc = {
+                        let ph_ref = embedded_ph.or(active_ph.as_ref());
+                        let sps_poc =
+                            self.full_sps_table[usize::from(pps.sps_id)]
+                                .as_ref()
+                                .map(|sps| {
+                                    (
+                                        sps.poc_lsb_bits,
+                                        sps.info.max_num_reorder_pics(nal.temporal_id),
+                                    )
+                                });
+                        match (sps_poc, ph_ref) {
+                            (Some((poc_lsb_bits, max_reorder)), Some(ph)) => self
+                                .derive_picture_order_count(
+                                    poc_lsb_bits,
+                                    max_reorder,
+                                    ph,
+                                    matches!(nal_type, VvcNalType::IdrWRadl | VvcNalType::IdrNLp),
+                                    nal.temporal_id,
+                                ),
+                            _ => poc_lsb,
+                        }
+                    };
                     let info = self.sps_table[usize::from(pps.sps_id)]
                         .as_ref()
                         .ok_or_else(|| {
@@ -2072,28 +2177,32 @@ impl VvcDecoder {
                         None => hls::derived_chroma_qp(i32::from(slice_qp)).clamp(0, 63) as u8,
                     };
 
+                    let cf = ChromaFormatIdc::from_idc(info.chroma_format_idc);
+                    let bd = info.bit_depth_luma;
+                    // The general coding tree is used for every stream whose SPS
+                    // enables partitioning the CTU-sized intra subset decoder
+                    // cannot express (`H.266 §7.3.8`), and for every VTM-style
+                    // picture that carries its picture header inline.
+                    let general_tree = self.full_sps_table[usize::from(pps.sps_id)]
+                        .as_ref()
+                        .is_some_and(|s| {
+                            let min_qt_luma =
+                                (1u32 << s.min_cb_log2) << s.log2_diff_min_qt_min_cb_intra_luma;
+                            let ctu = 1u32 << s.info.ctu_log2;
+                            s.dual_tree_intra
+                                || s.max_mtt_depth_intra_luma != 0
+                                || s.max_mtt_depth_inter != 0
+                                || min_qt_luma < 32
+                                || !s.info.width.is_multiple_of(ctu)
+                                || !s.info.height.is_multiple_of(ctu)
+                        })
+                        && matches!(bd, 8 | 10)
+                        && cf == ChromaFormatIdc::Chroma420
+                        && embedded_header.is_some();
+
                     if nal_type.is_irap() && !inter_allowed {
                         self.dpb.clear();
-                        let cf = ChromaFormatIdc::from_idc(info.chroma_format_idc);
-                        let bd = info.bit_depth_luma;
-                        let general_tree = self.full_sps_table[usize::from(pps.sps_id)]
-                            .as_ref()
-                            .is_some_and(|s| {
-                                let min_qt_luma =
-                                    (1u32 << s.min_cb_log2) << s.log2_diff_min_qt_min_cb_intra_luma;
-                                let ctu = 1u32 << s.info.ctu_log2;
-                                s.dual_tree_intra
-                                    || s.max_mtt_depth_intra_luma != 0
-                                    || s.max_mtt_depth_inter != 0
-                                    || min_qt_luma < 32
-                                    || !s.info.width.is_multiple_of(ctu)
-                                    || !s.info.height.is_multiple_of(ctu)
-                            });
-                        if general_tree
-                            && matches!(bd, 8 | 10)
-                            && cf == ChromaFormatIdc::Chroma420
-                            && embedded_header.is_some()
-                        {
+                        if general_tree {
                             let (sh, _) = embedded_header.as_ref().ok_or_else(|| {
                                 VvcError::Bitstream("missing slice header".into())
                             })?;
@@ -2160,7 +2269,7 @@ impl VvcDecoder {
                                         VvcError::Bitstream("chroma plane size mismatch".into())
                                     })?;
                                 self.dpb.insert(RefFrame::from_planes(
-                                    0,
+                                    slice_poc,
                                     false,
                                     y,
                                     u,
@@ -2211,9 +2320,9 @@ impl VvcDecoder {
                                     );
                                 }
                             }
-                            let i420 = cropped_vvc.to_i420();
-                            self.last_vvc_frame = Some(cropped_vvc);
-                            decoded_frame = Some(i420);
+                            let output = self.queue_output(slice_poc, cropped_vvc);
+                            decoded_frame = output.as_ref().map(VvcFrame::to_i420);
+                            self.last_vvc_frame = output;
                             continue;
                         }
                         // An inter stream disables MTS/LFNST in the SPS and
@@ -2263,7 +2372,19 @@ impl VvcDecoder {
                             }
                         }
                         decoded_frame = Some(disp);
+                    } else if general_tree {
+                        // Inter coding units in the general coding tree are the
+                        // next decoder stage; the CTU-sized subset inter decoder
+                        // below cannot parse VTM's multi-tool inter syntax.
+                        return Err(VvcError::Unsupported(
+                            "inter slice in the general coding tree",
+                        ));
                     } else {
+                        if embedded_ph.is_some() {
+                            return Err(VvcError::Unsupported(
+                                "inter slice with an embedded picture header",
+                            ));
+                        }
                         let mut sh_br = bits::BitReader::new(&nal.rbsp);
                         let _ = sh_br.read_bit();
                         let raw_st = sh_br.read_ue().unwrap_or(1);
@@ -3014,6 +3135,29 @@ impl VvcRateController {
 mod tests {
     use super::*;
 
+    #[test]
+    fn decoded_pictures_are_output_in_picture_order_count_order() {
+        // Decode order 0, 4, 2, 1, 3 with `MaxNumReorderPics = 2`
+        // (`H.266 §C.3.2`): pictures are held back until enough successors are
+        // known, then everything leaves in POC order. Each frame is tagged by
+        // its height so the output order can be checked.
+        let tagged =
+            |poc: i32| VvcFrame::new(4, (poc as u32 + 1) * 4, 8, ChromaFormatIdc::Chroma420);
+        let tag = |frame: &VvcFrame| frame.height as i32 / 4 - 1;
+        let mut decoder = VvcDecoder::new();
+        decoder.output_delay = 2;
+        let mut out = Vec::new();
+        for poc in [0i32, 4, 2, 1, 3] {
+            if let Some(ready) = decoder.queue_output(poc, tagged(poc)) {
+                out.push(tag(&ready));
+            }
+        }
+        for frame in decoder.flush_pending_frames() {
+            out.push(tag(&frame));
+        }
+        assert_eq!(out, vec![0, 1, 2, 3, 4]);
+    }
+
     fn test_frame(width: u32, height: u32, bar_x: u32) -> Vec<u8> {
         let mut rgba = Vec::with_capacity((width * height * 4) as usize);
         for y in 0..height {
@@ -3481,6 +3625,19 @@ mod tests {
             multilayer_enabled: false,
             ref_pic_resampling: false,
             res_change_in_clvs_allowed: false,
+            gdr_enabled: false,
+            wpp_enabled: false,
+            entry_points_present: false,
+            poc_lsb_bits: 8,
+            max_sub_layers_minus1: 0,
+            sub_layer_dpb_params: false,
+            max_dec_pic_buffering: vec![4],
+            max_num_reorder_pics: vec![0],
+            max_latency_increase_plus1: vec![1],
+            poc_msb_cycle: false,
+            poc_msb_cycle_len: 0,
+            extra_ph_bits: Vec::new(),
+            extra_sh_bits: Vec::new(),
             gci_bits: Vec::new(),
             num_sub_profiles: 0,
             sub_profile_idc: Vec::new(),

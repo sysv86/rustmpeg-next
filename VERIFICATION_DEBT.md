@@ -1,7 +1,66 @@
 # Verification Debt (`rustmpeg-next` H.266/VVC)
 
-Last updated: 2026-11-15 (10-bit general coding-tree decode; VTM intra interop
-`d_i8`/`d_i10` byte-exact; matrix 263/3).
+Last updated: 2026-11-15 (random-access high-level syntax + POC/DPB reordering;
+`d_ra8` IDR byte-exact, inter coding units still unsupported; matrix 263/3).
+
+## 0f. Random-access headers and the `d_ra8` IDR (2026-11-15)
+
+Executed after adding the multi sub-layer SPS/PTL/DPB syntax, the full picture
+header, the slice-header reference-list inheritance, `PicOrderCntVal` derivation
+and the POC-ordered output buffer. Oracle: pristine VTM 24.0 build
+(`/tmp/opencode/vtm-src`, `DecoderApp`). `rustmpeg` decoder:
+`target/release/examples/vvc_stateful_decode`.
+
+```bash
+D=/home/nitroarch/vvc-conf-full
+BIN=/tmp/opencode/vtm-src/bin/umake/gcc-16.2/x86_64/release
+$BIN/DecoderApp -b $D/d_ra8.vvc -o /tmp/opencode/ra8.vtmdec.yuv
+python3 -c "d=open('$D/d_ra8.vvc','rb').read(); open('/tmp/opencode/ra8_au1.vvc','wb').write(d[:1270])"
+target/release/examples/vvc_stateful_decode /tmp/opencode/ra8_au1.vvc /tmp/opencode/ra8_au1.ours.yuv
+head -c 24576 /tmp/opencode/ra8.vtmdec.yuv > /tmp/opencode/ra8_f1.vtm.yuv
+cmp /tmp/opencode/ra8_au1.ours.yuv /tmp/opencode/ra8_f1.vtm.yuv   # identical
+```
+
+Result:
+
+```text
+d_ra8 picture 1 (IDR_N_LP, 128x128, 8-bit, 128 CTU, QP23, all filters)  OK
+d_ra8 pictures 2-5 (B slices)  Unsupported("inter slice in the general coding tree")
+d_i8 / d_i10 (64x64, 3 frames, stock intra cfg)                          OK (unchanged)
+```
+
+The whole 5-picture stream parses its SPS, PPS, APS, embedded picture headers
+and slice headers without a desynchronisation; the failure is now the first
+inter coding unit, not the SPS. `d_ra8` keeps its matrix row failing.
+
+Other results in this run:
+
+- Strict 25-case harness (`run_conformance.sh`, pristine VTM 24.0 + VVdeC 3.3):
+  **50/50**.
+- Full 266-check matrix (`run_conformance_full.sh`): **263 passed / 3 failed /
+  0 skipped**. Same three failures as the previous run: `b12_420` (VVdeC has no
+  12-bit oracle), `ctu16` (`ENCODE FAIL` in the harness), `d_ra8`.
+- `cargo test --workspace`: OK. New tests: multi sub-layer SPS/PTL/DPB parse
+  (`sps_sub_layer_ptl_and_dpb_parameters_are_parsed`), PH override/RPL/POC-MSB
+  round trip, slice-header RPL inheritance from the PH, POC output order.
+- `cargo clippy --workspace --all-targets -- -D warnings`: OK.
+- `cargo fmt --all -- --check`: OK.
+- `python3 scripts/check-licenses.py`: OK.
+- Not re-run: 12-bit and 4:2:2/4:4:4 full-tool VTM streams, tiles/WPP/slices/RPR
+  VTM streams, GPU paths.
+
+Known gaps introduced or kept by this change (all typed, none silent):
+
+- Inter coding units in the general coding tree (merge/AMVP, affine, MMVD,
+  SMVD, CIIP, GPM, BDOF, DMVR, SBT), inter motion compensation and inter
+  boundary strength for deblocking.
+- Transform blocks larger than 32 samples still return
+  `Unsupported("transform block larger than 32 samples")`; the `d_ra8` IDR does
+  not contain one, but the full-size grouped scan is still unimplemented.
+- Virtual boundaries in the SPS/PH, weighted prediction in the PH/slice header,
+  long-term reference pictures, multi-slice/multi-tile pictures, and the
+  `ph_cu_chroma_qp_offset_subdiv_*` signalled values are parsed only far enough
+  to reject or to ignore them; they are not reconstructed.
 
 ## 0e. VTM intra interop at 8- and 10-bit (2026-11-15)
 

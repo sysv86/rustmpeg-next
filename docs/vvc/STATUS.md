@@ -1,3 +1,73 @@
+## 0h. Random-access high-level syntax, POC/DPB reordering, and the d_ra8 IDR (2026-11-15)
+
+The general coding-tree decoder now parses the complete random-access high-level
+syntax of a VTM 24.0 stream with `sps_max_sub_layers_minus1 = 5`, and the
+intra-random-access picture of `d_ra8` reconstructs byte-exactly. The four inter
+pictures are still outside the decoder: they are rejected with the typed
+`Unsupported("inter slice in the general coding tree")` instead of failing at
+the SPS. `d_ra8` therefore remains on the missing list, and its matrix row still
+fails.
+
+Implemented in this change:
+
+- **Multi sub-layer SPS.** `profile_tier_level()` is parsed with
+  `maxNumSubLayersMinus1` sub-layers: the per-sub-layer `sub_layer_level_present_flag`
+  bits, their `ptl_reserved_zero_bit` alignment and the `sub_layer_level_idc`
+  values are consumed before `ptl_num_sub_profiles` (§7.3.3). `dpb_parameters()`
+  is parsed for every sub-layer, honouring `sps_sublayer_dpb_params_flag`, and
+  the single signalled entry is replicated downwards when the flag is 0
+  (§7.3.3, VTM `VLCReader.cpp:1337-1362`). `parse_sps_info` and
+  `parse_full_sps_rbsp` now share one header parser, so the sub-picture block can
+  no longer desynchronise the two views of the SPS.
+- **Picture header.** `ph_poc_msb_present_flag`/`ph_poc_msb_cycle_val`, the
+  `sps_extra_ph_bit_present_flag` bits, `ph_pic_output_flag`,
+  `ph_partition_constraints_override_flag` (with the per-slice-type values),
+  `ph_cu_qp_delta_subdiv_intra/inter_slice`,
+  `ph_temporal_mvp_enabled_flag`, `ph_collocated_from_l0_flag`/`ph_collocated_ref_idx`,
+  `ph_fpel_mmvd_enabled_flag`, `ph_bdof_disabled_flag`, `ph_dmvr_disabled_flag`,
+  `ph_prof_disabled_flag`, `ph_qp_delta`, `ph_sao_luma/chroma_enabled_flag`, the
+  deblocking override with its six offsets, and `ph_extension_length` are parsed
+  and written (§7.3.2.8). Reference picture lists carried in the PH
+  (`pps_rpl_info_in_ph_flag = 1`) are parsed with `rpl_sps_flag`/`rpl_idx` or an
+  inline `ref_pic_list_struct`, and the picture header writer mirrors all of it.
+- **Slice header.** The `sps_extra_sh_bit_present_flag` bits,
+  `sh_cu_chroma_qp_offset_enabled_flag`, the slice-header extension and the
+  reference list inherited from the picture header are parsed; the collocated
+  picture, the `NumRefIdxActive` override and the weighted-prediction presence
+  now follow `pps_rpl_info_in_ph_flag` (§7.3.7).
+- **POC and DPB.** `PicOrderCntVal` is derived from `ph_pic_order_cnt_lsb`, the
+  MSB cycle and `prevTid0POC` exactly as in VTM `VLCReader.cpp:3644-3690`
+  (§8.3.1); the DPB is keyed by that POC and sized from
+  `dpb_max_dec_pic_buffering_minus1[0]`. Decoded general-tree pictures are held
+  in a reorder buffer of `MaxNumReorderPics[Tid]` entries and released in POC
+  order, so an access-unit sequence with decode order 0/4/2/1/3 is output as
+  0/1/2/3/4 (§C.3.2).
+- **Virtual boundaries and weighted prediction** are rejected with typed errors
+  when signalled, instead of silently misparsing the remaining header.
+
+Verification (pristine VTM 24.0 build from `vtm24.tar.gz`, `cmp` on Y+U+V):
+
+| Stream | Result |
+| :--- | :--- |
+| `d_ra8` picture 1 (IDR_N_LP, 128x128, 8-bit, 128-sample CTU, full toolbox, all filters) | byte-exact |
+| `d_ra8` pictures 2-5 (B slices) | typed rejection: inter coding units are not implemented |
+| `d_i8`, `d_i10` (64x64, 3 frames, stock intra cfg) | byte-exact (unchanged) |
+
+Strict 25-case harness (VTM 24.0 `DecoderApp` + VVdeC 3.3 `vvdecapp`): **50/50**.
+Full 266-check matrix: **263 passed / 3 failed / 0 skipped**, the same three
+documented failures (`b12_420`, `ctu16`, `d_ra8`). `cargo test --workspace`
+passes; the new unit tests cover the multi sub-layer SPS/DPB parse, the PH
+override/RPL round trip, the slice-header reference-list inheritance and the
+POC output order.
+
+Remaining for `d_ra8`: the general inter coding-unit syntax and its prediction
+tools (merge/AMVP, affine, MMVD, SMVD, CIIP, GPM, BDOF, DMVR, SBT), inter motion
+compensation with the recorded reconstruction path, inter boundary strength for
+deblocking, and the full-size coefficient scan for transform blocks larger than
+32 samples. None of that is implemented for the general coding tree; the reduced
+`slice::decode_inter_picture` path is a CTU-sized subset decoder and is not a
+base for it.
+
 # H.266 / VVC Implementation Status (`rustmpeg-video::vvc`)
 
 ## 0g. 10-bit general coding-tree decode and VTM intra interop (2026-11-15)
@@ -65,12 +135,10 @@ three remaining failures are `b12_420` (VVdeC has no 12-bit oracle), `ctu16`
 and `d_ra8`.
 
 `d_ra8` (VTM stock `encoder_randomaccess_vtm.cfg`, 128x128, 5 frames, POC order
-0/4/2/1/3, temporal ids 0..5) is still outside the decoder: the SPS is rejected
-at `max_sub_layers_minus1 != 0` before CABAC. Decoding it needs the multi
-sub-layer SPS/PH syntax, RPL-based reference-list construction, a POC-keyed DPB,
-and the general inter coding-unit syntax with its prediction tools; none of that
-is implemented for the general coding tree yet. It is the next decoder stage and
-is not claimed by this change.
+0/4/2/1/3, temporal ids 0..5) was outside the decoder at this point: the SPS was
+rejected at `max_sub_layers_minus1 != 0` before CABAC. Section 0h implements the
+multi sub-layer SPS/PH syntax, the RPL-based reference lists, the POC-keyed DPB
+and the reorder buffer; the general inter coding-unit syntax remains missing.
 
 ## 0f. Deblocking on full-tool intra streams (2026-11-15)
 
