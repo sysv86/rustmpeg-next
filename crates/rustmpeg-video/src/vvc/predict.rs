@@ -1421,6 +1421,29 @@ pub fn get_modified_wide_angle(w: usize, h: usize, pred_mode: u8) -> i32 {
     mode
 }
 
+/// Wide-angle intra prediction mode mapping in the standard's numbering
+/// (`-14..=-1` and `67..=80` for the extension modes).
+///
+/// Normative source: ITU-T Rec. H.266 §8.4.5.2.7 (Eq. after (321)); VTM
+/// `UnitTools.cpp:808-834` (`PU::getWideAngle`). This is the numbering the LFNST
+/// set and transpose derivation uses; the prediction parameters use
+/// [`get_modified_wide_angle`], whose shift does not reserve modes `0` and `1`
+/// (VTM `IntraPrediction::getModifiedWideAngle`).
+pub fn get_wide_angle(w: usize, h: usize, pred_mode: u8) -> i32 {
+    let mode = i32::from(pred_mode);
+    if pred_mode <= DC_IDX || pred_mode > VDIA_IDX || w == h {
+        return mode;
+    }
+    let wh_ratio = (floor_log2_u32(w as u32) - floor_log2_u32(h as u32)).abs();
+    if w > h && mode < if wh_ratio > 1 { 8 + 2 * wh_ratio } else { 8 } {
+        return mode + (i32::from(VDIA_IDX) - 1);
+    }
+    if h > w && mode > if wh_ratio > 1 { 60 - 2 * wh_ratio } else { 60 } {
+        return mode - (i32::from(VDIA_IDX) + 1);
+    }
+    mode
+}
+
 /// Derive the 6-entry Most Probable Mode (MPM) candidate list for a luma block
 /// from the intra modes of its left (`left_dir`) and above (`above_dir`) neighbors.
 ///
@@ -1571,6 +1594,11 @@ pub struct AngularParams {
     pub apply_pdpc: bool,
     /// Angular PDPC shift scale (`0..=2`).
     pub angular_scale: i32,
+    /// Number of above reference samples (`refW` of H.266 §8.4.5.2.6): `2 * nTbW`,
+    /// or `nCbW + nTbW` for a luma ISP sub-partition.
+    pub ref_w: usize,
+    /// Number of left reference samples (`refH` of H.266 §8.4.5.2.6).
+    pub ref_h: usize,
 }
 
 /// Initialize intra prediction parameters for a directional mode (`2..=66`).
@@ -1635,6 +1663,13 @@ pub fn init_angular_params(
         }
     }
 
+    let (ref_w, ref_h) = if use_isp && is_luma {
+        // H.266 §8.4.5.2.6 (Eq. 315/316): the unavailable part of the CU below
+        // and to the right of the sub-partition extends the reference arrays.
+        (cu_w + pu_w, cu_h + pu_h)
+    } else {
+        (2 * pu_w, 2 * pu_h)
+    };
     AngularParams {
         pred_mode,
         is_mode_ver,
@@ -1644,6 +1679,8 @@ pub fn init_angular_params(
         interpolation_flag,
         apply_pdpc,
         angular_scale,
+        ref_w,
+        ref_h,
     }
 }
 
@@ -1733,11 +1770,11 @@ pub fn predict_angular_with_params(
     let intra_pred_angle = params.intra_pred_angle;
     let abs_inv_angle = params.abs_inv_angle;
 
-    let top_ref_len = 2 * w;
-    let left_ref_len = 2 * h;
+    let top_ref_len = params.ref_w;
+    let left_ref_len = params.ref_h;
 
     let base_offset = h.max(w) + 4;
-    let buf_len = base_offset + 2 * w.max(h) + 64;
+    let buf_len = base_offset + 2 * w.max(h) + 2 * top_ref_len.max(left_ref_len) + 64;
     let mut ref_above = vec![128i32; buf_len];
     let mut ref_left = vec![128i32; buf_len];
 
@@ -4318,20 +4355,41 @@ mod tests {
         }
     }
 
-    /// Wide-angle mapping of H.266 §8.4.5.2.7, in the mode numbering the standard
-    /// itself uses (`67..80` and `-14..-1` for the extension modes).
-    fn spec_wide_angle(w: usize, h: usize, dir: u8) -> i32 {
-        let wh_ratio = (usize::BITS - 1 - w.leading_zeros()) as i32
-            - (usize::BITS - 1 - h.leading_zeros()) as i32;
-        let wh_ratio = wh_ratio.unsigned_abs() as i32;
-        let mode = i32::from(dir);
-        if w > h && mode >= 2 && mode < if wh_ratio > 1 { 8 + 2 * wh_ratio } else { 8 } {
-            return mode + 65;
+    #[test]
+    fn wide_angle_mapping_differs_from_the_prediction_mapping_only_by_the_reserved_modes() {
+        for &(w, h) in &[
+            (8usize, 8usize),
+            (16, 4),
+            (4, 16),
+            (32, 8),
+            (8, 32),
+            (64, 4),
+        ] {
+            for dir in 2..=66u8 {
+                let spec = get_wide_angle(w, h, dir);
+                // The standard reserves modes 0 and 1, so its extension modes shift
+                // by 67; the prediction parameters use the shift-by-65 mirror
+                // (VTM `IntraPrediction::getModifiedWideAngle`).
+                let expected = if spec < 0 { spec + 2 } else { spec };
+                assert_eq!(
+                    get_modified_wide_angle(w, h, dir),
+                    expected,
+                    "dir {dir}, {w}x{h}"
+                );
+            }
         }
-        if h > w && mode <= 66 && mode > if wh_ratio > 1 { 60 - 2 * wh_ratio } else { 60 } {
-            return mode - 67;
-        }
-        mode
+    }
+
+    #[test]
+    fn isp_extends_the_angular_reference_arrays_to_coding_block_plus_transform_block() {
+        // H.266 §8.4.5.2.6, Eq. 315/316.
+        let isp = init_angular_params(6, 4, 4, 16, 4, true, 0, true);
+        assert_eq!((isp.ref_w, isp.ref_h), (20, 8));
+        let plain = init_angular_params(6, 4, 4, 16, 4, true, 0, false);
+        assert_eq!((plain.ref_w, plain.ref_h), (8, 8));
+        // Chroma never uses the ISP extension.
+        let chroma = init_angular_params(6, 2, 2, 8, 2, false, 0, true);
+        assert_eq!((chroma.ref_w, chroma.ref_h), (4, 4));
     }
 
     #[test]
@@ -4361,7 +4419,7 @@ mod tests {
                 // to be applied at all.
                 assert_eq!(
                     uses_reference_filter(true, IntraMode::Angular(dir), w, h),
-                    w * h > 32 && INTEGER_SLOPE.contains(&spec_wide_angle(w, h, dir)),
+                    w * h > 32 && INTEGER_SLOPE.contains(&get_wide_angle(w, h, dir)),
                     "dir {dir}, {w}x{h}"
                 );
             }

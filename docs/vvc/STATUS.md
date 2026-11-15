@@ -1,5 +1,59 @@
 # H.266 / VVC Implementation Status (`rustmpeg-video::vvc`)
 
+## 0e. LFNST and ISP reconstruction for the stock configuration (2026-11-15)
+
+The general coding-tree decoder now reconstructs the stock `encoder_intra_vtm.cfg`
+stream (every tool enabled) byte-exactly. Verified with `cmp` on full Y+U+V, 3
+frames, QP26, VTM 24.0 `DecoderApp` output for 64x64 and 128x128 pictures
+(`s64.source.yuv` and `ctu128.source.yuv`, 4:2:0 8-bit):
+
+| Stream (VTM encode flags) | 64x64 | 128x128 |
+| :--- | :--- | :--- |
+| tools off (`--MIP=0 --LFNST=0 --MTS=0 --ISP=0 --MRL=0 --LMChroma=0 --JointCbCr=0 --SBT=0 --BDPCM=0`), filters off | byte-exact | byte-exact |
+| `--LFNST=1` only | byte-exact | — |
+| `--ISP=1` only | byte-exact | — |
+| `--LFNST=1 --ISP=1` | byte-exact | — |
+| stock (all tools on), filters off | byte-exact | byte-exact |
+| stock (all tools on), full filter chain | byte-exact | byte-exact |
+
+The filters themselves were already exact; the failures were reconstruction
+defects in the LFNST and ISP paths at the first combination (`base`, all filters
+disabled). Fixes in this change:
+
+- **LFNST set and transpose selection** (`predict.rs` `get_wide_angle`,
+  `decode_general.rs` `lfnst_intra_mode`): the §8.4.5.2.7 wide-angle mapping is
+  applied before the LFNST mode is renumbered (`+81` for negative wide-angle
+  modes, `+14` for `67..80`), using the coding-block size for a luma ISP
+  sub-partition (Eq. 320/321). The previous code indexed the LFNST table with the
+  raw `0..66` mode, so every wide-angle block (`16x4`, `8x4`, tall `4xN`) used
+  the wrong set and the wrong (non-transposed) layout. The prediction
+  parameters keep the VTM `getModifiedWideAngle` numbering (`−65` shift); the
+  standard's `−67` shift is only used for the LFNST index.
+- **LFNST primary-transform zero-out** (`decode_general.rs` `lfnst_skips`):
+  `nonZeroW`/`nonZeroH` follow Eq. 1169/1170 (`4` when either TU dimension is
+  `4`, else `8`); only the `> 32` case was handled before.
+- **ISP implicit MTS** (`decode_general.rs`): `implicitMtsEnabled` for an ISP
+  coding unit requires `sps_mts_enabled_flag == 1`. ISP blocks were forced to
+  DST-7 even with MTS disabled in the SPS, so `--ISP=1 --MTS=0` streams
+  reconstructed with the wrong kernel.
+- **ISP reference array lengths** (`predict.rs` `AngularParams::ref_w`/`ref_h`):
+  angular prediction for a luma ISP sub-partition uses `refW = nCbW + nTbW` and
+  `refH = nCbH + nTbH` (Eq. 315/316). The reference arrays were truncated to
+  `2 * nTbW`/`2 * nTbH`, so the §8.4.5.2.15 PDPC reads `mainRef[dX]` and the
+  interpolation taps `refMain[deltaInt + x + 3]` ran past the copied samples for
+  the wide-angle-mapped modes of a `16x4` coding unit.
+
+Verification after the fix: strict 25-case harness (rustmpeg encode → VTM 24.0
+`DecoderApp` + VVdeC 3.3 `vvdecapp`) **50/50**; `cargo test --workspace` passes
+(338 VVC tests, 4 new); the full 266-check matrix was not re-run.
+
+Not covered by this change: at QP37 (stock tools, full filter chain) the output
+still differs from VTM in 23 of 18432 luma samples of a 64x64 picture, and the
+difference is introduced by the deblocking stage (`base` through `CCALF` are
+byte-exact, and the reduced-tool configuration is byte-exact with deblocking at
+the same QP). That is a separate, pre-existing deblocking defect; QP26 — the
+configuration recorded above — is unaffected.
+
 ## 0d. In-loop filters for the general decode path (2026-11-15)
 
 The general coding-tree decoder now applies the complete in-loop filter chain:
@@ -18,18 +72,17 @@ pictures, using the 3-frame 4:2:0 sources `s64.source.yuv` and
 | +CCALF | byte-exact | byte-exact |
 | +deblocking (full chain) | byte-exact | byte-exact |
 
-Because the committed general path still has pre-existing reconstruction
-differences unrelated to filtering, these streams disable the orthogonal tools:
-`--MIP=0 --LFNST=0 --MTS=0 --ISP=0 --MRL=0 --LMChroma=0 --JointCbCr=0 --SBT=0`.
-The source for both sizes is 4:2:0 8-bit; the exact commands are in
-[`VERIFICATION_DEBT.md`](../../VERIFICATION_DEBT.md).
+These streams disable the orthogonal tools that were not yet exact when the
+filter stages were verified: `--MIP=0 --LFNST=0 --MTS=0 --ISP=0 --MRL=0
+--LMChroma=0 --JointCbCr=0 --SBT=0` (the stock configuration is byte-exact as of
+section 0e, at the same QP). The source for both sizes is 4:2:0 8-bit; the exact
+commands are in [`VERIFICATION_DEBT.md`](../../VERIFICATION_DEBT.md).
 
-Stock `encoder_intra_vtm.cfg` (all tools on) is **not** byte-exact at the first
+Stock `encoder_intra_vtm.cfg` (all tools on) was **not** byte-exact at the first
 combination, `base` with every filter disabled: with only `--LFNST=1` enabled the
-stream differs, and with only `--ISP=1` enabled it differs. The failing
-reconstructions are LFNST-coded `16x8` transform units and ISP prediction
-regions, i.e. decode bugs that predate this change and are not filter stages.
-No filter result is claimed for that stock configuration.
+stream differed, and with only `--ISP=1` enabled it differed. Those were LFNST and
+ISP reconstruction defects that predate this change, not filter stages; they are
+fixed in section 0e, which supersedes this paragraph for the stock configuration.
 
 Fixes in this change:
 

@@ -1,6 +1,69 @@
 # Verification Debt (`rustmpeg-next` H.266/VVC)
 
-Last updated: 2026-11-15 (general in-loop filter chain; 266-check matrix last run 2026-10-28).
+Last updated: 2026-11-15 (LFNST/ISP reconstruction; stock configuration byte-exact at QP26).
+
+## 0c. LFNST and ISP reconstruction for the stock configuration (2026-11-15)
+
+Executed after fixing the LFNST set/transpose derivation, the LFNST
+primary-transform zero-out, the ISP implicit-MTS gate, and the ISP angular
+reference lengths. Oracles: VTM 24.0 `DecoderApp` and VVdeC 3.3 `vvdecapp`;
+`rustmpeg` decoder: `target/release/examples/vvc_stateful_decode`.
+
+Sources (4:2:0, 8-bit, 3 frames): `~/vvc-conf/s64.source.yuv` (64x64) and
+`~/vvc-conf-full/ctu128.source.yuv` (128x128). Encoder: VTM 24.0 `EncoderApp`
+with `encoder_intra_vtm.cfg`, `-q 26 --InternalBitDepth=8
+--TemporalSubsampleRatio=1 --FrameRate=30 -f 3`.
+
+```bash
+TOOLS="--MIP=0 --LFNST=0 --MTS=0 --ISP=0 --MRL=0 --LMChroma=0 --JointCbCr=0 --SBT=0 --BDPCM=0"
+FILTERS_OFF="--DeblockingFilterDisable=1 --SAO=0 --ALF=0 --CCALF=0 --LMCSEnable=0"
+FILTERS_ON="--DeblockingFilterDisable=0 --SAO=1 --ALF=1 --CCALF=1 --LMCSEnable=1"
+```
+
+Result (`cmp` on full Y+U+V, 3 frames):
+
+```text
+base/64          OK    base/128        OK
+lfnst/64         OK    lfnst+isp/64    OK
+isp/64           OK
+stock/64         OK    stock/128       OK
+stock+filters/64 OK    stock+filters/128 OK
+```
+
+`lfnst` = `TOOLS` with `--LFNST=1`, `isp` = `TOOLS` with `--ISP=1`,
+`stock` = no tool isolation flags.
+
+Additional sweep (stock tools, both filter settings, same 3-frame sources):
+64x64 QP22/QP32/QP37 and 128x128 QP32 are byte-exact with filters off; with the
+full filter chain 64x64 QP22, 128x128 QP32 are byte-exact. **64x64 QP37 with the
+full filter chain is not**: 23 of 18432 luma samples differ, and the difference
+is introduced by deblocking (`base`, `+LMCS`, `+SAO`, `+ALF`, `+CCALF` are all
+byte-exact for that stream; the same QP with the tool-isolation flags and
+deblocking is byte-exact). This is a separate pre-existing deblocking defect, not
+claimed fixed and not covered by the QP26 results above.
+
+Other results in this run:
+
+- Strict 25-case harness (`run_conformance.sh`, VTM 24.0 + VVdeC 3.3): **50/50**
+  (25 cases on both decoders). The script's hardcoded oracle paths were stale
+  (`h266-package/reference/.../release/DecoderApp` no longer exists); it was run
+  from an unmodified copy with `VTM`/`VVDEC` pointed at the recorded VTM 24.0 /
+  VVdeC 3.3 builds.
+- `cargo test --workspace`: OK (338 VVC tests, 4 new: `get_wide_angle` numbering,
+  `AngularParams::ref_w`/`ref_h`, `lfnst_intra_mode`, `lfnst_skips`).
+- `cargo clippy --workspace --all-targets -- -D warnings`: OK.
+- `cargo fmt --all -- --check`: OK.
+- `python3 scripts/check-licenses.py`: OK.
+- Not re-run: the external 266-check matrix, VTM-encoder interop (`d_i8`,
+  `d_i10`, `d_ra8`), tiles/WPP/slices/RPR, and GPU paths.
+- Not exercised by an oracle stream: implicit intra MTS for a non-ISP TU
+  (`sps_mts_enabled_flag == 1 && sps_explicit_mts_intra_enabled_flag == 0`). VTM
+  24.0 `EncoderApp` aborts with `xCheckModeSplit: Split decision reusing cannot
+  skip quad split` for `--MTSIntraMaxCand=0`, and every configuration used above
+  keeps explicit intra MTS enabled, so `implicitMtsEnabled` is only reached
+  through ISP. The chroma DCT-2 guard (`cIdx > 0`) and the implicit luma DST-7
+  branch follow §8.7.4.1 but are covered by no external oracle; their ISP half is
+  verified.
 
 ## 0b. General in-loop filter verification (2026-11-15)
 
@@ -39,17 +102,16 @@ db/64     OK    db/128     OK
 The same twelve combinations were reproduced byte-exactly on a second 3-frame
 source (64x64 and 128x128, VTM `EncoderApp`, same flags).
 
-Stock configuration without the tool isolation flags is **not** byte-exact at
-the first combination (`base`, every filter disabled). The first failing cases
-are streams where only one of the following tools is re-enabled:
+Stock configuration without the tool isolation flags was **not** byte-exact at
+that time (first combination `base`, every filter disabled). The failing cases
+were streams where only one of the following tools was re-enabled:
 
-- `--LFNST=1`: mismatch in a `16x8` transform unit with `lfnst_idx == 2`;
+- `--LFNST=1`: mismatch in a LFNST-coded transform unit;
 - `--ISP=1`: mismatch in an ISP prediction region.
 
-Both are pre-existing reconstruction defects outside the filter stages; the
-filters are not implicated because they are disabled in those streams. Do not
-claim filter conformance for the full-tool stock configuration until these are
-fixed.
+Both were reconstruction defects outside the filter stages (the filters are
+disabled in those streams); they are fixed in section 0c, which records the
+stock configuration as byte-exact at QP26.
 
 Other results in this run:
 

@@ -656,7 +656,7 @@ struct CuPlan {
     bdpcm_c: u8,
     chroma_mode: u8,
     /// Intra mode used by the LFNST set/transpose derivation for a chroma TU.
-    lfnst_mode_c: u16,
+    lfnst_mode_c: u8,
     lfnst: u8,
     mts: u8,
     implicit_mts: bool,
@@ -1341,6 +1341,13 @@ fn decode_cu_luma(
         }
     }
 
+    // H.266 §8.7.4.1: `implicitMtsEnabled` is 1 for an ISP coding unit whenever
+    // `sps_mts_enabled_flag` is 1 (independently of
+    // `sps_explicit_mts_intra_enabled_flag`).
+    if plan.isp != predict::IspMode::None {
+        plan.implicit_mts = g.sps.mts_enabled;
+    }
+
     if node.tree == TreeType::Joint {
         let cw = w / 2;
         let ch = h / 2;
@@ -1537,12 +1544,31 @@ fn decode_isp(dec: &mut BinDecoder<'_>, ctx: &mut CtxStore) -> u8 {
 /// Intra mode whose LFNST set and transpose flag apply to a chroma TU
 /// (H.266 §8.7.4.3, VTM `TrQuant::xInvLfnst`): the actual chroma mode, with the
 /// co-located luma mode substituted for an INTRA_LT/L/T_CCLM mode.
-fn chroma_lfnst_mode(luma_mode: u8, chroma_mode: u8) -> u16 {
+fn chroma_lfnst_mode(luma_mode: u8, chroma_mode: u8) -> u8 {
     if (81..=83).contains(&chroma_mode) {
-        u16::from(luma_mode)
+        luma_mode
     } else {
-        u16::from(chroma_mode)
+        chroma_mode
     }
+}
+
+/// LFNST intra mode index (`0..=94`, VTM `TrQuant::getLFNSTIntraMode`) for a
+/// transform block, derived from the §8.4.5.2.7 wide-angle mapping of the
+/// prediction mode in force for that block.
+///
+/// `nw`/`nh` are the coding-block dimensions when ISP is active on luma and the
+/// transform-block dimensions otherwise (§8.4.5.2.7, Eq. 318-321).
+fn lfnst_intra_mode(plan: &CuPlan, luma: bool, cw: usize, ch: usize) -> u16 {
+    let (nw, nh, mode) = if luma {
+        if plan.isp == predict::IspMode::None {
+            (cw, ch, plan.mode)
+        } else {
+            (plan.w, plan.h, plan.mode)
+        }
+    } else {
+        (cw, ch, plan.lfnst_mode_c)
+    };
+    lfnst::get_lfnst_intra_mode(predict::get_wide_angle(nw, nh, mode))
 }
 
 fn decode_chroma_mode(
@@ -2231,23 +2257,18 @@ fn inverse_residual(
     }
 
     if plan.lfnst > 0 && !used_mts && (luma || plan.tree == TreeType::Chroma) {
-        let lfnst_intra_mode = if luma {
-            lfnst_mode(plan.mode)
-        } else {
-            plan.lfnst_mode_c
-        };
+        let lfnst_intra_mode = lfnst_intra_mode(plan, luma, cw, ch);
         lfnst::inverse_lfnst_rect(cw, ch, &mut dequant, plan.lfnst, lfnst_intra_mode).map_err(
             |_e| VvcError::Unsupported("unsupported transform dimensions or transform type"),
         )?;
     }
     let (th, tv) = if used_mts {
         mts_types(plan.mts)?
-    } else if plan.lfnst == 0
-        && plan.mip.is_none()
-        && (plan.isp != predict::IspMode::None || plan.implicit_mts)
-    {
-        // H.266 §8.7.3 / VTM `TrQuant::getTrTypes`: intra ISP and implicit
-        // intra MTS select DST-7 for a dimension in `4..=16`, DCT-2 otherwise.
+    } else if luma && plan.lfnst == 0 && plan.mip.is_none() && plan.implicit_mts {
+        // H.266 §8.7.4.1 / VTM `TrQuant::getTrTypes`: with `implicitMtsEnabled`
+        // (ISP, or no explicit intra MTS) a luma dimension in `4..=16` uses
+        // DST-7 and DCT-2 otherwise. With `sps_mts_enabled_flag == 0`, or for
+        // chroma, both stay DCT-2.
         (
             if (4..=16).contains(&cw) {
                 dct::TrType::Dst7
@@ -2301,17 +2322,12 @@ fn primary_skips(w: usize, h: usize, th: dct::TrType, tv: dct::TrType) -> (usize
     (sw, sh)
 }
 
+/// Zero-out width/height of the primary transform for a block with LFNST
+/// (H.266 §8.7.4.1, Eq. 1169/1170): `nonZeroW` and `nonZeroH` are `4` when either
+/// dimension is `4` and `8` otherwise.
 fn lfnst_skips(w: usize, h: usize) -> (usize, usize) {
-    (if w > 32 { 16 } else { 0 }, if h > 32 { 16 } else { 0 })
-}
-
-fn lfnst_mode(mode: u8) -> u16 {
-    match mode {
-        0 => 0,
-        1 => 1,
-        2..=66 => u16::from(mode),
-        _ => 0,
-    }
+    let nz = if w == 4 || h == 4 { 4 } else { 8 };
+    (w - nz.min(w), h - nz.min(h))
 }
 
 impl Gen<'_> {
@@ -3623,5 +3639,70 @@ fn alf_chroma_block(
             let val = cur + ((sum + (1 << (shift - 1))) >> shift);
             dst.set(x, y, val.clamp(0, 255) as u8);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(mode: u8, isp: predict::IspMode, w: usize, h: usize) -> CuPlan {
+        CuPlan {
+            tree: TreeType::Luma,
+            x: 0,
+            w,
+            h,
+            qp_y: 26,
+            qp_cb: 26,
+            qp_cr: 26,
+            mode,
+            mip: None,
+            isp,
+            mrl: 0,
+            bdpcm_l: 0,
+            bdpcm_c: 0,
+            chroma_mode: 0,
+            lfnst_mode_c: 0,
+            lfnst: 1,
+            mts: 0,
+            implicit_mts: false,
+            dep_quant: false,
+        }
+    }
+
+    /// H.266 §8.7.4.1 derives the LFNST intra mode from the §8.4.5.2.7
+    /// wide-angle mapping, applied to the coding block for a luma ISP
+    /// sub-partition (Eq. 320/321) and to the transform block otherwise.
+    #[test]
+    fn lfnst_mode_uses_the_wide_angle_coding_block_for_isp() {
+        // 16x4 coding block, mode 6 -> 71 -> extended index 85: LFNST set 1,
+        // transposed.
+        let isp = plan(6, predict::IspMode::Ver, 16, 4);
+        let idx = lfnst_intra_mode(&isp, true, 4, 4);
+        assert_eq!(idx, 85);
+        assert_eq!(lfnst::lfnst_set(idx), Ok(1));
+        assert!(lfnst::transposes(idx));
+
+        // The same mode without ISP maps 6 -> 71 through the 4x4 block size,
+        // where the mapping does not apply: extended index 6, set 1, not
+        // transposed.
+        let plain = plan(6, predict::IspMode::None, 16, 4);
+        let idx = lfnst_intra_mode(&plain, true, 4, 4);
+        assert_eq!(idx, 6);
+        assert_eq!(lfnst::lfnst_set(idx), Ok(1));
+        assert!(!lfnst::transposes(idx));
+    }
+
+    /// H.266 §8.7.4.1, Eq. 1169/1170: the primary transform only uses the
+    /// `nonZeroW x nonZeroH` low-frequency region when LFNST applies.
+    #[test]
+    fn lfnst_zeroes_the_primary_transform_outside_non_zero_region() {
+        assert_eq!(lfnst_skips(4, 4), (0, 0));
+        assert_eq!(lfnst_skips(8, 8), (0, 0));
+        assert_eq!(lfnst_skips(16, 8), (8, 0));
+        assert_eq!(lfnst_skips(8, 4), (4, 0));
+        assert_eq!(lfnst_skips(4, 16), (0, 12));
+        assert_eq!(lfnst_skips(16, 16), (8, 8));
+        assert_eq!(lfnst_skips(64, 64), (56, 56));
     }
 }
