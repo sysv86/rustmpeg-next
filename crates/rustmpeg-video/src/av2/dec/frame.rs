@@ -2102,7 +2102,7 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             None
         };
 
-        let mut dip_mode: Option<u8> = None;
+        let mut dip_mode: Option<(u8, bool)> = None;
         if self.seq.intra_dip && y_mode == 0 {
             let ctx = bs as usize;
             if self
@@ -2110,14 +2110,9 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
                 .decode_bool_adapt(self.cdf.m.use_dip(ctx.min(2)))?
                 != 0
             {
-                let transpose = self.msac.decode_bool_bypass();
+                let transpose = self.msac.decode_bool_bypass() != 0;
                 let mode = self.msac.decode_symbol_adapt(self.cdf.m.dip_mode(), 5)? as u8;
-                if transpose != 0 {
-                    return Err(Av2Error::Unsupported(
-                        "transposed DIP prediction".to_string(),
-                    ));
-                }
-                dip_mode = Some(mode);
+                dip_mode = Some((mode, transpose));
             }
         }
 
@@ -2200,21 +2195,52 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
                     pl.data[dst_row + c] = self.bd.clip_pixel(pal.colors[idx.min(pal.size - 1)]);
                 }
             }
-        } else if let Some(dip) = dip_mode {
+        } else if let Some((dip, transpose)) = dip_mode {
             let edge = self.edge_buffer(0, px_x, px_y, w, h, have_left, have_top, 0);
-            let pl = &mut self.rec.planes[0];
-            let off = pl.offset(px_x, px_y);
-            predict_filter_intra_block(
-                self.bd,
-                &mut pl.data,
-                off,
-                pl.stride,
-                &edge,
-                256,
-                filter_intra_mode(dip),
-                w,
-                h,
-            );
+            if transpose {
+                // Transposed DIP (AV2 Spec v1.0.0 §7.13.2.5): swap above/left
+                // edge samples, predict HxW, then transpose back into WxH.
+                let mut t_edge = [BD::Pixel::default(); 512];
+                t_edge[256] = edge[256];
+                let max_span = (w + h).min(255);
+                for i in 1..=max_span {
+                    t_edge[256 + i] = edge[256 - i];
+                    t_edge[256 - i] = edge[256 + i];
+                }
+                let mut tmp = vec![BD::Pixel::default(); w * h];
+                predict_filter_intra_block(
+                    self.bd,
+                    &mut tmp,
+                    0,
+                    h,
+                    &t_edge,
+                    256,
+                    filter_intra_mode(dip),
+                    h,
+                    w,
+                );
+                let pl = &mut self.rec.planes[0];
+                let off = pl.offset(px_x, px_y);
+                for r in 0..h {
+                    for c in 0..w {
+                        pl.data[off + r * pl.stride + c] = tmp[c * h + r];
+                    }
+                }
+            } else {
+                let pl = &mut self.rec.planes[0];
+                let off = pl.offset(px_x, px_y);
+                predict_filter_intra_block(
+                    self.bd,
+                    &mut pl.data,
+                    off,
+                    pl.stride,
+                    &edge,
+                    256,
+                    filter_intra_mode(dip),
+                    w,
+                    h,
+                );
+            }
         } else {
             let edge = self.edge_buffer(0, px_x, px_y, w, h, have_left, have_top, mrl_idx);
             let pl = &mut self.rec.planes[0];
@@ -2705,6 +2731,7 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             let mut motion_mode = 0u8;
             let mut inter_intra = false;
             let mut inter_intra_mode = 0u8;
+            let mut inter_intra_wedge: Option<u8> = None;
             if !forced_globalmv {
                 if warp_signalled {
                     let ctx = self.warp_mv_count(bx4, by4, bw4, bh4);
@@ -2840,10 +2867,7 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
                                     .decode_bool_adapt(&mut self.cdf.m.wedge_inter_intra)?
                                     != 0
                             {
-                                let _ = self.read_wedge_idx()?;
-                                return Err(Av2Error::Unsupported(
-                                    "inter-intra wedge blending".to_string(),
-                                ));
+                                inter_intra_wedge = Some(self.read_wedge_idx()?);
                             }
                         }
                     }
@@ -2991,10 +3015,7 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
                             .decode_bool_adapt(&mut self.cdf.m.wedge_inter_intra)?
                             != 0
                         {
-                            let _ = self.read_wedge_idx()?;
-                            return Err(Av2Error::Unsupported(
-                                "warp inter-intra wedge blending".to_string(),
-                            ));
+                            inter_intra_wedge = Some(self.read_wedge_idx()?);
                         }
                     }
                 }
@@ -3242,19 +3263,56 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             }
 
             if let Some((iy, chroma)) = ii_saved {
-                let mask = interintra_mask(inter_intra_mode, w, h);
-                let dp = &mut self.rec.planes[0];
-                let off = dp.offset(px_x, px_y);
-                blend_interintra(self.bd, &mut dp.data, off, dp.stride, &iy, &mask, w, h);
-                if let Some((iu, iv)) = chroma {
-                    let mask_u = interintra_mask(inter_intra_mode, cw, ch);
-                    let dp = &mut self.rec.planes[1];
-                    let off = dp.offset(cpx_x, cpx_y);
-                    blend_interintra(self.bd, &mut dp.data, off, dp.stride, &iu, &mask_u, cw, ch);
-                    let mask_v = interintra_mask(inter_intra_mode, cw, ch);
-                    let dp = &mut self.rec.planes[2];
-                    let off = dp.offset(cpx_x, cpx_y);
-                    blend_interintra(self.bd, &mut dp.data, off, dp.stride, &iv, &mask_v, cw, ch);
+                if let Some(widx) = inter_intra_wedge {
+                    // Wedge inter-intra blending (AV2 Spec v1.0.0 §7.13.3.14).
+                    let mask_y = WEDGE_TABLES
+                        .get_mask(bs, widx as usize, 0, 0)
+                        .ok_or_else(|| {
+                            Av2Error::BitstreamError(format!(
+                                "missing inter-intra luma wedge mask bs {bs:?} idx {widx}"
+                            ))
+                        })?;
+                    let dp = &mut self.rec.planes[0];
+                    let off = dp.offset(px_x, px_y);
+                    blend_interintra(self.bd, &mut dp.data, off, dp.stride, &iy, mask_y, w, h);
+                    if let Some((iu, iv)) = chroma {
+                        let mask_c = WEDGE_TABLES
+                            .get_mask(chroma_bs, widx as usize, ss_x as usize, ss_y as usize)
+                            .ok_or_else(|| {
+                                Av2Error::BitstreamError(format!(
+                                    "missing inter-intra chroma wedge mask bs {chroma_bs:?} idx {widx}"
+                                ))
+                            })?;
+                        let dp = &mut self.rec.planes[1];
+                        let off = dp.offset(cpx_x, cpx_y);
+                        blend_interintra(
+                            self.bd, &mut dp.data, off, dp.stride, &iu, mask_c, cw, ch,
+                        );
+                        let dp = &mut self.rec.planes[2];
+                        let off = dp.offset(cpx_x, cpx_y);
+                        blend_interintra(
+                            self.bd, &mut dp.data, off, dp.stride, &iv, mask_c, cw, ch,
+                        );
+                    }
+                } else {
+                    let mask = interintra_mask(inter_intra_mode, w, h);
+                    let dp = &mut self.rec.planes[0];
+                    let off = dp.offset(px_x, px_y);
+                    blend_interintra(self.bd, &mut dp.data, off, dp.stride, &iy, &mask, w, h);
+                    if let Some((iu, iv)) = chroma {
+                        let mask_u = interintra_mask(inter_intra_mode, cw, ch);
+                        let dp = &mut self.rec.planes[1];
+                        let off = dp.offset(cpx_x, cpx_y);
+                        blend_interintra(
+                            self.bd, &mut dp.data, off, dp.stride, &iu, &mask_u, cw, ch,
+                        );
+                        let mask_v = interintra_mask(inter_intra_mode, cw, ch);
+                        let dp = &mut self.rec.planes[2];
+                        let off = dp.offset(cpx_x, cpx_y);
+                        blend_interintra(
+                            self.bd, &mut dp.data, off, dp.stride, &iv, &mask_v, cw, ch,
+                        );
+                    }
                 }
             }
 
@@ -3898,14 +3956,20 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
         if !all_zero {
             if seg_lossless {
                 if tx_part_ll_full {
-                    let base_tx = MAX_TXFM_SIZE_FOR_BS[bs as usize] as usize;
-                    let d = &TXFM_DIMENSIONS[base_tx];
-                    if d.w > 8 || d.h > 8 {
-                        return Err(Av2Error::Unsupported(
-                            "multi-chunk inter lossless_tx_size block".to_string(),
-                        ));
+                    let chunk_w = w.min(32);
+                    let chunk_h = h.min(32);
+                    let chunk_tx = crate::av2::txpart::find_tx_size(chunk_w, chunk_h)
+                        .map(|t| t as usize)
+                        .unwrap_or_else(|| MAX_TXFM_SIZE_FOR_BS[bs as usize] as usize);
+                    let mut cy = 0usize;
+                    while cy < h {
+                        let mut cx = 0usize;
+                        while cx < w {
+                            luma_tus.push((chunk_tx, px_x + cx, px_y + cy));
+                            cx += chunk_w;
+                        }
+                        cy += chunk_h;
                     }
-                    luma_tus.push((base_tx, px_x, px_y));
                 } else {
                     for y4 in 0..bh4 {
                         for x4 in 0..bw4 {
@@ -4865,39 +4929,102 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
         }
         self.check_intrabc_mv(bs, bx4, by4, mv)?;
 
-        let dx_px = (mv.x as i32) / 8;
-        let dy_px = (mv.y as i32) / 8;
-        if mv.x % 8 != 0 || mv.y % 8 != 0 {
-            return Err(Av2Error::Unsupported(
-                "sub-pixel IntraBC prediction".to_string(),
-            ));
-        }
         let x_limit = self.frame_mi_w * 4;
         let y_limit = self.frame_mi_h * 4;
-        apply_intrabc_block_bounded(
-            &mut self.rec.planes[0],
-            px_x,
-            px_y,
-            w,
-            h,
-            dy_px,
-            dx_px,
-            x_limit,
-            y_limit,
-        );
-        if has_chroma {
-            for pl in 1..=2 {
-                apply_intrabc_block_bounded(
-                    &mut self.rec.planes[pl],
-                    (chroma_bx4 * 4) >> ss_x,
-                    (chroma_by4 * 4) >> ss_y,
-                    (chroma_bw4 * 4) >> ss_x,
-                    (chroma_bh4 * 4) >> ss_y,
-                    dy_px >> ss_y,
-                    dx_px >> ss_x,
-                    x_limit >> ss_x,
-                    y_limit >> ss_y,
+        if mv.x % 8 != 0 || mv.y % 8 != 0 {
+            // Sub-pixel IntraBC prediction (AV2 Spec v1.0.0 §7.13.3.1):
+            // 8-tap regular filter against already-reconstructed samples.
+            let mv_y_q16 = mv.y as i32 * 2;
+            let mv_x_q16 = mv.x as i32 * 2;
+            {
+                let mut pred = vec![BD::Pixel::default(); w * h];
+                let rp = &self.rec.planes[0];
+                mc_predict_block(
+                    self.bd,
+                    &mut pred,
+                    0,
+                    w,
+                    &rp.data,
+                    rp.stride,
+                    x_limit as i32,
+                    y_limit as i32,
+                    px_x as i32,
+                    px_y as i32,
+                    w,
+                    h,
+                    mv_y_q16,
+                    mv_x_q16,
+                    0,
                 );
+                let dp = &mut self.rec.planes[0];
+                let off = dp.offset(px_x, px_y);
+                for r in 0..h {
+                    let dst_row = off + r * dp.stride;
+                    dp.data[dst_row..dst_row + w].copy_from_slice(&pred[r * w..(r + 1) * w]);
+                }
+            }
+            if has_chroma {
+                let cpx_x = (chroma_bx4 * 4) >> ss_x;
+                let cpx_y = (chroma_by4 * 4) >> ss_y;
+                let cw_ibc = (chroma_bw4 * 4) >> ss_x;
+                let ch_ibc = (chroma_bh4 * 4) >> ss_y;
+                for pl in 1..=2 {
+                    let mut pred = vec![BD::Pixel::default(); cw_ibc * ch_ibc];
+                    let rp = &self.rec.planes[pl];
+                    mc_predict_block(
+                        self.bd,
+                        &mut pred,
+                        0,
+                        cw_ibc,
+                        &rp.data,
+                        rp.stride,
+                        (x_limit >> ss_x) as i32,
+                        (y_limit >> ss_y) as i32,
+                        cpx_x as i32,
+                        cpx_y as i32,
+                        cw_ibc,
+                        ch_ibc,
+                        mv_y_q16 >> ss_y,
+                        mv_x_q16 >> ss_x,
+                        0,
+                    );
+                    let dp = &mut self.rec.planes[pl];
+                    let off = dp.offset(cpx_x, cpx_y);
+                    for r in 0..ch_ibc {
+                        let dst_row = off + r * dp.stride;
+                        dp.data[dst_row..dst_row + cw_ibc]
+                            .copy_from_slice(&pred[r * cw_ibc..(r + 1) * cw_ibc]);
+                    }
+                }
+            }
+        } else {
+            let dx_px = (mv.x as i32) / 8;
+            let dy_px = (mv.y as i32) / 8;
+            apply_intrabc_block_bounded(
+                &mut self.rec.planes[0],
+                px_x,
+                px_y,
+                w,
+                h,
+                dy_px,
+                dx_px,
+                x_limit,
+                y_limit,
+            );
+            if has_chroma {
+                for pl in 1..=2 {
+                    apply_intrabc_block_bounded(
+                        &mut self.rec.planes[pl],
+                        (chroma_bx4 * 4) >> ss_x,
+                        (chroma_by4 * 4) >> ss_y,
+                        (chroma_bw4 * 4) >> ss_x,
+                        (chroma_bh4 * 4) >> ss_y,
+                        dy_px >> ss_y,
+                        dx_px >> ss_x,
+                        x_limit >> ss_x,
+                        y_limit >> ss_y,
+                    );
+                }
             }
         }
 
@@ -4911,56 +5038,84 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             let tx = MAX_TXFM_SIZE_FOR_BS[bs as usize] as usize;
             let t_dim = &TXFM_DIMENSIONS[tx];
             let (ibc_tx_part, _) = self.decode_tx_partition(bs, 0, 1, false, seg_lossless)?;
-            if ibc_tx_part != TxPartition::TxNone {
-                return Err(Av2Error::Unsupported(
-                    "IntraBC transform partitioning".to_string(),
-                ));
+            let mut ibc_tus: Vec<(usize, usize, usize)> = Vec::new();
+            match ibc_tx_part {
+                TxPartition::TxNone => ibc_tus.push((tx, px_x, px_y)),
+                _ => {
+                    let base = crate::av2::levels::RectTxfmSize::from_usize(tx)
+                        .unwrap_or(crate::av2::levels::RectTxfmSize::Tx4x4);
+                    for u in crate::av2::txpart::expand_tx_partition(base, ibc_tx_part).0 {
+                        ibc_tus.push((u.tx as usize, px_x + u.x_px, px_y + u.y_px));
+                    }
+                }
             }
-            let y_params = CoefDecodeParams {
-                tx,
-                bs: bs as usize,
-                plane: 0,
-                intra: false,
-                fsc: false,
-                lossless: seg_lossless,
-                uv_mode: 0,
-                y_mode: 0,
-                y_angle: 0,
-                mrl_index: 0,
-                y_txtp: 0,
-                reduced_txtp_set: self.fh.reduced_txtp_set as i32,
-                u_has_cf: 0,
-                dq_tbl: self.dq[seg_id.min((MAX_SEGMENTS - 1) as u8) as usize][0],
-                bitdepth: self.bd.bitdepth(),
-                ss_hor: ss_x != 0,
-                ss_ver: ss_y != 0,
-                chroma_dctonly: self.seq.chroma_dctonly,
-                qm: self.qm_slice(seg_id, 0, tx, seg_lossless),
-            };
-            let y_res = decode_coefs(
-                &mut self.msac,
-                &mut self.cdf.coef,
-                &mut self.cdf.m,
-                &self.a_cols[a_idx].lcoef[bx4_in_sb..],
-                &self.l_ctx.lcoef[by4_in_sb..],
-                &y_params,
-                &mut self.dq_y,
-            )?;
-            l_res_ctx = y_res.res_ctx;
-            if y_res.eob >= 0 {
-                let pl = &mut self.rec.planes[0];
-                let off = pl.offset(px_x, px_y);
-                inv_txfm_add(
-                    self.bd,
-                    &mut pl.data,
-                    off,
-                    pl.stride,
+            let mut y_txtp_first = 0u16;
+            for (idx_tu, &(tx_u, x_u, y_u)) in ibc_tus.iter().enumerate() {
+                let ux4 = (x_u - px_x) / 4;
+                let uy4 = (y_u - px_y) / 4;
+                let td = &TXFM_DIMENSIONS[tx_u];
+                let y_params = CoefDecodeParams {
+                    tx: tx_u,
+                    bs: bs as usize,
+                    plane: 0,
+                    intra: false,
+                    fsc: false,
+                    lossless: seg_lossless,
+                    uv_mode: 0,
+                    y_mode: 0,
+                    y_angle: 0,
+                    mrl_index: 0,
+                    y_txtp: 0,
+                    reduced_txtp_set: self.fh.reduced_txtp_set as i32,
+                    u_has_cf: 0,
+                    dq_tbl: self.dq[seg_id.min((MAX_SEGMENTS - 1) as u8) as usize][0],
+                    bitdepth: self.bd.bitdepth(),
+                    ss_hor: ss_x != 0,
+                    ss_ver: ss_y != 0,
+                    chroma_dctonly: self.seq.chroma_dctonly,
+                    qm: self.qm_slice(seg_id, 0, tx_u, seg_lossless),
+                };
+                let y_res = decode_coefs(
+                    &mut self.msac,
+                    &mut self.cdf.coef,
+                    &mut self.cdf.m,
+                    &self.a_cols[a_idx].lcoef[bx4_in_sb + ux4..],
+                    &self.l_ctx.lcoef[by4_in_sb + uy4..],
+                    &y_params,
                     &mut self.dq_y,
-                    y_res.txtp as u32,
-                    y_res.eob,
-                    tx,
-                );
+                )?;
+                if idx_tu == 0 {
+                    y_txtp_first = y_res.txtp;
+                }
+                l_res_ctx = y_res.res_ctx;
+                for i4 in 0..(td.w as usize)
+                    .min(32usize.saturating_sub(bx4_in_sb + ux4))
+                    .min(self.frame_mi_w.saturating_sub(bx4 + ux4))
+                {
+                    self.a_cols[a_idx].lcoef[bx4_in_sb + ux4 + i4] = y_res.res_ctx;
+                }
+                for i4 in 0..(td.h as usize)
+                    .min(32usize.saturating_sub(by4_in_sb + uy4))
+                    .min(self.frame_mi_h.saturating_sub(by4 + uy4))
+                {
+                    self.l_ctx.lcoef[by4_in_sb + uy4 + i4] = y_res.res_ctx;
+                }
+                if y_res.eob >= 0 {
+                    let pl = &mut self.rec.planes[0];
+                    let off = pl.offset(x_u, y_u);
+                    inv_txfm_add(
+                        self.bd,
+                        &mut pl.data,
+                        off,
+                        pl.stride,
+                        &mut self.dq_y,
+                        y_res.txtp as u32,
+                        y_res.eob,
+                        tx_u,
+                    );
+                }
             }
+            let y_res_txtp = y_txtp_first;
             let _ = t_dim;
             if has_chroma {
                 let layout_col = (self.seq.layout as usize).saturating_sub(1);
@@ -4982,7 +5137,7 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
                     y_mode: 0,
                     y_angle: 0,
                     mrl_index: 0,
-                    y_txtp: y_res.txtp as u32,
+                    y_txtp: y_res_txtp as u32,
                     reduced_txtp_set: self.fh.reduced_txtp_set as i32,
                     u_has_cf: 0,
                     dq_tbl: self.dq[seg_id.min((MAX_SEGMENTS - 1) as u8) as usize][1],
@@ -5182,9 +5337,11 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
                 0 => TxPartition::TxSplit,
                 1 => TxPartition::TxH,
                 2 => TxPartition::TxV,
+                3 => TxPartition::TxH4,
+                4 => TxPartition::TxV4,
                 _ => {
                     return Err(Av2Error::Unsupported(format!(
-                        "transform partition type {} (4-way/5-way)",
+                        "transform partition type {} (5-way)",
                         sym + 1
                     )));
                 }
@@ -5199,13 +5356,14 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
                 self.msac
                     .decode_bool_adapt(self.cdf.m.tx_2or3_partition_type(fsc, inter, ctx))?
             };
-            if four_way != 0 {
-                return Err(Av2Error::Unsupported(
-                    "4-way transform partition type".to_string(),
-                ));
-            }
             return Ok((
-                if bw4 >= 4 {
+                if four_way != 0 {
+                    if bw4 >= 4 {
+                        TxPartition::TxV4
+                    } else {
+                        TxPartition::TxH4
+                    }
+                } else if bw4 >= 4 {
                     TxPartition::TxV
                 } else {
                     TxPartition::TxH

@@ -230,16 +230,66 @@ pub fn expand_tx_partition(base_tx: RectTxfmSize, tx_part: TxPartition) -> (Vec<
                 )
             }
         }
-        _ => (
-            vec![SubTxUnit {
-                tx: base_tx,
-                x_px: 0,
-                y_px: 0,
-                w_px: w,
-                h_px: h,
-            }],
-            1,
-        ),
+        TxPartition::TxH4 => {
+            if h >= 16
+                && let Some(sub_tx) = find_tx_size(w, h / 4)
+            {
+                let qh = h / 4;
+                (
+                    (0..4)
+                        .map(|k| SubTxUnit {
+                            tx: sub_tx,
+                            x_px: 0,
+                            y_px: k * qh,
+                            w_px: w,
+                            h_px: qh,
+                        })
+                        .collect(),
+                    4,
+                )
+            } else {
+                (
+                    vec![SubTxUnit {
+                        tx: base_tx,
+                        x_px: 0,
+                        y_px: 0,
+                        w_px: w,
+                        h_px: h,
+                    }],
+                    1,
+                )
+            }
+        }
+        TxPartition::TxV4 => {
+            if w >= 16
+                && let Some(sub_tx) = find_tx_size(w / 4, h)
+            {
+                let qw = w / 4;
+                (
+                    (0..4)
+                        .map(|k| SubTxUnit {
+                            tx: sub_tx,
+                            x_px: k * qw,
+                            y_px: 0,
+                            w_px: qw,
+                            h_px: h,
+                        })
+                        .collect(),
+                    4,
+                )
+            } else {
+                (
+                    vec![SubTxUnit {
+                        tx: base_tx,
+                        x_px: 0,
+                        y_px: 0,
+                        w_px: w,
+                        h_px: h,
+                    }],
+                    1,
+                )
+            }
+        }
     }
 }
 
