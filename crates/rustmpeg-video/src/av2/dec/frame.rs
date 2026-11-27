@@ -643,6 +643,22 @@ fn validate_tools(seq: &SequenceHeader, fh: &FrameHeader) -> Result<()> {
     Ok(())
 }
 
+/// Chroma block coordinates and presence propagated through the partition tree
+/// (AV2 Spec v1.0.0 §5.20.3.1 `decode_partition`).
+#[derive(Clone, Copy, Debug)]
+struct ChromaBlockCtx {
+    /// Whether this leaf codes chroma syntax and samples (`HasChroma`).
+    has_chroma: bool,
+    /// Whether a sub-8x8 chroma offset is already active (`chromaOffset`).
+    chroma_offset: bool,
+    /// Chroma block left coordinate in 4x4 luma units (`ChromaMiCol`).
+    bx4: usize,
+    /// Chroma block top coordinate in 4x4 luma units (`ChromaMiRow`).
+    by4: usize,
+    /// Chroma block luma-equivalent size (`ChromaMiSize`).
+    bs: BlockSize,
+}
+
 struct TileDecoder<'a, BD: BitDepth> {
     bd: BD,
     seq: &'a SequenceHeader,
@@ -1011,7 +1027,14 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             let mut bx4 = self.tile_col_start4;
             while bx4 < self.tile_col_end4 {
                 self.decode_lr(bx4, by4)?;
-                self.decode_sb(root_bs, bx4, by4, false)?;
+                let root_chroma = ChromaBlockCtx {
+                    has_chroma: self.seq.layout != PixelLayout::I400,
+                    chroma_offset: false,
+                    bx4,
+                    by4,
+                    bs: root_bs,
+                };
+                self.decode_sb(root_bs, bx4, by4, root_chroma)?;
                 bx4 += sb_step4;
             }
             by4 += sb_step4;
@@ -1026,19 +1049,20 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         bs: BlockSize,
         bx4: usize,
         by4: usize,
-        chroma_offset: bool,
+        chroma: ChromaBlockCtx,
     ) -> Result<()> {
         if bx4 >= self.tile_col_end4 || by4 >= self.tile_row_end4 {
             return Ok(());
         }
-        let cfg = PartitionSyntaxConfig::from_seq_header(self.seq, self.fh.is_key_or_intra());
+        let mut cfg = PartitionSyntaxConfig::from_seq_header(self.seq, self.fh.is_key_or_intra());
+        cfg.has_chroma = chroma.has_chroma;
         let allowed = init_allowed_partitions(
             bs,
             bx4,
             by4,
             self.frame_mi_w,
             self.frame_mi_h,
-            chroma_offset,
+            chroma.chroma_offset,
             &cfg,
         );
         let bp = match partition_implied(bs, bx4, by4, self.frame_mi_w, self.frame_mi_h)
@@ -1062,7 +1086,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 }
             },
         };
-        self.decode_partition_node(bs, bp, bx4, by4, chroma_offset, &cfg)
+        self.decode_partition_node(bs, bp, bx4, by4, chroma, &cfg)
     }
 
     /// Applies the decoded partition: updates the partition context and either
@@ -1073,14 +1097,33 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         bp: BlockPartition,
         bx4: usize,
         by4: usize,
-        chroma_offset: bool,
+        chroma: ChromaBlockCtx,
         cfg: &PartitionSyntaxConfig,
     ) -> Result<()> {
         let b_dim = BLOCK_DIMENSIONS[bs as usize];
         let bw4 = b_dim[0] as usize;
         let bh4 = b_dim[1] as usize;
         let a_idx = ((bx4 - self.tile_col_start4) >> 5).min(self.a_cols.len() - 1);
-        let child_chroma_offset = chroma_offset || chroma_offset_for_partition(bp, bs, cfg);
+        let (child_chroma_offset, chroma_bx4, chroma_by4, chroma_bs) =
+            if !chroma.chroma_offset && chroma.has_chroma {
+                (chroma_offset_for_partition(bp, bs, cfg), bx4, by4, bs)
+            } else {
+                (chroma.chroma_offset, chroma.bx4, chroma.by4, chroma.bs)
+            };
+        let child_pre = ChromaBlockCtx {
+            has_chroma: chroma.has_chroma && !child_chroma_offset,
+            chroma_offset: child_chroma_offset,
+            bx4: chroma_bx4,
+            by4: chroma_by4,
+            bs: chroma_bs,
+        };
+        let child_last = ChromaBlockCtx {
+            has_chroma: chroma.has_chroma,
+            chroma_offset: child_chroma_offset,
+            bx4: chroma_bx4,
+            by4: chroma_by4,
+            bs: chroma_bs,
+        };
         let Some(sub_bs) = partition_subsize(bs, bp) else {
             return Err(Av2Error::BitstreamError(format!(
                 "partition {bp:?} is not legal for block size {bs:?}"
@@ -1096,23 +1139,30 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     bx4 & 31,
                     by4 & 31,
                 );
-                self.decode_leaf(bs, bx4, by4)
+                let leaf_chroma = ChromaBlockCtx {
+                    has_chroma: chroma.has_chroma && self.seq.layout != PixelLayout::I400,
+                    chroma_offset: child_chroma_offset,
+                    bx4: chroma_bx4,
+                    by4: chroma_by4,
+                    bs: chroma_bs,
+                };
+                self.decode_leaf(bs, bx4, by4, leaf_chroma)
             }
             BlockPartition::H => {
-                self.decode_sb(sub_bs, bx4, by4, child_chroma_offset)?;
-                self.decode_sb(sub_bs, bx4, by4 + (bh4 >> 1), child_chroma_offset)
+                self.decode_sb(sub_bs, bx4, by4, child_pre)?;
+                self.decode_sb(sub_bs, bx4, by4 + (bh4 >> 1), child_last)
             }
             BlockPartition::V => {
-                self.decode_sb(sub_bs, bx4, by4, child_chroma_offset)?;
-                self.decode_sb(sub_bs, bx4 + (bw4 >> 1), by4, child_chroma_offset)
+                self.decode_sb(sub_bs, bx4, by4, child_pre)?;
+                self.decode_sb(sub_bs, bx4 + (bw4 >> 1), by4, child_last)
             }
             BlockPartition::Split => {
                 let half_w4 = bw4 >> 1;
                 let half_h4 = bh4 >> 1;
-                self.decode_sb(sub_bs, bx4, by4, child_chroma_offset)?;
-                self.decode_sb(sub_bs, bx4 + half_w4, by4, child_chroma_offset)?;
-                self.decode_sb(sub_bs, bx4, by4 + half_h4, child_chroma_offset)?;
-                self.decode_sb(sub_bs, bx4 + half_w4, by4 + half_h4, child_chroma_offset)
+                self.decode_sb(sub_bs, bx4, by4, child_pre)?;
+                self.decode_sb(sub_bs, bx4 + half_w4, by4, child_pre)?;
+                self.decode_sb(sub_bs, bx4, by4 + half_h4, child_pre)?;
+                self.decode_sb(sub_bs, bx4 + half_w4, by4 + half_h4, child_last)
             }
             BlockPartition::H3 => {
                 let Some(mid_bs) = h_partition_midsize(bs) else {
@@ -1121,10 +1171,36 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     )));
                 };
                 let qh4 = bh4 >> 2;
-                self.decode_sb(sub_bs, bx4, by4, false)?;
-                self.decode_sb(mid_bs, bx4, by4 + qh4, false)?;
-                self.decode_sb(mid_bs, bx4 + (bw4 >> 1), by4 + qh4, false)?;
-                self.decode_sb(sub_bs, bx4, by4 + 3 * qh4, child_chroma_offset)
+                let middle_chroma =
+                    bs == BlockSize::Bs8x32 && chroma.has_chroma && cfg.subsampling_x;
+                let (mid_cx, mid_cy, mid_cbs) = if middle_chroma {
+                    (
+                        bx4,
+                        by4 + qh4,
+                        partition_subsize(bs, BlockPartition::H).unwrap_or(bs),
+                    )
+                } else {
+                    (chroma_bx4, chroma_by4, chroma_bs)
+                };
+                let mid_offset = child_chroma_offset || middle_chroma;
+                let mid0 = ChromaBlockCtx {
+                    has_chroma: chroma.has_chroma && !child_chroma_offset && !middle_chroma,
+                    chroma_offset: mid_offset,
+                    bx4: mid_cx,
+                    by4: mid_cy,
+                    bs: mid_cbs,
+                };
+                let mid1 = ChromaBlockCtx {
+                    has_chroma: chroma.has_chroma && !child_chroma_offset,
+                    chroma_offset: mid_offset,
+                    bx4: mid_cx,
+                    by4: mid_cy,
+                    bs: mid_cbs,
+                };
+                self.decode_sb(sub_bs, bx4, by4, child_pre)?;
+                self.decode_sb(mid_bs, bx4, by4 + qh4, mid0)?;
+                self.decode_sb(mid_bs, bx4 + (bw4 >> 1), by4 + qh4, mid1)?;
+                self.decode_sb(sub_bs, bx4, by4 + 3 * qh4, child_last)
             }
             BlockPartition::V3 => {
                 let Some(mid_bs) = h_partition_midsize(bs) else {
@@ -1133,10 +1209,36 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     )));
                 };
                 let qw4 = bw4 >> 2;
-                self.decode_sb(sub_bs, bx4, by4, false)?;
-                self.decode_sb(mid_bs, bx4 + qw4, by4, false)?;
-                self.decode_sb(mid_bs, bx4 + qw4, by4 + (bh4 >> 1), false)?;
-                self.decode_sb(sub_bs, bx4 + 3 * qw4, by4, child_chroma_offset)
+                let middle_chroma =
+                    bs == BlockSize::Bs32x8 && chroma.has_chroma && cfg.subsampling_y;
+                let (mid_cx, mid_cy, mid_cbs) = if middle_chroma {
+                    (
+                        bx4 + qw4,
+                        by4,
+                        partition_subsize(bs, BlockPartition::V).unwrap_or(bs),
+                    )
+                } else {
+                    (chroma_bx4, chroma_by4, chroma_bs)
+                };
+                let mid_offset = child_chroma_offset || middle_chroma;
+                let mid0 = ChromaBlockCtx {
+                    has_chroma: chroma.has_chroma && !child_chroma_offset && !middle_chroma,
+                    chroma_offset: mid_offset,
+                    bx4: mid_cx,
+                    by4: mid_cy,
+                    bs: mid_cbs,
+                };
+                let mid1 = ChromaBlockCtx {
+                    has_chroma: chroma.has_chroma && !child_chroma_offset,
+                    chroma_offset: mid_offset,
+                    bx4: mid_cx,
+                    by4: mid_cy,
+                    bs: mid_cbs,
+                };
+                self.decode_sb(sub_bs, bx4, by4, child_pre)?;
+                self.decode_sb(mid_bs, bx4 + qw4, by4, mid0)?;
+                self.decode_sb(mid_bs, bx4 + qw4, by4 + (bh4 >> 1), mid1)?;
+                self.decode_sb(sub_bs, bx4 + 3 * qw4, by4, child_last)
             }
             BlockPartition::H4A => {
                 let Some((sub_bs, big_bs, med_bs)) = partition_4way_sizes(bs, bp) else {
@@ -1145,10 +1247,10 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     )));
                 };
                 let u = bh4 >> 3;
-                self.decode_sb(sub_bs, bx4, by4, false)?;
-                self.decode_sb(med_bs, bx4, by4 + u, false)?;
-                self.decode_sb(big_bs, bx4, by4 + 3 * u, false)?;
-                self.decode_sb(sub_bs, bx4, by4 + 7 * u, child_chroma_offset)
+                self.decode_sb(sub_bs, bx4, by4, child_pre)?;
+                self.decode_sb(med_bs, bx4, by4 + u, child_pre)?;
+                self.decode_sb(big_bs, bx4, by4 + 3 * u, child_pre)?;
+                self.decode_sb(sub_bs, bx4, by4 + 7 * u, child_last)
             }
             BlockPartition::H4B => {
                 let Some((sub_bs, big_bs, med_bs)) = partition_4way_sizes(bs, bp) else {
@@ -1157,10 +1259,10 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     )));
                 };
                 let u = bh4 >> 3;
-                self.decode_sb(sub_bs, bx4, by4, false)?;
-                self.decode_sb(big_bs, bx4, by4 + u, false)?;
-                self.decode_sb(med_bs, bx4, by4 + 5 * u, false)?;
-                self.decode_sb(sub_bs, bx4, by4 + 7 * u, child_chroma_offset)
+                self.decode_sb(sub_bs, bx4, by4, child_pre)?;
+                self.decode_sb(big_bs, bx4, by4 + u, child_pre)?;
+                self.decode_sb(med_bs, bx4, by4 + 5 * u, child_pre)?;
+                self.decode_sb(sub_bs, bx4, by4 + 7 * u, child_last)
             }
             BlockPartition::V4A => {
                 let Some((sub_bs, big_bs, med_bs)) = partition_4way_sizes(bs, bp) else {
@@ -1169,10 +1271,10 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     )));
                 };
                 let u = bw4 >> 3;
-                self.decode_sb(sub_bs, bx4, by4, false)?;
-                self.decode_sb(med_bs, bx4 + u, by4, false)?;
-                self.decode_sb(big_bs, bx4 + 3 * u, by4, false)?;
-                self.decode_sb(sub_bs, bx4 + 7 * u, by4, child_chroma_offset)
+                self.decode_sb(sub_bs, bx4, by4, child_pre)?;
+                self.decode_sb(med_bs, bx4 + u, by4, child_pre)?;
+                self.decode_sb(big_bs, bx4 + 3 * u, by4, child_pre)?;
+                self.decode_sb(sub_bs, bx4 + 7 * u, by4, child_last)
             }
             BlockPartition::V4B => {
                 let Some((sub_bs, big_bs, med_bs)) = partition_4way_sizes(bs, bp) else {
@@ -1181,10 +1283,10 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     )));
                 };
                 let u = bw4 >> 3;
-                self.decode_sb(sub_bs, bx4, by4, false)?;
-                self.decode_sb(big_bs, bx4 + u, by4, false)?;
-                self.decode_sb(med_bs, bx4 + 5 * u, by4, false)?;
-                self.decode_sb(sub_bs, bx4 + 7 * u, by4, child_chroma_offset)
+                self.decode_sb(sub_bs, bx4, by4, child_pre)?;
+                self.decode_sb(big_bs, bx4 + u, by4, child_pre)?;
+                self.decode_sb(med_bs, bx4 + 5 * u, by4, child_pre)?;
+                self.decode_sb(sub_bs, bx4 + 7 * u, by4, child_last)
             }
         }
     }
@@ -1257,18 +1359,30 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         Ok(())
     }
 
-    fn decode_leaf(&mut self, bs: BlockSize, bx4: usize, by4: usize) -> Result<()> {
+    fn decode_leaf(
+        &mut self,
+        bs: BlockSize,
+        bx4: usize,
+        by4: usize,
+        chroma: ChromaBlockCtx,
+    ) -> Result<()> {
         let b_dim = BLOCK_DIMENSIONS[bs as usize];
         let (bw4, bh4) = (b_dim[0] as usize, b_dim[1] as usize);
         let end = bx4 < self.tile_col_end4 && by4 < self.tile_row_end4;
-        self.decode_leaf_inner(bs, bx4, by4)?;
+        self.decode_leaf_inner(bs, bx4, by4, chroma)?;
         if end {
             self.note_refmv_bank(bw4, bh4, bx4, by4);
         }
         Ok(())
     }
 
-    fn decode_leaf_inner(&mut self, bs: BlockSize, bx4: usize, by4: usize) -> Result<()> {
+    fn decode_leaf_inner(
+        &mut self,
+        bs: BlockSize,
+        bx4: usize,
+        by4: usize,
+        chroma: ChromaBlockCtx,
+    ) -> Result<()> {
         if bx4 >= self.tile_col_end4 || by4 >= self.tile_row_end4 {
             return Ok(());
         }
@@ -1324,7 +1438,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             } else {
                 seg_id
             };
-            self.decode_intra_block(bs, bx4, by4, tx, seg_id)
+            self.decode_intra_block(bs, bx4, by4, tx, seg_id, chroma)
         } else {
             // `read_skip()`: `SEG_LVL_SKIP` forces `skip_flag` to 1 and codes
             // no symbol; otherwise the flag is decoded with the neighbour
@@ -1356,7 +1470,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 )?;
             }
             let forced_globalmv = seg_enabled && self.seg_syntax.globalmv_feature(self.fh, seg_id);
-            self.decode_inter_block(bs, bx4, by4, tx, seg_id, all_zero, forced_globalmv)
+            self.decode_inter_block(bs, bx4, by4, tx, seg_id, all_zero, forced_globalmv, chroma)
         }
     }
 
@@ -1436,6 +1550,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         uv_angle: i8,
         dpcm_y: Option<bool>,
         dpcm_uv: Option<bool>,
+        chroma: ChromaBlockCtx,
     ) -> Result<()> {
         let b_dim = BLOCK_DIMENSIONS[bs as usize];
         let bw4 = b_dim[0] as usize;
@@ -1447,22 +1562,28 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         let by4_in_sb = by4 & 31;
         let have_left = bx4 > self.tile_col_start4;
         let have_top = by4 > self.tile_row_start4;
-        let has_chroma = self.seq.layout != PixelLayout::I400;
+        let has_chroma = chroma.has_chroma && self.seq.layout != PixelLayout::I400;
+        let chroma_bs = if has_chroma { chroma.bs } else { bs };
+        let chroma_bx4 = if has_chroma { chroma.bx4 } else { bx4 };
+        let chroma_by4 = if has_chroma { chroma.by4 } else { by4 };
+        let chroma_bw4 = BLOCK_DIMENSIONS[chroma_bs as usize][0] as usize;
+        let chroma_bh4 = BLOCK_DIMENSIONS[chroma_bs as usize][1] as usize;
+        let chroma_a_idx = ((chroma_bx4 - self.tile_col_start4) >> 5).min(self.a_cols.len() - 1);
         let ss_x = self.seq.ss_hor;
         let ss_y = self.seq.ss_ver;
         let layout_col = (self.seq.layout as usize).saturating_sub(1);
         let uv_bs_idx = if has_chroma {
-            SS_BS[bs as usize][layout_col] as usize
+            SS_BS[chroma_bs as usize][layout_col] as usize
         } else {
             bs as usize
         };
         let uv_bs_dim = BLOCK_DIMENSIONS[uv_bs_idx];
         let cw = (uv_bs_dim[0] as usize) * 4;
         let ch = (uv_bs_dim[1] as usize) * 4;
-        let cpx_x = px_x >> ss_x;
-        let cpx_y = px_y >> ss_y;
-        let cbx4_in_sb = bx4_in_sb >> ss_x;
-        let cby4_in_sb = by4_in_sb >> ss_y;
+        let cpx_x = (chroma_bx4 * 4) >> ss_x;
+        let cpx_y = (chroma_by4 * 4) >> ss_y;
+        let cbx4_in_sb = (chroma_bx4 & 31) >> ss_x;
+        let cby4_in_sb = (chroma_by4 & 31) >> ss_y;
         let seg = seg_id.min((MAX_SEGMENTS - 1) as u8) as usize;
 
         let mut u_has_cf = false;
@@ -1571,7 +1692,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                         )
                     } else {
                         (
-                            &self.a_cols[a_idx].ccoef[plane - 1][cbx4_in_sb + x4..],
+                            &self.a_cols[chroma_a_idx].ccoef[plane - 1][cbx4_in_sb + x4..],
                             &self.l_ctx.ccoef[plane - 1][cby4_in_sb + y4..],
                         )
                     };
@@ -1654,14 +1775,14 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         if has_chroma {
             for i in 0..(uv_bs_dim[0] as usize)
                 .min(32 - cbx4_in_sb)
-                .min((self.frame_mi_w >> ss_x).saturating_sub(bx4 >> ss_x))
+                .min((self.frame_mi_w >> ss_x).saturating_sub(chroma_bx4 >> ss_x))
             {
-                self.a_cols[a_idx].uvmode[cbx4_in_sb + i] = uv_mode;
-                self.a_cols[a_idx].tx_chroma[cbx4_in_sb + i] = 0;
+                self.a_cols[chroma_a_idx].uvmode[cbx4_in_sb + i] = uv_mode;
+                self.a_cols[chroma_a_idx].tx_chroma[cbx4_in_sb + i] = 0;
             }
             for i in 0..(uv_bs_dim[1] as usize)
                 .min(32 - cby4_in_sb)
-                .min((self.frame_mi_h >> ss_y).saturating_sub(by4 >> ss_y))
+                .min((self.frame_mi_h >> ss_y).saturating_sub(chroma_by4 >> ss_y))
             {
                 self.l_ctx.uvmode[cby4_in_sb + i] = uv_mode;
                 self.l_ctx.tx_chroma[cby4_in_sb + i] = 0;
@@ -1696,10 +1817,10 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             }
         }
         if has_chroma {
-            let cbx4 = bx4 >> ss_x;
-            let cby4 = by4 >> ss_y;
-            let cbw4 = (bw4 >> ss_x).max(1);
-            let cbh4 = (bh4 >> ss_y).max(1);
+            let cbx4 = chroma_bx4 >> ss_x;
+            let cby4 = chroma_by4 >> ss_y;
+            let cbw4 = (chroma_bw4 >> ss_x).max(1);
+            let cbh4 = (chroma_bh4 >> ss_y).max(1);
             for dy4 in 0..cbh4 {
                 let cy4 = cby4 + dy4;
                 if cy4 >= self.grid.chroma_h {
@@ -1738,6 +1859,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         by4: usize,
         tx: usize,
         preskip_seg_id: u8,
+        chroma: ChromaBlockCtx,
     ) -> Result<()> {
         let b_dim = BLOCK_DIMENSIONS[bs as usize];
         let bw4 = b_dim[0] as usize;
@@ -1811,7 +1933,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             self.decode_cdef_idx(bx4, by4, bw4, bh4, false)?;
             self.decode_ccso_blk(bx4, by4)?;
             self.decode_delta_q_at(bs, bx4, by4, skip_txfm)?;
-            return self.decode_intrabc_block(bs, bx4, by4, seg_id, skip_txfm, allow_sct);
+            return self.decode_intrabc_block(bs, bx4, by4, seg_id, skip_txfm, allow_sct, chroma);
         }
 
         if seg_enabled && !self.seg_syntax.preskip {
@@ -1847,12 +1969,20 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             }
         }
 
-        let has_chroma = self.seq.layout != PixelLayout::I400;
+        let has_chroma = chroma.has_chroma && self.seq.layout != PixelLayout::I400;
+        let chroma_bs = if has_chroma { chroma.bs } else { bs };
+        let chroma_bx4 = if has_chroma { chroma.bx4 } else { bx4 };
+        let chroma_by4 = if has_chroma { chroma.by4 } else { by4 };
+        let chroma_bw4 = BLOCK_DIMENSIONS[chroma_bs as usize][0] as usize;
+        let chroma_bh4 = BLOCK_DIMENSIONS[chroma_bs as usize][1] as usize;
+        let chroma_a_idx = ((chroma_bx4 - self.tile_col_start4) >> 5).min(self.a_cols.len() - 1);
+        let chroma_have_left = chroma_bx4 > self.tile_col_start4;
+        let chroma_have_top = chroma_by4 > self.tile_row_start4;
         let ss_x = self.seq.ss_hor;
         let ss_y = self.seq.ss_ver;
         let layout_col = (self.seq.layout as usize).saturating_sub(1);
         let uv_bs_idx = if has_chroma {
-            SS_BS[bs as usize][layout_col] as usize
+            SS_BS[chroma_bs as usize][layout_col] as usize
         } else {
             bs as usize
         };
@@ -1860,14 +1990,18 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         let uv_tdim = &TXFM_DIMENSIONS[uvtx];
         let cw = uv_tdim.w as usize * 4;
         let ch = uv_tdim.h as usize * 4;
-        let cpx_x = px_x >> ss_x;
-        let cpx_y = px_y >> ss_y;
+        let cpx_x = (chroma_bx4 * 4) >> ss_x;
+        let cpx_y = (chroma_by4 * 4) >> ss_y;
+        let cbx4_in_sb = (chroma_bx4 & 31) >> ss_x;
+        let cby4_in_sb = (chroma_by4 & 31) >> ss_y;
 
+        // `is_cfl_allowed` (AV2 Spec v1.0.0 §5.20.5.6): max 32x32 luma area.
+        let cfl_allowed = self.seq.cfl && chroma_bw4 <= 8 && chroma_bh4 <= 8;
         let (uv_mode, uv_angle, dpcm_uv, cfl_alphas) = if has_chroma {
             let (um, ua, duv) = decode_intra_uv_mode(
                 &mut self.msac,
                 &mut self.cdf.m,
-                self.seq.cfl,
+                cfl_allowed,
                 seg_lossless,
                 midx,
             )?;
@@ -1975,6 +2109,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             }
             return self.decode_lossless_intra_block(
                 bs, bx4, by4, seg_id, y_mode, y_angle, midx, uv_mode, uv_angle, dpcm_y, dpcm_uv,
+                chroma,
             );
         }
 
@@ -2106,8 +2241,8 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 &mut self.msac,
                 &mut self.cdf.coef,
                 &mut self.cdf.m,
-                &self.a_cols[a_idx].ccoef[0][(bx4_in_sb >> ss_x)..],
-                &self.l_ctx.ccoef[0][(by4_in_sb >> ss_y)..],
+                &self.a_cols[chroma_a_idx].ccoef[0][cbx4_in_sb..],
+                &self.l_ctx.ccoef[0][cby4_in_sb..],
                 &u_params,
                 &mut self.dq_u,
             )?;
@@ -2125,8 +2260,8 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 &mut self.msac,
                 &mut self.cdf.coef,
                 &mut self.cdf.m,
-                &self.a_cols[a_idx].ccoef[1][(bx4_in_sb >> ss_x)..],
-                &self.l_ctx.ccoef[1][(by4_in_sb >> ss_y)..],
+                &self.a_cols[chroma_a_idx].ccoef[1][cbx4_in_sb..],
+                &self.l_ctx.ccoef[1][cby4_in_sb..],
                 &v_params,
                 &mut self.dq_v,
             )?;
@@ -2139,8 +2274,8 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 compute_cfl_ac_luma(
                     &self.rec.planes[0].data,
                     self.rec.planes[0].stride,
-                    px_x,
-                    px_y,
+                    chroma_bx4 * 4,
+                    chroma_by4 * 4,
                     cw,
                     ch,
                     ss_x,
@@ -2152,15 +2287,36 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 None
             };
             for pl_idx in 1..=2 {
-                let edge = self.edge_buffer(pl_idx, cpx_x, cpx_y, cw, ch, have_left, have_top, 0);
+                let edge = self.edge_buffer(
+                    pl_idx,
+                    cpx_x,
+                    cpx_y,
+                    cw,
+                    ch,
+                    chroma_have_left,
+                    chroma_have_top,
+                    0,
+                );
                 let dst = &mut self.rec.planes[pl_idx];
                 let off = dst.offset(cpx_x, cpx_y);
                 if let (Some((au, av)), Some(ac)) = (cfl_alphas, cfl_data) {
                     let mut dc_pred_buf = [BD::Pixel::default(); 64 * 64];
                     let dc_pred = &mut dc_pred_buf[..cw * ch];
                     predict_intra_block(
-                        self.bd, dc_pred, 0, cw, &edge, 256, 0, 0, cw, ch, have_left, have_top,
-                        pl_idx, 0,
+                        self.bd,
+                        dc_pred,
+                        0,
+                        cw,
+                        &edge,
+                        256,
+                        0,
+                        0,
+                        cw,
+                        ch,
+                        chroma_have_left,
+                        chroma_have_top,
+                        pl_idx,
+                        0,
                     );
                     predict_cfl_plane(
                         self.bd,
@@ -2182,11 +2338,11 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                         &edge,
                         256,
                         uv_mode,
-                        0,
+                        uv_angle,
                         cw,
                         ch,
-                        have_left,
-                        have_top,
+                        chroma_have_left,
+                        chroma_have_top,
                         pl_idx,
                         0,
                     );
@@ -2220,25 +2376,23 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     uvtx,
                 );
             }
-            let cbx4 = bx4_in_sb >> ss_x;
-            let cby4 = by4_in_sb >> ss_y;
             for i in 0..(uv_tdim.w as usize)
-                .min(32 - cbx4)
-                .min((self.frame_mi_w >> ss_x).saturating_sub(bx4 >> ss_x))
+                .min(32 - cbx4_in_sb)
+                .min((self.frame_mi_w >> ss_x).saturating_sub(chroma_bx4 >> ss_x))
             {
-                self.a_cols[a_idx].uvmode[cbx4 + i] = uv_mode;
-                self.a_cols[a_idx].tx_chroma[cbx4 + i] = uv_tdim.lw;
-                self.a_cols[a_idx].ccoef[0][cbx4 + i] = u_res_ctx;
-                self.a_cols[a_idx].ccoef[1][cbx4 + i] = v_res_ctx;
+                self.a_cols[chroma_a_idx].uvmode[cbx4_in_sb + i] = uv_mode;
+                self.a_cols[chroma_a_idx].tx_chroma[cbx4_in_sb + i] = uv_tdim.lw;
+                self.a_cols[chroma_a_idx].ccoef[0][cbx4_in_sb + i] = u_res_ctx;
+                self.a_cols[chroma_a_idx].ccoef[1][cbx4_in_sb + i] = v_res_ctx;
             }
             for i in 0..(uv_tdim.h as usize)
-                .min(32 - cby4)
-                .min((self.frame_mi_h >> ss_y).saturating_sub(by4 >> ss_y))
+                .min(32 - cby4_in_sb)
+                .min((self.frame_mi_h >> ss_y).saturating_sub(chroma_by4 >> ss_y))
             {
-                self.l_ctx.uvmode[cby4 + i] = uv_mode;
-                self.l_ctx.tx_chroma[cby4 + i] = uv_tdim.lh;
-                self.l_ctx.ccoef[0][cby4 + i] = u_res_ctx;
-                self.l_ctx.ccoef[1][cby4 + i] = v_res_ctx;
+                self.l_ctx.uvmode[cby4_in_sb + i] = uv_mode;
+                self.l_ctx.tx_chroma[cby4_in_sb + i] = uv_tdim.lh;
+                self.l_ctx.ccoef[0][cby4_in_sb + i] = u_res_ctx;
+                self.l_ctx.ccoef[1][cby4_in_sb + i] = v_res_ctx;
             }
         }
 
@@ -2325,10 +2479,10 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         if has_chroma {
             let uv_tx_w = uv_tdim.w * 4;
             let uv_tx_h = uv_tdim.h * 4;
-            let cbx4 = bx4 >> ss_x;
-            let cby4 = by4 >> ss_y;
-            let cbw4 = (bw4 >> ss_x).max(1);
-            let cbh4 = (bh4 >> ss_y).max(1);
+            let cbx4 = chroma_bx4 >> ss_x;
+            let cby4 = chroma_by4 >> ss_y;
+            let cbw4 = (chroma_bw4 >> ss_x).max(1);
+            let cbh4 = (chroma_bh4 >> ss_y).max(1);
             let uv_w4 = (uv_tdim.w as usize).max(1);
             let uv_h4 = (uv_tdim.h as usize).max(1);
             for dy4 in 0..cbh4 {
@@ -2362,6 +2516,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_inter_block(
         &mut self,
         bs: BlockSize,
@@ -2371,6 +2526,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         seg_id: u8,
         all_zero: bool,
         forced_globalmv: bool,
+        chroma: ChromaBlockCtx,
     ) -> Result<()> {
         let b_dim = BLOCK_DIMENSIONS[bs as usize];
         let bw4 = b_dim[0] as usize;
@@ -2409,12 +2565,20 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         self.decode_ccso_blk(bx4, by4)?;
         self.decode_delta_q_at(bs, bx4, by4, all_zero)?;
 
-        let has_chroma = self.seq.layout != PixelLayout::I400;
+        let has_chroma = chroma.has_chroma && self.seq.layout != PixelLayout::I400;
+        let chroma_bs = if has_chroma { chroma.bs } else { bs };
+        let chroma_bx4 = if has_chroma { chroma.bx4 } else { bx4 };
+        let chroma_by4 = if has_chroma { chroma.by4 } else { by4 };
+        let chroma_bw4 = BLOCK_DIMENSIONS[chroma_bs as usize][0] as usize;
+        let chroma_bh4 = BLOCK_DIMENSIONS[chroma_bs as usize][1] as usize;
+        let chroma_a_idx = ((chroma_bx4 - self.tile_col_start4) >> 5).min(self.a_cols.len() - 1);
         let ss_x = self.seq.ss_hor;
         let ss_y = self.seq.ss_ver;
+        let cbx4_in_sb = (chroma_bx4 & 31) >> ss_x;
+        let cby4_in_sb = (chroma_by4 & 31) >> ss_y;
         let layout_col = (self.seq.layout as usize).saturating_sub(1);
         let uv_bs_idx = if has_chroma {
-            SS_BS[bs as usize][layout_col] as usize
+            SS_BS[chroma_bs as usize][layout_col] as usize
         } else {
             bs as usize
         };
@@ -2431,12 +2595,12 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         // segment codes 4x4 transforms inside it, everything else a single
         // transform of the plane block size.
         let (cw, ch) = if seg_lossless {
-            ((bw4 >> ss_x).max(1) * 4, (bh4 >> ss_y).max(1) * 4)
+            ((chroma_bw4 >> ss_x).max(1) * 4, (chroma_bh4 >> ss_y).max(1) * 4)
         } else {
             (uv_tdim.w as usize * 4, uv_tdim.h as usize * 4)
         };
-        let cpx_x = px_x >> ss_x;
-        let cpx_y = px_y >> ss_y;
+        let cpx_x = (chroma_bx4 * 4) >> ss_x;
+        let cpx_y = (chroma_by4 * 4) >> ss_y;
 
         let is_comp = if forced_globalmv {
             false
@@ -3848,25 +4012,25 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                             &mut self.msac,
                             &mut self.cdf.coef,
                             &mut self.cdf.m,
-                            &self.a_cols[a_idx].ccoef[pl - 1][(bx4_in_sb >> ss_x) + ux4..],
-                            &self.l_ctx.ccoef[pl - 1][(by4_in_sb >> ss_y) + uy4..],
+                            &self.a_cols[chroma_a_idx].ccoef[pl - 1][cbx4_in_sb + ux4..],
+                            &self.l_ctx.ccoef[pl - 1][cby4_in_sb + uy4..],
                             &params,
                             dq_buf,
                         )?
                     };
                     last_ctx = res.res_ctx;
                     for i4 in 0..(td.w as usize)
-                        .min(32usize.saturating_sub((bx4_in_sb >> ss_x) + ux4))
-                        .min((self.frame_mi_w >> ss_x).saturating_sub((bx4 >> ss_x) + ux4))
+                        .min(32usize.saturating_sub(cbx4_in_sb + ux4))
+                        .min((self.frame_mi_w >> ss_x).saturating_sub((chroma_bx4 >> ss_x) + ux4))
                     {
-                        self.a_cols[a_idx].ccoef[pl - 1][(bx4_in_sb >> ss_x) + ux4 + i4] =
+                        self.a_cols[chroma_a_idx].ccoef[pl - 1][cbx4_in_sb + ux4 + i4] =
                             res.res_ctx;
                     }
                     for i4 in 0..(td.h as usize)
-                        .min(32usize.saturating_sub((by4_in_sb >> ss_y) + uy4))
-                        .min((self.frame_mi_h >> ss_y).saturating_sub((by4 >> ss_y) + uy4))
+                        .min(32usize.saturating_sub(cby4_in_sb + uy4))
+                        .min((self.frame_mi_h >> ss_y).saturating_sub((chroma_by4 >> ss_y) + uy4))
                     {
-                        self.l_ctx.ccoef[pl - 1][(by4_in_sb >> ss_y) + uy4 + i4] = res.res_ctx;
+                        self.l_ctx.ccoef[pl - 1][cby4_in_sb + uy4 + i4] = res.res_ctx;
                     }
                     if pl == 1 {
                         u_has_cf = res.eob >= 0;
@@ -3966,25 +4130,23 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             }
         }
         if has_chroma {
-            let cbx4 = bx4_in_sb >> ss_x;
-            let cby4 = by4_in_sb >> ss_y;
             let single_chroma_unit = !chroma_multi_tu;
             for i in 0..(uv_tdim.w as usize)
-                .min(32 - cbx4)
-                .min((self.frame_mi_w >> ss_x).saturating_sub(bx4 >> ss_x))
+                .min(32 - cbx4_in_sb)
+                .min((self.frame_mi_w >> ss_x).saturating_sub(chroma_bx4 >> ss_x))
             {
                 if single_chroma_unit {
-                    self.a_cols[a_idx].ccoef[0][cbx4 + i] = u_res_ctx;
-                    self.a_cols[a_idx].ccoef[1][cbx4 + i] = v_res_ctx;
+                    self.a_cols[chroma_a_idx].ccoef[0][cbx4_in_sb + i] = u_res_ctx;
+                    self.a_cols[chroma_a_idx].ccoef[1][cbx4_in_sb + i] = v_res_ctx;
                 }
             }
             for i in 0..(uv_tdim.h as usize)
-                .min(32 - cby4)
-                .min((self.frame_mi_h >> ss_y).saturating_sub(by4 >> ss_y))
+                .min(32 - cby4_in_sb)
+                .min((self.frame_mi_h >> ss_y).saturating_sub(chroma_by4 >> ss_y))
             {
                 if single_chroma_unit {
-                    self.l_ctx.ccoef[0][cby4 + i] = u_res_ctx;
-                    self.l_ctx.ccoef[1][cby4 + i] = v_res_ctx;
+                    self.l_ctx.ccoef[0][cby4_in_sb + i] = u_res_ctx;
+                    self.l_ctx.ccoef[1][cby4_in_sb + i] = v_res_ctx;
                 }
             }
         }
@@ -4023,10 +4185,10 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         if has_chroma {
             let uv_tx_w = uv_tdim.w * 4;
             let uv_tx_h = uv_tdim.h * 4;
-            let cbx4 = bx4 >> ss_x;
-            let cby4 = by4 >> ss_y;
-            let cbw4 = (bw4 >> ss_x).max(1);
-            let cbh4 = (bh4 >> ss_y).max(1);
+            let cbx4 = chroma_bx4 >> ss_x;
+            let cby4 = chroma_by4 >> ss_y;
+            let cbw4 = (chroma_bw4 >> ss_x).max(1);
+            let cbh4 = (chroma_bh4 >> ss_y).max(1);
             let uv_w4 = (uv_tdim.w as usize).max(1);
             let uv_h4 = (uv_tdim.h as usize).max(1);
             for dy4 in 0..cbh4 {
@@ -4547,6 +4709,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
 
     /// Decodes `read_intrabc_info()` and reconstructs the block
     /// (AV2 Spec v1.0.0 §5.20.5.4).
+    #[allow(clippy::too_many_arguments)]
     fn decode_intrabc_block(
         &mut self,
         bs: BlockSize,
@@ -4555,6 +4718,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
         seg_id: u8,
         skip_txfm: bool,
         allow_sct: bool,
+        chroma: ChromaBlockCtx,
     ) -> Result<()> {
         let b_dim = BLOCK_DIMENSIONS[bs as usize];
         let bw4 = b_dim[0] as usize;
@@ -4572,7 +4736,15 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             self.fh.quant.lossless[seg_id.min((MAX_SEGMENTS - 1) as u8) as usize] != 0;
         let ss_x = self.seq.ss_hor;
         let ss_y = self.seq.ss_ver;
-        let has_chroma = self.seq.layout != PixelLayout::I400;
+        let has_chroma = chroma.has_chroma && self.seq.layout != PixelLayout::I400;
+        let chroma_bs = if has_chroma { chroma.bs } else { bs };
+        let chroma_bx4 = if has_chroma { chroma.bx4 } else { bx4 };
+        let chroma_by4 = if has_chroma { chroma.by4 } else { by4 };
+        let chroma_bw4 = BLOCK_DIMENSIONS[chroma_bs as usize][0] as usize;
+        let chroma_bh4 = BLOCK_DIMENSIONS[chroma_bs as usize][1] as usize;
+        let chroma_a_idx = ((chroma_bx4 - self.tile_col_start4) >> 5).min(self.a_cols.len() - 1);
+        let cbx4_in_sb = (chroma_bx4 & 31) >> ss_x;
+        let cby4_in_sb = (chroma_by4 & 31) >> ss_y;
 
         let intrabc_mode = self.msac.decode_bool_adapt(&mut self.cdf.m.intrabc_mode)?;
         let max_m = self.fh.max_bvp_drl_bits.max(1) as usize;
@@ -4644,10 +4816,10 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             for pl in 1..=2 {
                 apply_intrabc_block_bounded(
                     &mut self.rec.planes[pl],
-                    px_x >> ss_x,
-                    px_y >> ss_y,
-                    w >> ss_x,
-                    h >> ss_y,
+                    (chroma_bx4 * 4) >> ss_x,
+                    (chroma_by4 * 4) >> ss_y,
+                    (chroma_bw4 * 4) >> ss_x,
+                    (chroma_bh4 * 4) >> ss_y,
                     dy_px >> ss_y,
                     dx_px >> ss_x,
                     x_limit >> ss_x,
@@ -4718,13 +4890,13 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             let _ = t_dim;
             if has_chroma {
                 let layout_col = (self.seq.layout as usize).saturating_sub(1);
-                let uv_bs_idx = SS_BS[bs as usize][layout_col] as usize;
+                let uv_bs_idx = SS_BS[chroma_bs as usize][layout_col] as usize;
                 let uvtx = MAX_TXFM_SIZE_FOR_BS[uv_bs_idx] as usize;
                 let uv_tdim = &TXFM_DIMENSIONS[uvtx];
                 let cw = uv_tdim.w as usize * 4;
                 let ch = uv_tdim.h as usize * 4;
-                let cpx_x = px_x >> ss_x;
-                let cpx_y = px_y >> ss_y;
+                let cpx_x = (chroma_bx4 * 4) >> ss_x;
+                let cpx_y = (chroma_by4 * 4) >> ss_y;
                 let mut u_params = CoefDecodeParams {
                     tx: uvtx,
                     bs: uv_bs_idx,
@@ -4749,8 +4921,8 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     &mut self.msac,
                     &mut self.cdf.coef,
                     &mut self.cdf.m,
-                    &self.a_cols[a_idx].ccoef[0][(bx4_in_sb >> ss_x)..],
-                    &self.l_ctx.ccoef[0][(by4_in_sb >> ss_y)..],
+                    &self.a_cols[chroma_a_idx].ccoef[0][cbx4_in_sb..],
+                    &self.l_ctx.ccoef[0][cby4_in_sb..],
                     &u_params,
                     &mut self.dq_u,
                 )?;
@@ -4762,8 +4934,8 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     &mut self.msac,
                     &mut self.cdf.coef,
                     &mut self.cdf.m,
-                    &self.a_cols[a_idx].ccoef[1][(bx4_in_sb >> ss_x)..],
-                    &self.l_ctx.ccoef[1][(by4_in_sb >> ss_y)..],
+                    &self.a_cols[chroma_a_idx].ccoef[1][cbx4_in_sb..],
+                    &self.l_ctx.ccoef[1][cby4_in_sb..],
                     &u_params,
                     &mut self.dq_v,
                 )?;
@@ -4837,25 +5009,23 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             // (`av2_reset_entropy_context`, §5.20.4.1 / `coeffs()` `x4/y4`,
             // §5.20.7.27). Writing them at luma indices desynchronised the
             // chroma `txb_skip` context of the block below the IntraBC block.
-            let cbx4 = bx4_in_sb >> ss_x;
-            let cby4 = by4_in_sb >> ss_y;
-            for i in 0..(bw4 >> ss_x)
-                .min(32 - cbx4)
-                .min((self.frame_mi_w >> ss_x).saturating_sub(bx4 >> ss_x))
+            for i in 0..(chroma_bw4 >> ss_x)
+                .min(32 - cbx4_in_sb)
+                .min((self.frame_mi_w >> ss_x).saturating_sub(chroma_bx4 >> ss_x))
             {
-                let a = &mut self.a_cols[a_idx];
-                a.ccoef[0][cbx4 + i] = u_res_ctx;
-                a.ccoef[1][cbx4 + i] = v_res_ctx;
-                a.uvmode[cbx4 + i] = 0;
+                let a = &mut self.a_cols[chroma_a_idx];
+                a.ccoef[0][cbx4_in_sb + i] = u_res_ctx;
+                a.ccoef[1][cbx4_in_sb + i] = v_res_ctx;
+                a.uvmode[cbx4_in_sb + i] = 0;
             }
-            for i in 0..(bh4 >> ss_y)
-                .min(32 - cby4)
-                .min((self.frame_mi_h >> ss_y).saturating_sub(by4 >> ss_y))
+            for i in 0..(chroma_bh4 >> ss_y)
+                .min(32 - cby4_in_sb)
+                .min((self.frame_mi_h >> ss_y).saturating_sub(chroma_by4 >> ss_y))
             {
                 let l = &mut self.l_ctx;
-                l.ccoef[0][cby4 + i] = u_res_ctx;
-                l.ccoef[1][cby4 + i] = v_res_ctx;
-                l.uvmode[cby4 + i] = 0;
+                l.ccoef[0][cby4_in_sb + i] = u_res_ctx;
+                l.ccoef[1][cby4_in_sb + i] = v_res_ctx;
+                l.uvmode[cby4_in_sb + i] = 0;
             }
         }
         self.store_palette_block(bx4, by4, bw4, bh4, None);
