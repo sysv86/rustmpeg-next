@@ -244,20 +244,64 @@ fn read_tile_info(
     let min_log2_tiles = tile_log2(max_tile_area_sb, sbw * sbh).max(min_log2_cols);
 
     t.uniform = br.get_bit()? != 0;
-    if !t.uniform {
-        return Err(Av2Error::Unsupported("non-uniform tile layout".to_string()));
+    if t.uniform {
+        let mut log2_cols = min_log2_cols;
+        while log2_cols < max_log2_cols && br.get_bit()? != 0 {
+            log2_cols += 1;
+        }
+        let min_log2_rows = (min_log2_tiles - log2_cols).max(0);
+        let mut log2_rows = min_log2_rows;
+        while log2_rows < max_log2_rows && br.get_bit()? != 0 {
+            log2_rows += 1;
+        }
+        t.log2_cols = log2_cols as u8;
+        t.log2_rows = log2_rows as u8;
+    } else {
+        // Non-uniform tile spacing (AV2 Spec v1.0.0 §5.18.7.3).
+        let mut widest_tile_sb = 1i32;
+        let mut start_sb = 0i32;
+        let mut cols = 0usize;
+        while start_sb < sbw {
+            if cols >= MAX_TILE_COLS {
+                return Err(Av2Error::BitstreamError(
+                    "non-uniform tile column count exceeds MAX_TILE_COLS".to_string(),
+                ));
+            }
+            t.col_start_sb[cols] = start_sb as u16;
+            let n = (sbw - start_sb).min(max_tile_width_sb).max(1) as u32;
+            let size_sb = br.get_uniform(n)? as i32 + 1;
+            widest_tile_sb = widest_tile_sb.max(size_sb);
+            start_sb += size_sb;
+            cols += 1;
+        }
+        t.col_start_sb[cols] = sbw as u16;
+        t.cols = cols as u8;
+        t.log2_cols = tile_log2(1, cols as i32) as u8;
+
+        let max_area_sb = if min_log2_tiles > 0 {
+            (sbh * sbw) >> (min_log2_tiles + 1)
+        } else {
+            sbh * sbw
+        };
+        let max_tile_height_sb = (max_area_sb / widest_tile_sb.max(1)).max(1);
+        let mut start_sb = 0i32;
+        let mut rows = 0usize;
+        while start_sb < sbh {
+            if rows >= MAX_TILE_ROWS {
+                return Err(Av2Error::BitstreamError(
+                    "non-uniform tile row count exceeds MAX_TILE_ROWS".to_string(),
+                ));
+            }
+            t.row_start_sb[rows] = start_sb as u16;
+            let max_h = (sbh - start_sb).min(max_tile_height_sb).max(1) as u32;
+            let size_sb = br.get_uniform(max_h)? as i32 + 1;
+            start_sb += size_sb;
+            rows += 1;
+        }
+        t.row_start_sb[rows] = sbh as u16;
+        t.rows = rows as u8;
+        t.log2_rows = tile_log2(1, rows as i32) as u8;
     }
-    let mut log2_cols = min_log2_cols;
-    while log2_cols < max_log2_cols && br.get_bit()? != 0 {
-        log2_cols += 1;
-    }
-    let min_log2_rows = (min_log2_tiles - log2_cols).max(0);
-    let mut log2_rows = min_log2_rows;
-    while log2_rows < max_log2_rows && br.get_bit()? != 0 {
-        log2_rows += 1;
-    }
-    t.log2_cols = log2_cols as u8;
-    t.log2_rows = log2_rows as u8;
     Ok(())
 }
 
@@ -270,18 +314,20 @@ fn finish_tile_grid(
     level: u8,
     tier: u8,
 ) {
-    init_uniform_tile_info(
-        t,
-        1,
-        sb128,
-        seq_sb128,
-        width,
-        height,
-        level,
-        tier,
-        t.log2_cols,
-        t.log2_rows,
-    );
+    if t.uniform {
+        init_uniform_tile_info(
+            t,
+            1,
+            sb128,
+            seq_sb128,
+            width,
+            height,
+            level,
+            tier,
+            t.log2_cols,
+            t.log2_rows,
+        );
+    }
 }
 
 /// Parses a `sequence_header_obu()` payload.
@@ -634,27 +680,61 @@ pub fn parse_tile_group<'a>(
 /// `ref_info[slot]` is used to derive `DerivedPrimaryRefFrame` when the frame
 /// header does not signal a primary reference (AV2 Spec v1.0.0 §5.18.1 and
 /// §7.8). The segmentation syntax depends on that derived value.
-pub fn parse_tile_group_with_refs<'a>(
+/// Parsed slice of tiles from one `tile_group_obu()` (AV2 Spec v1.0.0 §5.19).
+pub struct ParsedTileGroupSlice<'a> {
+    /// Frame header parsed from this OBU, when `frame_header_present_flag == 1`.
+    pub fh: Option<FrameHeader>,
+    /// Inclusive starting tile index (`tg_start`).
+    pub tg_start: usize,
+    /// Inclusive ending tile index (`tg_end`).
+    pub tg_end: usize,
+    /// Tile payloads for `tg_start..=tg_end`.
+    pub tiles: Vec<&'a [u8]>,
+}
+
+/// Parses one `tile_group_obu()` (first or continuation, full or partial) using
+/// `existing_fh` when `is_first_tile_group == 0` and no redundant frame header
+/// is carried (AV2 Spec v1.0.0 §5.19).
+pub fn parse_tile_group_slice<'a>(
     seq: &SequenceHeader,
     obu: &Obu<'a>,
     ref_info: &[RefFrameInfo; 16],
-) -> Result<(FrameHeader, Vec<&'a [u8]>)> {
+    existing_fh: Option<&FrameHeader>,
+) -> Result<ParsedTileGroupSlice<'a>> {
     let mut br = BitReader::new(obu.payload);
     let is_first = br.get_bit()?;
-    if is_first == 0 {
-        return Err(Av2Error::Unsupported(
-            "tile groups that are not the first group of a frame".to_string(),
-        ));
-    }
-    let mut fh = parse_frame_header(seq, &mut br, obu.obu_type, ref_info)?;
-    fh.tlayer_id = obu.tlayer_id;
-    let n_tiles = (fh.tiling.t.cols.max(1) as usize) * (fh.tiling.t.rows.max(1) as usize);
-    if n_tiles > 1 {
-        let flag = br.get_bit()?;
-        if flag != 0 {
-            return Err(Av2Error::Unsupported("partial tile groups".to_string()));
+    let fh_present = if is_first != 0 {
+        true
+    } else {
+        br.get_bit()? != 0
+    };
+    let parsed_fh = if fh_present {
+        let mut fh = parse_frame_header(seq, &mut br, obu.obu_type, ref_info)?;
+        fh.tlayer_id = obu.tlayer_id;
+        Some(fh)
+    } else {
+        None
+    };
+    let fh_ref = parsed_fh.as_ref().or(existing_fh).ok_or_else(|| {
+        Av2Error::BitstreamError(
+            "continuation tile group without a preceding frame header".to_string(),
+        )
+    })?;
+    let n_tiles = (fh_ref.tiling.t.cols.max(1) as usize) * (fh_ref.tiling.t.rows.max(1) as usize);
+    let tile_start_and_end_present = if n_tiles > 1 { br.get_bit()? != 0 } else { false };
+    let (tg_start, tg_end) = if n_tiles == 1 || !tile_start_and_end_present {
+        (0usize, n_tiles - 1)
+    } else {
+        let tile_bits = (fh_ref.tiling.t.log2_cols as u32) + (fh_ref.tiling.t.log2_rows as u32);
+        let s = br.get_bits(tile_bits)? as usize;
+        let e = br.get_bits(tile_bits)? as usize;
+        if s > e || e >= n_tiles {
+            return Err(Av2Error::BitstreamError(format!(
+                "tile group range {s}..={e} out of bounds for {n_tiles} tiles"
+            )));
         }
-    }
+        (s, e)
+    };
     br.byte_align();
     let mut pos = br.bit_pos() / 8;
     let payload = obu.payload;
@@ -663,10 +743,11 @@ pub fn parse_tile_group_with_refs<'a>(
             "tile group header exceeds the payload".to_string(),
         ));
     }
-    let n_bytes = fh.tiling.n_bytes.max(1) as usize;
-    let mut tiles = Vec::with_capacity(n_tiles);
-    for idx in 0..n_tiles {
-        if idx + 1 < n_tiles {
+    let n_bytes = fh_ref.tiling.n_bytes.max(1) as usize;
+    let count = tg_end - tg_start + 1;
+    let mut tiles = Vec::with_capacity(count);
+    for idx in 0..count {
+        if idx + 1 < count {
             if pos + n_bytes > payload.len() {
                 return Err(Av2Error::BitstreamError(
                     "truncated tile size field".to_string(),
@@ -689,7 +770,33 @@ pub fn parse_tile_group_with_refs<'a>(
             tiles.push(&payload[pos..]);
         }
     }
-    Ok((fh, tiles))
+    Ok(ParsedTileGroupSlice {
+        fh: parsed_fh,
+        tg_start,
+        tg_end,
+        tiles,
+    })
+}
+
+pub fn parse_tile_group_with_refs<'a>(
+    seq: &SequenceHeader,
+    obu: &Obu<'a>,
+    ref_info: &[RefFrameInfo; 16],
+) -> Result<(FrameHeader, Vec<&'a [u8]>)> {
+    let slice = parse_tile_group_slice(seq, obu, ref_info, None)?;
+    let fh = slice.fh.ok_or_else(|| {
+        Av2Error::BitstreamError("tile group did not contain a frame header".to_string())
+    })?;
+    let n_tiles = (fh.tiling.t.cols.max(1) as usize) * (fh.tiling.t.rows.max(1) as usize);
+    if slice.tg_start != 0 || slice.tg_end + 1 != n_tiles {
+        return Err(Av2Error::BitstreamError(format!(
+            "partial tile group {}..={} passed to single-group parser (expected 0..={})",
+            slice.tg_start,
+            slice.tg_end,
+            n_tiles - 1
+        )));
+    }
+    Ok((fh, slice.tiles))
 }
 
 /// Derives `DerivedPrimaryRefFrame` when the frame header does not signal one.
@@ -1018,19 +1125,32 @@ pub fn parse_frame_header(
         }
     }
 
-    // Frame size
+    // Frame size (`frame_size_with_refs()`, AV2 Spec v1.0.0 §5.18.2)
     if fh.frame_size_override != 0 {
+        let mut found_ref = false;
         if fh.is_inter_or_switch() {
-            for _ in 0..fh.n_ref_frames as usize {
+            for i in 0..fh.n_ref_frames as usize {
                 if br.get_bit()? != 0 {
-                    return Err(Av2Error::Unsupported(
-                        "reference-derived frame size".to_string(),
-                    ));
+                    let slot = (fh.refidx[i] as usize).min(NUM_REF_FRAMES - 1);
+                    if !ref_info[slot].present
+                        || ref_info[slot].width <= 0
+                        || ref_info[slot].height <= 0
+                    {
+                        return Err(Av2Error::BitstreamError(format!(
+                            "reference-derived frame size references empty slot {slot}"
+                        )));
+                    }
+                    fh.width = ref_info[slot].width;
+                    fh.height = ref_info[slot].height;
+                    found_ref = true;
+                    break;
                 }
             }
         }
-        fh.width = br.get_bits(seq.width_n_bits as u32)? as i32 + 1;
-        fh.height = br.get_bits(seq.height_n_bits as u32)? as i32 + 1;
+        if !found_ref {
+            fh.width = br.get_bits(seq.width_n_bits as u32)? as i32 + 1;
+            fh.height = br.get_bits(seq.height_n_bits as u32)? as i32 + 1;
+        }
     } else {
         fh.width = seq.max_width;
         fh.height = seq.max_height;
@@ -1081,27 +1201,25 @@ pub fn parse_frame_header(
                 fh.allow_local_intrabc = br.get_bit()? as u8;
             }
         }
-        if seq.allow_max_bvp_drl_bits {
-            let change = br.get_bit()?;
-            if change != 0 {
-                return Err(Av2Error::Unsupported(
-                    "frame-level BVP DRL bit count change".to_string(),
-                ));
-            }
-        }
         fh.max_bvp_drl_bits = seq.def_max_bvp_drl_bits;
+        if seq.allow_max_bvp_drl_bits && br.get_bit()? != 0 {
+            let mut v = br.get_uniform(2)? as u8 + 1;
+            if v >= seq.def_max_bvp_drl_bits {
+                v += 1;
+            }
+            fh.max_bvp_drl_bits = v;
+        }
     }
 
     if fh.is_inter_or_switch() {
-        if seq.allow_frame_max_drl_bits {
-            let change = br.get_bit()?;
-            if change != 0 {
-                return Err(Av2Error::Unsupported(
-                    "frame-level DRL bit count change".to_string(),
-                ));
-            }
-        }
         fh.max_drl_bits = seq.def_max_drl_bits;
+        if seq.allow_frame_max_drl_bits && br.get_bit()? != 0 {
+            let mut v = br.get_uniform(4)? as u8 + 1;
+            if v >= seq.def_max_drl_bits {
+                v += 1;
+            }
+            fh.max_drl_bits = v;
+        }
         if !force_int_mv {
             if br.get_bit()? != 0 {
                 fh.mv_precision = 2;
@@ -1162,11 +1280,27 @@ pub fn parse_frame_header(
         );
     } else if seq.tiling.present == AdaptiveBoolean::Adaptive {
         if br.get_bit()? == 0 {
-            return Err(Av2Error::Unsupported(
-                "explicit frame tile layout".to_string(),
-            ));
+            read_tile_info(
+                br,
+                &mut fh.tiling.t,
+                fh.sb128,
+                fh.width,
+                fh.height,
+                seq.level,
+                seq.tier,
+            )?;
+            finish_tile_grid(
+                &mut fh.tiling.t,
+                fh.sb128,
+                seq.sb128,
+                fh.width,
+                fh.height,
+                seq.level,
+                seq.tier,
+            );
+        } else {
+            fh.tiling.t = seq.tiling.t.clone();
         }
-        fh.tiling.t = seq.tiling.t.clone();
     } else {
         fh.tiling.t = seq.tiling.t.clone();
     }
@@ -1673,7 +1807,30 @@ pub fn parse_frame_header(
                                 fh.ccso.planes[p].refidx = br.get_bits(n_bits)? as u8;
                             }
                             if fh.ccso.planes[p].reuse != 0 {
-                                return Err(Av2Error::Unsupported("CCSO reuse".to_string()));
+                                let ridx = fh.ccso.planes[p].refidx as usize;
+                                let slot = fh
+                                    .refidx
+                                    .get(ridx)
+                                    .copied()
+                                    .filter(|&s| s >= 0 && (s as usize) < NUM_REF_FRAMES)
+                                    .ok_or_else(|| {
+                                        Av2Error::BitstreamError(format!(
+                                            "CCSO reuse reference index {ridx} out of range"
+                                        ))
+                                    })? as usize;
+                                if !ref_info[slot].present {
+                                    return Err(Av2Error::BitstreamError(format!(
+                                        "CCSO reuse references empty slot {slot}"
+                                    )));
+                                }
+                                let src_plane = ref_info[slot].ccso_planes[p];
+                                let sb_reuse = fh.ccso.planes[p].sb_reuse;
+                                let refidx = fh.ccso.planes[p].refidx;
+                                fh.ccso.planes[p] = src_plane;
+                                fh.ccso.planes[p].enabled = 1;
+                                fh.ccso.planes[p].reuse = 1;
+                                fh.ccso.planes[p].sb_reuse = sb_reuse;
+                                fh.ccso.planes[p].refidx = refidx;
                             }
                         }
                     }

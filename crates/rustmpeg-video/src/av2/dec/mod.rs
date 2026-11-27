@@ -83,18 +83,54 @@ pub(crate) fn decode_group<'a>(
     obus: &[Obu<'a>],
     ref_info: &[RefFrameInfo; 16],
 ) -> Result<Option<DecodedTileGroup<'a>>> {
-    let mut out = None;
+    let mut frame_fh: Option<FrameHeader> = None;
+    let mut tile_slots: Vec<Option<&'a [u8]>> = Vec::new();
     for obu in obus {
         if matches!(
             obu.obu_type,
             ObuType::ClosedLoopKf | ObuType::OpenLoopKf | ObuType::TileGrp
         ) {
-            let (fh, tiles) = hls::parse_tile_group_with_refs(seq, obu, ref_info)?;
-            let n_cols = fh.tiling.t.cols.max(1) as usize;
-            out = Some(DecodedTileGroup { fh, tiles, n_cols });
+            let slice = hls::parse_tile_group_slice(seq, obu, ref_info, frame_fh.as_ref())?;
+            if frame_fh.is_none() {
+                let fh = slice.fh.ok_or_else(|| {
+                    Av2Error::BitstreamError(
+                        "first tile group in temporal unit lacked a frame header".to_string(),
+                    )
+                })?;
+                let n_tiles =
+                    (fh.tiling.t.cols.max(1) as usize) * (fh.tiling.t.rows.max(1) as usize);
+                tile_slots = vec![None; n_tiles];
+                frame_fh = Some(fh);
+            }
+            for (offset, payload) in slice.tiles.into_iter().enumerate() {
+                let idx = slice.tg_start + offset;
+                if idx >= tile_slots.len() {
+                    return Err(Av2Error::BitstreamError(format!(
+                        "tile index {idx} exceeds frame tile count {}",
+                        tile_slots.len()
+                    )));
+                }
+                tile_slots[idx] = Some(payload);
+            }
+            if tile_slots.iter().all(Option::is_some) {
+                break;
+            }
         }
     }
-    Ok(out)
+    let Some(fh) = frame_fh else {
+        return Ok(None);
+    };
+    let tiles: Vec<&'a [u8]> = tile_slots
+        .into_iter()
+        .enumerate()
+        .map(|(idx, slot)| {
+            slot.ok_or_else(|| {
+                Av2Error::BitstreamError(format!("missing tile {idx} in multi-tile-group frame"))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let n_cols = fh.tiling.t.cols.max(1) as usize;
+    Ok(Some(DecodedTileGroup { fh, tiles, n_cols }))
 }
 
 /// One decoded frame with its timing and coding metadata.
