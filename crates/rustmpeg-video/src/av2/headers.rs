@@ -654,6 +654,9 @@ pub struct FhQuantQm {
     pub y: [u8; 4],
     pub u: [u8; 4],
     pub v: [u8; 4],
+    /// Derived `SegQMLevel[segmentId][plane]` (AV2 Spec v1.0.0 §5.18.1).
+    /// Values `0..=14` select a normative QM level; `15` selects a flat matrix.
+    pub seg_qm_level: [[u8; 3]; MAX_SEGMENTS],
 }
 
 #[derive(Debug, Clone, Copy, Default)]

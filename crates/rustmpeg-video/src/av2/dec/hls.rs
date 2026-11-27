@@ -1235,14 +1235,16 @@ pub fn parse_frame_header(
         fh.segmentation.last_active_segid = fh.segmentation.d.last_active_segid() as i8;
     }
 
-    // setup_qm_params()
+    // setup_qm_params() (AV2 Spec v1.0.0 §5.18.6.2)
     fh.quant.qm.enabled = br.get_bit()? as u8;
+    fh.quant.qm.seg_qm_level = [[15; 3]; MAX_SEGMENTS];
     if fh.quant.qm.enabled != 0 {
         let qm_num = if fh.segmentation.enabled != 0 {
             let num = br.get_bits(2)? as u8 + 1;
             fh.quant.qm.num = num;
             num as usize
         } else {
+            fh.quant.qm.num = 1;
             1usize
         };
         for i in 0..qm_num {
@@ -1264,7 +1266,6 @@ pub fn parse_frame_header(
                 fh.quant.qm.v[i] = fh.quant.qm.y[i];
             }
         }
-        return Err(Av2Error::Unsupported("quantization matrices".to_string()));
     }
 
     // delta_q_params()
@@ -1314,6 +1315,31 @@ pub fn parse_frame_header(
         fh.segmentation.lossless[i] = lossless as u8;
         has_lossless_segment |= lossless;
         coded_lossless &= lossless;
+
+        // `SegQMLevel` assignment (AV2 Spec v1.0.0 §5.18.1).
+        if fh.quant.qm.enabled != 0 {
+            if lossless {
+                fh.quant.qm.seg_qm_level[i] = [15, 15, 15];
+            } else {
+                let qm_num = fh.quant.qm.num.max(1) as usize;
+                let qm_idx = if qm_num > 1 {
+                    let bits = tile_log2(1, qm_num as i32) as usize;
+                    br.get_bits(bits)? as usize
+                } else {
+                    0
+                };
+                if qm_idx >= qm_num {
+                    return Err(Av2Error::BitstreamError(format!(
+                        "qm_index {qm_idx} out of range for qmNum {qm_num}"
+                    )));
+                }
+                fh.quant.qm.seg_qm_level[i] = [
+                    fh.quant.qm.y[qm_idx],
+                    fh.quant.qm.u[qm_idx],
+                    fh.quant.qm.v[qm_idx],
+                ];
+            }
+        }
     }
     for i in n_seg..MAX_SEGMENTS {
         fh.quant.lossless[i] = 0;

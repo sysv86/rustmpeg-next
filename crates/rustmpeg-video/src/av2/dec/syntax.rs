@@ -710,7 +710,7 @@ pub fn decode_delta_qindex(
 
 /// Parameters for decoding one transform block's coefficients.
 #[derive(Debug, Clone, Copy)]
-pub struct CoefDecodeParams {
+pub struct CoefDecodeParams<'a> {
     /// Rectangular transform size index.
     pub tx: usize,
     /// Block size index for the skip/level contexts.
@@ -747,6 +747,9 @@ pub struct CoefDecodeParams {
     pub ss_ver: bool,
     /// Whether chroma transforms are restricted to DCT.
     pub chroma_dctonly: bool,
+    /// Optional normative quantization matrix weights in column-major order
+    /// (`AV2 Spec v1.0.0 §7.15.1`); `None` uses flat weight 32.
+    pub qm: Option<&'a [u8]>,
 }
 
 /// Result of decoding one transform block.
@@ -766,7 +769,7 @@ pub struct CoefDecodeResult {
 fn derive_txtp(
     msac: &mut MsacDecoder<'_>,
     cdf_m: &mut CdfModeContext,
-    p: &CoefDecodeParams,
+    p: &CoefDecodeParams<'_>,
     t_dim: &crate::av2::tables::TxfmInfo,
     eob: i32,
 ) -> Result<u16> {
@@ -938,7 +941,7 @@ pub fn decode_coefs(
     cdf_m: &mut CdfModeContext,
     a: &[u8],
     l: &[u8],
-    p: &CoefDecodeParams,
+    p: &CoefDecodeParams<'_>,
     dq_out: &mut [i32],
 ) -> Result<CoefDecodeResult> {
     let t_dim = &TXFM_DIMENSIONS[p.tx];
@@ -1076,7 +1079,7 @@ pub fn decode_coefs(
             level as i32
         };
         dq_out[0] = dequantize_coef(
-            signed, 0, 0, p.dq_tbl, None, t_dim.ctx, p.bitdepth, p.lossless,
+            signed, 0, 0, p.dq_tbl, p.qm, t_dim.ctx, p.bitdepth, p.lossless,
         ) * dq_scale;
         let res_ctx = (level.min(63) as u8) | (dc_sign_level as u8);
         return Ok(CoefDecodeResult {
@@ -1214,7 +1217,7 @@ pub fn decode_coefs(
         cul_level += level;
         let signed = if sign { -(level as i32) } else { level as i32 };
         dq_out[rc] = dequantize_coef(
-            signed, i, rc, p.dq_tbl, None, t_dim.ctx, p.bitdepth, p.lossless,
+            signed, i, rc, p.dq_tbl, p.qm, t_dim.ctx, p.bitdepth, p.lossless,
         ) * dq_scale;
     }
 
@@ -1238,7 +1241,7 @@ pub fn decode_coefs(
         cul_level += level;
         let signed = if sign { -(level as i32) } else { level as i32 };
         dq_out[0] = dequantize_coef(
-            signed, 0, 0, p.dq_tbl, None, t_dim.ctx, p.bitdepth, p.lossless,
+            signed, 0, 0, p.dq_tbl, p.qm, t_dim.ctx, p.bitdepth, p.lossless,
         ) * dq_scale;
     } else {
         dc_sign_level = 1 << 6;
@@ -1308,6 +1311,7 @@ mod tests {
             ss_hor: true,
             ss_ver: true,
             chroma_dctonly: false,
+            qm: None,
         };
         let a_enc = [0x40u8; 64];
         let l_enc = [0x2Eu8; 64];

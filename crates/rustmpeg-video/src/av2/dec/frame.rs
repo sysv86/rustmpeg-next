@@ -64,14 +64,15 @@ use crate::av2::partition::{
     init_allowed_partitions, partition_4way_sizes, partition_implied, partition_subsize,
 };
 use crate::av2::pixel::BitDepth;
-use crate::av2::quantizer::dq_lookup;
+use crate::av2::quantizer::{QmTables, dq_lookup};
 use crate::av2::restoration::{apply_ns_wiener_plane, apply_pc_wiener_units};
 use crate::av2::screen::{
     IbcBufferState, MAX_PALETTE_COLORS, apply_intrabc_block_bounded, lower_mv_precision_to_integer,
 };
 use crate::av2::segment::SegmentMap;
 use crate::av2::tables::{
-    BLOCK_DIMENSIONS, MAX_TXFM_SIZE_FOR_BS, SS_BS, TX_PART_GROUP, TXFM_DIMENSIONS,
+    BLOCK_DIMENSIONS, MAX_TXFM_SIZE_FOR_BS, N_RECT_TX_SIZES, SS_BS, TX_PART_GROUP,
+    TXFM_DIMENSIONS,
 };
 use crate::av2::transform::inv_txfm_add;
 use crate::av2::warp::{
@@ -200,6 +201,23 @@ pub fn decode_frame<BD: BitDepth>(
     );
     let mut dq = [[[0u32; 2]; 3]; MAX_SEGMENTS];
     init_segment_quant_tables(fh, fh.quant.yac as i32, bd.bitdepth(), &mut dq);
+
+    let mut qm_tables: [Option<QmTables>; 15] = std::array::from_fn(|_| None);
+    if fh.quant.qm.enabled != 0 {
+        let n_seg = if fh.segmentation.enabled != 0 {
+            MAX_SEGMENTS
+        } else {
+            1
+        };
+        for seg_lvls in &fh.quant.qm.seg_qm_level[..n_seg] {
+            for &lvl in seg_lvls {
+                let idx = lvl as usize;
+                if idx < 15 && qm_tables[idx].is_none() {
+                    qm_tables[idx] = Some(QmTables::for_level(idx));
+                }
+            }
+        }
+    }
 
     let mut ref_frames: [Option<&Frame<BD::Pixel>>; 7] = [None; 7];
     let mut refdist = [0i32; 7];
@@ -408,6 +426,7 @@ pub fn decode_frame<BD: BitDepth>(
             scratch_chroma_diff_mask: vec![0u8; 128 * 128],
             skip_seg_frame,
             dq,
+            qm_tables: &qm_tables,
             seg_map: &mut seg_map,
             seg_prev: prev_segmap,
             seg_syntax,
@@ -676,6 +695,7 @@ struct TileDecoder<'a, BD: BitDepth> {
     scratch_diff_mask: Vec<u8>,
     scratch_chroma_diff_mask: Vec<u8>,
     dq: [[[u32; 2]; 3]; MAX_SEGMENTS],
+    qm_tables: &'a [Option<QmTables>; 15],
     seg_map: &'a mut SegmentMap,
     seg_prev: Option<&'a SegmentMap>,
     seg_syntax: SegSyntax,
@@ -748,7 +768,27 @@ struct TileDecoder<'a, BD: BitDepth> {
     tu_coded: [Vec<bool>; 3],
 }
 
-impl<BD: BitDepth> TileDecoder<'_, BD> {
+impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
+    /// Returns the normative quantization matrix slice for `(seg_id, plane, tx)`
+    /// when `using_qmatrix == 1` and the segment is not lossless
+    /// (AV2 Spec v1.0.0 §7.15.1).
+    #[inline]
+    fn qm_slice(&self, seg_id: u8, plane: usize, tx: usize, lossless: bool) -> Option<&'a [u8]> {
+        if lossless || self.fh.quant.qm.enabled == 0 {
+            return None;
+        }
+        let seg = seg_id.min((MAX_SEGMENTS - 1) as u8) as usize;
+        let pl = plane.min(2);
+        let lvl = self.fh.quant.qm.seg_qm_level[seg][pl] as usize;
+        if lvl >= 15 {
+            return None;
+        }
+        let plane_type = usize::from(pl > 0);
+        self.qm_tables[lvl]
+            .as_ref()
+            .map(|t| t.qm[plane_type][tx.min(N_RECT_TX_SIZES - 1)].as_slice())
+    }
+
     fn read_wedge_idx(&mut self) -> Result<u8> {
         let quad = self.msac.decode_symbol_adapt(self.cdf.m.wedge_quad(), 3)?;
         let angle_sub = self
@@ -1684,6 +1724,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                         ss_hor: ss_x != 0,
                         ss_ver: ss_y != 0,
                         chroma_dctonly: self.seq.chroma_dctonly,
+                        qm: None,
                     };
                     let (a_slice, l_slice) = if is_luma {
                         (
@@ -2133,6 +2174,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
             ss_hor: ss_x != 0,
             ss_ver: ss_y != 0,
             chroma_dctonly: self.seq.chroma_dctonly,
+            qm: self.qm_slice(seg_id, 0, tx, seg_lossless),
         };
         let y_res = decode_coefs(
             &mut self.msac,
@@ -2236,6 +2278,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 ss_hor: ss_x != 0,
                 ss_ver: ss_y != 0,
                 chroma_dctonly: self.seq.chroma_dctonly,
+                qm: self.qm_slice(seg_id, 1, uvtx, seg_lossless),
             };
             let u_res = decode_coefs(
                 &mut self.msac,
@@ -2254,6 +2297,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 u_has_cf: (eob_u >= 0) as i32,
                 plane: 2,
                 dq_tbl: self.dq[seg_id.min((MAX_SEGMENTS - 1) as u8) as usize][2],
+                qm: self.qm_slice(seg_id, 2, uvtx, seg_lossless),
                 ..u_params
             };
             let v_res = decode_coefs(
@@ -3880,6 +3924,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 ss_hor: ss_x != 0,
                 ss_ver: ss_y != 0,
                 chroma_dctonly: self.seq.chroma_dctonly,
+                qm: self.qm_slice(seg_id, 0, tx_u, seg_lossless),
             };
             let res = decode_coefs(
                 &mut self.msac,
@@ -4001,6 +4046,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                         ss_hor: ss_x != 0,
                         ss_ver: ss_y != 0,
                         chroma_dctonly: self.seq.chroma_dctonly,
+                        qm: self.qm_slice(seg_id, pl, tx_u, seg_lossless),
                     };
                     let res = {
                         let dq_buf = if pl == 1 {
@@ -4862,6 +4908,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 ss_hor: ss_x != 0,
                 ss_ver: ss_y != 0,
                 chroma_dctonly: self.seq.chroma_dctonly,
+                qm: self.qm_slice(seg_id, 0, tx, seg_lossless),
             };
             let y_res = decode_coefs(
                 &mut self.msac,
@@ -4916,6 +4963,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                     ss_hor: ss_x != 0,
                     ss_ver: ss_y != 0,
                     chroma_dctonly: self.seq.chroma_dctonly,
+                    qm: self.qm_slice(seg_id, 1, uvtx, seg_lossless),
                 };
                 let u_res = decode_coefs(
                     &mut self.msac,
@@ -4930,6 +4978,7 @@ impl<BD: BitDepth> TileDecoder<'_, BD> {
                 u_params.u_has_cf = (u_res.eob >= 0) as i32;
                 u_params.plane = 2;
                 u_params.dq_tbl = self.dq[seg_id.min((MAX_SEGMENTS - 1) as u8) as usize][2];
+                u_params.qm = self.qm_slice(seg_id, 2, uvtx, seg_lossless);
                 let v_res = decode_coefs(
                     &mut self.msac,
                     &mut self.cdf.coef,
