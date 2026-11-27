@@ -292,6 +292,17 @@ pub fn decode_frame<BD: BitDepth>(
             skip_seg_frame = i;
         }
     }
+    // `SkipModeFrame[0..2]` (AV2 Spec v1.0.0 §5.18.8.2).
+    let skip_mode_frames: [usize; 2] = if fh.is_inter_or_switch() && fh.n_ref_frames > 1 {
+        let r1 = if (absrefdist[0] - absrefdist[1]).abs() <= 1 {
+            1usize
+        } else {
+            0usize
+        };
+        [0usize, r1]
+    } else {
+        [0usize, 0usize]
+    };
 
     // Current-frame segment map. With `segmentation_update_map == 0` the map
     // is loaded from the primary reference (`load_previous_segment_ids`,
@@ -425,6 +436,8 @@ pub fn decode_frame<BD: BitDepth>(
             scratch_diff_mask: vec![0u8; 128 * 128],
             scratch_chroma_diff_mask: vec![0u8; 128 * 128],
             skip_seg_frame,
+            skip_mode_frames,
+            skip_mode_map: vec![false; f_bw4 * f_bh4],
             dq,
             qm_tables: &qm_tables,
             seg_map: &mut seg_map,
@@ -644,9 +657,8 @@ fn validate_tools(seq: &SequenceHeader, fh: &FrameHeader) -> Result<()> {
     {
         return unsupported("multi-class frame-level Wiener NS filters");
     }
-    if fh.skip_mode_enabled != 0 {
-        return unsupported("skip mode");
-    }
+    // Skip mode (`skip_mode_params` / `read_skip_mode`, §5.18.8.2 / §5.20.5.9)
+    // is supported.
     if fh.bawp != 0 {
         return unsupported("block-adaptive weighted prediction");
     }
@@ -689,6 +701,8 @@ struct TileDecoder<'a, BD: BitDepth> {
     refdir: [i8; 7],
     furthest_future_refidx: i8,
     skip_seg_frame: usize,
+    skip_mode_frames: [usize; 2],
+    skip_mode_map: Vec<bool>,
     scratch_mc0: Vec<i32>,
     scratch_mc1: Vec<i32>,
     scratch_diff_mask: Vec<u8>,
@@ -1445,8 +1459,40 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
         }
 
         let forced_globalmv = seg_enabled && self.seg_syntax.globalmv_feature(self.fh, seg_id);
+        let seg_skip_pre = seg_enabled && self.seg_syntax.skip_feature(self.fh, seg_id);
+        // `read_skip_mode()` (AV2 Spec v1.0.0 §5.20.5.9).
+        let skip_mode = if inter_frame
+            && self.fh.skip_mode_enabled != 0
+            && !seg_skip_pre
+            && !forced_globalmv
+            && bw4.min(bh4) >= 2
+            && self.fh.n_ref_frames >= 1
+        {
+            let top_sm = have_top && self.skip_mode_map[(by4 - 1) * self.frame_mi_w + bx4];
+            let left_sm = have_left && self.skip_mode_map[by4 * self.frame_mi_w + bx4 - 1];
+            let sm_ctx = (top_sm as usize + left_sm as usize).min(2);
+            self.msac
+                .decode_bool_adapt(&mut self.cdf.m.skip_mode[sm_ctx])?
+                != 0
+        } else {
+            false
+        };
+        for dy in 0..bh4 {
+            let r = by4 + dy;
+            if r >= self.frame_mi_h {
+                break;
+            }
+            for dx in 0..bw4 {
+                let c = bx4 + dx;
+                if c >= self.frame_mi_w {
+                    break;
+                }
+                self.skip_mode_map[r * self.frame_mi_w + c] = skip_mode;
+            }
+        }
+
         let is_intra = if inter_frame {
-            if forced_globalmv {
+            if skip_mode || forced_globalmv {
                 false
             } else {
                 let a_idx = ((bx4 - self.tile_col_start4) >> 5).min(self.a_cols.len() - 1);
@@ -1479,11 +1525,10 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             };
             self.decode_intra_block(bs, bx4, by4, tx, seg_id, chroma)
         } else {
-            // `read_skip()`: `SEG_LVL_SKIP` forces `skip_flag` to 1 and codes
-            // no symbol; otherwise the flag is decoded with the neighbour
-            // context (§5.20.5.10).
+            // `read_skip()`: `skip_mode` or `SEG_LVL_SKIP` forces `skip_flag`
+            // to 1 and codes no symbol (§5.20.5.10).
             let seg_skip = seg_enabled && self.seg_syntax.skip_feature(self.fh, seg_id);
-            let all_zero = if seg_skip {
+            let all_zero = if skip_mode || seg_skip {
                 true
             } else {
                 let a_idx = ((bx4 - self.tile_col_start4) >> 5).min(self.a_cols.len() - 1);
@@ -1509,7 +1554,17 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
                 )?;
             }
             let forced_globalmv = seg_enabled && self.seg_syntax.globalmv_feature(self.fh, seg_id);
-            self.decode_inter_block(bs, bx4, by4, tx, seg_id, all_zero, forced_globalmv, chroma)
+            self.decode_inter_block(
+                bs,
+                bx4,
+                by4,
+                tx,
+                seg_id,
+                all_zero,
+                forced_globalmv,
+                skip_mode,
+                chroma,
+            )
         }
     }
 
@@ -2116,15 +2171,8 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             }
         }
 
-        // Transform partition. Intra transform partitions (per-transform-block
-        // intra prediction) are not implemented; the syntax is still parsed so
-        // the rejection is precise.
+        // Transform partition (AV2 Spec v1.0.0 §5.20.6.3 / §7.14.2).
         let (intra_tx_part, _) = self.decode_tx_partition(bs, 0, 0, false, seg_lossless)?;
-        if intra_tx_part != TxPartition::TxNone {
-            return Err(Av2Error::Unsupported(
-                "intra transform partitioning".to_string(),
-            ));
-        }
 
         if seg_lossless {
             if palette.is_some() {
@@ -2148,138 +2196,189 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             );
         }
 
-        // Luma coefficients.
-        let y_params = CoefDecodeParams {
-            tx,
-            bs: bs as usize,
-            plane: 0,
-            intra: true,
-            fsc: false,
-            lossless: seg_lossless,
-            uv_mode: uv_mode as usize,
-            y_mode: y_mode as usize,
-            y_angle,
-            mrl_index: mrl_idx,
-            y_txtp: 0,
-            reduced_txtp_set: self.fh.reduced_txtp_set as i32,
-            u_has_cf: 0,
-            dq_tbl: self.dq[seg_id.min((MAX_SEGMENTS - 1) as u8) as usize][0],
-            bitdepth: self.bd.bitdepth(),
-            ss_hor: ss_x != 0,
-            ss_ver: ss_y != 0,
-            chroma_dctonly: self.seq.chroma_dctonly,
-            qm: self.qm_slice(seg_id, 0, tx, seg_lossless),
-        };
-        let y_res = decode_coefs(
-            &mut self.msac,
-            &mut self.cdf.coef,
-            &mut self.cdf.m,
-            &self.a_cols[a_idx].lcoef[bx4_in_sb..],
-            &self.l_ctx.lcoef[by4_in_sb..],
-            &y_params,
-            &mut self.dq_y,
-        )?;
-
-        // Luma prediction and reconstruction.
-        let y_txtp = y_res.txtp;
-        if let Some(pal) = &palette {
-            // Palette prediction: `rec[r][c] = palette_colors_y[ColorMapY[r][c]]`
-            // for the on-screen part of the block (§5.20.8.4).
-            let onscreen_w = w.min((self.frame_mi_w * 4).saturating_sub(px_x));
-            let onscreen_h = h.min((self.frame_mi_h * 4).saturating_sub(px_y));
-            let pl = &mut self.rec.planes[0];
-            for r in 0..onscreen_h {
-                let dst_row = (px_y + r) * pl.stride + px_x;
-                for c in 0..onscreen_w {
-                    let idx = pal.map[r * w + c] as usize;
-                    pl.data[dst_row + c] = self.bd.clip_pixel(pal.colors[idx.min(pal.size - 1)]);
+        // Luma prediction, coefficient decoding, and reconstruction.
+        // When `intra_tx_part != TxNone`, each sub-transform unit is predicted
+        // sequentially from previously reconstructed sub-TUs (§7.14.2).
+        let mut intra_luma_tus: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+        match intra_tx_part {
+            TxPartition::TxNone => intra_luma_tus.push((tx, px_x, px_y, w, h)),
+            _ => {
+                let base = crate::av2::levels::RectTxfmSize::from_usize(tx)
+                    .unwrap_or(crate::av2::levels::RectTxfmSize::Tx4x4);
+                for u in crate::av2::txpart::expand_tx_partition(base, intra_tx_part).0 {
+                    intra_luma_tus.push((
+                        u.tx as usize,
+                        px_x + u.x_px,
+                        px_y + u.y_px,
+                        u.w_px,
+                        u.h_px,
+                    ));
                 }
             }
-        } else if let Some((dip, transpose)) = dip_mode {
-            let edge = self.edge_buffer(0, px_x, px_y, w, h, have_left, have_top, 0);
-            if transpose {
-                // Transposed DIP (AV2 Spec v1.0.0 §7.13.2.5): swap above/left
-                // edge samples, predict HxW, then transpose back into WxH.
-                let mut t_edge = [BD::Pixel::default(); 512];
-                t_edge[256] = edge[256];
-                let max_span = (w + h).min(255);
-                for i in 1..=max_span {
-                    t_edge[256 + i] = edge[256 - i];
-                    t_edge[256 - i] = edge[256 + i];
-                }
-                let mut tmp = vec![BD::Pixel::default(); w * h];
-                predict_filter_intra_block(
-                    self.bd,
-                    &mut tmp,
-                    0,
-                    h,
-                    &t_edge,
-                    256,
-                    filter_intra_mode(dip),
-                    h,
-                    w,
-                );
+        }
+        let multi_intra_tu = intra_luma_tus.len() > 1;
+        let mut y_res = crate::av2::dec::syntax::CoefDecodeResult {
+            eob: -1,
+            txtp: 0,
+            res_ctx: 0x40,
+        };
+        let mut y_txtp = 0u16;
+        for (tu_idx, &(tx_u, x_u, y_u, w_u, h_u)) in intra_luma_tus.iter().enumerate() {
+            let ux4 = (x_u - px_x) / 4;
+            let uy4 = (y_u - px_y) / 4;
+            let td_u = &TXFM_DIMENSIONS[tx_u];
+            let hl_u = have_left || x_u > px_x;
+            let ht_u = have_top || y_u > px_y;
+
+            let y_params = CoefDecodeParams {
+                tx: tx_u,
+                bs: bs as usize,
+                plane: 0,
+                intra: true,
+                fsc: false,
+                lossless: seg_lossless,
+                uv_mode: uv_mode as usize,
+                y_mode: y_mode as usize,
+                y_angle,
+                mrl_index: mrl_idx,
+                y_txtp: 0,
+                reduced_txtp_set: self.fh.reduced_txtp_set as i32,
+                u_has_cf: 0,
+                dq_tbl: self.dq[seg_id.min((MAX_SEGMENTS - 1) as u8) as usize][0],
+                bitdepth: self.bd.bitdepth(),
+                ss_hor: ss_x != 0,
+                ss_ver: ss_y != 0,
+                chroma_dctonly: self.seq.chroma_dctonly,
+                qm: self.qm_slice(seg_id, 0, tx_u, seg_lossless),
+            };
+            let res_u = decode_coefs(
+                &mut self.msac,
+                &mut self.cdf.coef,
+                &mut self.cdf.m,
+                &self.a_cols[a_idx].lcoef[bx4_in_sb + ux4..],
+                &self.l_ctx.lcoef[by4_in_sb + uy4..],
+                &y_params,
+                &mut self.dq_y,
+            )?;
+            if tu_idx == 0 {
+                y_txtp = res_u.txtp;
+            }
+            y_res = res_u;
+
+            if let Some(pal) = &palette {
+                let onscreen_w = w_u.min((self.frame_mi_w * 4).saturating_sub(x_u));
+                let onscreen_h = h_u.min((self.frame_mi_h * 4).saturating_sub(y_u));
                 let pl = &mut self.rec.planes[0];
-                let off = pl.offset(px_x, px_y);
-                for r in 0..h {
-                    for c in 0..w {
-                        pl.data[off + r * pl.stride + c] = tmp[c * h + r];
+                for r in 0..onscreen_h {
+                    let dst_row = (y_u + r) * pl.stride + x_u;
+                    let map_row = (y_u - px_y + r) * w + (x_u - px_x);
+                    for c in 0..onscreen_w {
+                        let idx = pal.map[map_row + c] as usize;
+                        pl.data[dst_row + c] =
+                            self.bd.clip_pixel(pal.colors[idx.min(pal.size - 1)]);
                     }
                 }
+            } else if let Some((dip, transpose)) = dip_mode {
+                let edge = self.edge_buffer(0, x_u, y_u, w_u, h_u, hl_u, ht_u, 0);
+                if transpose {
+                    let mut t_edge = [BD::Pixel::default(); 512];
+                    t_edge[256] = edge[256];
+                    let max_span = (w_u + h_u).min(255);
+                    for i in 1..=max_span {
+                        t_edge[256 + i] = edge[256 - i];
+                        t_edge[256 - i] = edge[256 + i];
+                    }
+                    let mut tmp = vec![BD::Pixel::default(); w_u * h_u];
+                    predict_filter_intra_block(
+                        self.bd,
+                        &mut tmp,
+                        0,
+                        h_u,
+                        &t_edge,
+                        256,
+                        filter_intra_mode(dip),
+                        h_u,
+                        w_u,
+                    );
+                    let pl = &mut self.rec.planes[0];
+                    let off = pl.offset(x_u, y_u);
+                    for r in 0..h_u {
+                        for c in 0..w_u {
+                            pl.data[off + r * pl.stride + c] = tmp[c * h_u + r];
+                        }
+                    }
+                } else {
+                    let pl = &mut self.rec.planes[0];
+                    let off = pl.offset(x_u, y_u);
+                    predict_filter_intra_block(
+                        self.bd,
+                        &mut pl.data,
+                        off,
+                        pl.stride,
+                        &edge,
+                        256,
+                        filter_intra_mode(dip),
+                        w_u,
+                        h_u,
+                    );
+                }
             } else {
+                let edge = self.edge_buffer(0, x_u, y_u, w_u, h_u, hl_u, ht_u, mrl_idx);
                 let pl = &mut self.rec.planes[0];
-                let off = pl.offset(px_x, px_y);
-                predict_filter_intra_block(
+                let off = pl.offset(x_u, y_u);
+                predict_intra_block(
                     self.bd,
                     &mut pl.data,
                     off,
                     pl.stride,
                     &edge,
                     256,
-                    filter_intra_mode(dip),
-                    w,
-                    h,
+                    y_mode,
+                    y_angle,
+                    w_u,
+                    h_u,
+                    hl_u,
+                    ht_u,
+                    0,
+                    mrl_idx,
                 );
             }
-        } else {
-            let edge = self.edge_buffer(0, px_x, px_y, w, h, have_left, have_top, mrl_idx);
-            let pl = &mut self.rec.planes[0];
-            let off = pl.offset(px_x, px_y);
-            predict_intra_block(
-                self.bd,
-                &mut pl.data,
-                off,
-                pl.stride,
-                &edge,
-                256,
-                y_mode,
-                y_angle,
-                w,
-                h,
-                have_left,
-                have_top,
-                0,
-                mrl_idx,
-            );
-        }
-        if y_res.eob >= 0 {
-            for y in 0..t_dim.h as usize {
-                for x in 0..t_dim.w as usize {
-                    self.grid.set_lr_noskip(bx4 + x, by4 + y, true);
+
+            if res_u.eob >= 0 {
+                for y in 0..td_u.h as usize {
+                    for x in 0..td_u.w as usize {
+                        self.grid.set_lr_noskip(bx4 + ux4 + x, by4 + uy4 + y, true);
+                    }
+                }
+                let pl = &mut self.rec.planes[0];
+                let off = pl.offset(x_u, y_u);
+                inv_txfm_add(
+                    self.bd,
+                    &mut pl.data,
+                    off,
+                    pl.stride,
+                    &mut self.dq_y,
+                    res_u.txtp as u32,
+                    res_u.eob,
+                    tx_u,
+                );
+            }
+            if multi_intra_tu {
+                for i4 in 0..(td_u.w as usize)
+                    .min(32usize.saturating_sub(bx4_in_sb + ux4))
+                    .min(self.frame_mi_w.saturating_sub(bx4 + ux4))
+                {
+                    self.a_cols[a_idx].lcoef[bx4_in_sb + ux4 + i4] = res_u.res_ctx;
+                    self.a_cols[a_idx].txtp[bx4_in_sb + ux4 + i4] = res_u.txtp;
+                }
+                for i4 in 0..(td_u.h as usize)
+                    .min(32usize.saturating_sub(by4_in_sb + uy4))
+                    .min(self.frame_mi_h.saturating_sub(by4 + uy4))
+                {
+                    self.l_ctx.lcoef[by4_in_sb + uy4 + i4] = res_u.res_ctx;
+                    self.l_ctx.txtp[by4_in_sb + uy4 + i4] = res_u.txtp;
                 }
             }
-            let pl = &mut self.rec.planes[0];
-            let off = pl.offset(px_x, px_y);
-            inv_txfm_add(
-                self.bd,
-                &mut pl.data,
-                off,
-                pl.stride,
-                &mut self.dq_y,
-                y_txtp as u32,
-                y_res.eob,
-                tx,
-            );
         }
 
         // Chroma coefficients and reconstruction.
@@ -2484,12 +2583,14 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             self.a_cols[a_idx].filter[0][bx4_in_sb + i] = 3;
             self.a_cols[a_idx].filter[1][bx4_in_sb + i] = 3;
         }
-        for i in 0..bw4
-            .min(32 - bx4_in_sb)
-            .min(self.frame_mi_w.saturating_sub(bx4))
-        {
-            self.a_cols[a_idx].lcoef[bx4_in_sb + i] = y_res.res_ctx;
-            self.a_cols[a_idx].txtp[bx4_in_sb + i] = y_txtp;
+        if !multi_intra_tu {
+            for i in 0..bw4
+                .min(32 - bx4_in_sb)
+                .min(self.frame_mi_w.saturating_sub(bx4))
+            {
+                self.a_cols[a_idx].lcoef[bx4_in_sb + i] = y_res.res_ctx;
+                self.a_cols[a_idx].txtp[bx4_in_sb + i] = y_txtp;
+            }
         }
         for i in 0..bh4
             .min(32 - by4_in_sb)
@@ -2506,12 +2607,14 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             self.l_ctx.filter[0][by4_in_sb + i] = 3;
             self.l_ctx.filter[1][by4_in_sb + i] = 3;
         }
-        for i in 0..bh4
-            .min(32 - by4_in_sb)
-            .min(self.frame_mi_h.saturating_sub(by4))
-        {
-            self.l_ctx.lcoef[by4_in_sb + i] = y_res.res_ctx;
-            self.l_ctx.txtp[by4_in_sb + i] = y_txtp;
+        if !multi_intra_tu {
+            for i in 0..bh4
+                .min(32 - by4_in_sb)
+                .min(self.frame_mi_h.saturating_sub(by4))
+            {
+                self.l_ctx.lcoef[by4_in_sb + i] = y_res.res_ctx;
+                self.l_ctx.txtp[by4_in_sb + i] = y_txtp;
+            }
         }
 
         // Record deblocking block info for luma
@@ -2595,6 +2698,7 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
         seg_id: u8,
         all_zero: bool,
         forced_globalmv: bool,
+        skip_mode: bool,
         chroma: ChromaBlockCtx,
     ) -> Result<()> {
         let b_dim = BLOCK_DIMENSIONS[bs as usize];
@@ -2671,7 +2775,9 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
         let cpx_x = (chroma_bx4 * 4) >> ss_x;
         let cpx_y = (chroma_by4 * 4) >> ss_y;
 
-        let is_comp = if forced_globalmv {
+        let is_comp = if skip_mode {
+            self.skip_mode_frames[0] != self.skip_mode_frames[1]
+        } else if forced_globalmv {
             false
         } else if self.fh.switchable_comp_refs != 0 && (bw4 * bh4 >= 4) {
             let ctx = nb.comp_ctx(&self.refdir);
@@ -2686,7 +2792,216 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
         let mut block_motion_mode = 0u8;
         let mut block_warp_params = DEFAULT_WARP_PARAMS;
         let mut cwp_map = 8u8;
-        if !is_comp {
+        if skip_mode {
+            // Skip mode (`read_skip_mode` + `skip_drl_mode`, §5.20.5.9 / §5.20.7.1).
+            let max_drl = self.fh.max_drl_bits.max(1) as usize;
+            let mut drl_idx = 0usize;
+            while drl_idx < max_drl && drl_idx < 3 {
+                if self
+                    .msac
+                    .decode_bool_adapt(&mut self.cdf.m.skip_drl_mode[drl_idx])?
+                    == 0
+                {
+                    break;
+                }
+                drl_idx += 1;
+            }
+            let sr0 = self.skip_mode_frames[0];
+            let sr1 = self.skip_mode_frames[1];
+            if sr0 == sr1 {
+                let cands = self.mv_stack(bx4, by4, bw4, bh4, [sr0 as i8, -1]);
+                let mv = cands.get(drl_idx).map(|c| c.mv0).unwrap_or_default();
+                let ref_frame = self.ref_frames[sr0].ok_or_else(|| {
+                    Av2Error::BitstreamError(
+                        "skip_mode single-ref references a missing frame".to_string(),
+                    )
+                })?;
+                let mv_y_q16 = mv.y as i32 * 2;
+                let mv_x_q16 = mv.x as i32 * 2;
+                {
+                    let rp = &ref_frame.planes[0];
+                    let dp = &mut self.rec.planes[0];
+                    let off = dp.offset(px_x, px_y);
+                    let stride = dp.stride;
+                    mc_predict_block(
+                        self.bd,
+                        &mut dp.data,
+                        off,
+                        stride,
+                        &rp.data,
+                        rp.stride,
+                        rp.coded_width as i32,
+                        rp.coded_height as i32,
+                        px_x as i32,
+                        px_y as i32,
+                        w,
+                        h,
+                        mv_y_q16,
+                        mv_x_q16,
+                        0,
+                    );
+                }
+                if has_chroma {
+                    for pl_idx in 1..=2 {
+                        let rp = &ref_frame.planes[pl_idx];
+                        let dp = &mut self.rec.planes[pl_idx];
+                        let off = dp.offset(cpx_x, cpx_y);
+                        let stride = dp.stride;
+                        mc_predict_block(
+                            self.bd,
+                            &mut dp.data,
+                            off,
+                            stride,
+                            &rp.data,
+                            rp.stride,
+                            rp.coded_width as i32,
+                            rp.coded_height as i32,
+                            cpx_x as i32,
+                            cpx_y as i32,
+                            cw,
+                            ch,
+                            mv_y_q16 >> ss_y,
+                            mv_x_q16 >> ss_x,
+                            0,
+                        );
+                    }
+                }
+                r0_idx = sr0 as i8;
+                r1_idx = -1;
+                comp_type_idx = 0;
+                saved_mode = 12 + InterPredMode::NearMv as u8;
+                mv0 = mv;
+                mv1 = MvXY::default();
+                filter = 0;
+            } else {
+                let cands = self.mv_stack(bx4, by4, bw4, bh4, [sr0 as i8, sr1 as i8]);
+                let (cmv0, cmv1) = cands
+                    .get(drl_idx)
+                    .map(|c| (c.mv0, c.mv1))
+                    .unwrap_or_default();
+                let r0 = self.ref_frames[sr0].ok_or_else(|| {
+                    Av2Error::BitstreamError(
+                        "skip_mode compound ref0 references a missing frame".to_string(),
+                    )
+                })?;
+                let r1 = self.ref_frames[sr1].ok_or_else(|| {
+                    Av2Error::BitstreamError(
+                        "skip_mode compound ref1 references a missing frame".to_string(),
+                    )
+                })?;
+                let l_area = w * h;
+                {
+                    let rp0 = &r0.planes[0];
+                    let rp1 = &r1.planes[0];
+                    let dp = &mut self.rec.planes[0];
+                    let off = dp.offset(px_x, px_y);
+                    let stride = dp.stride;
+                    mc_predict_block_prep(
+                        self.bd,
+                        &mut self.scratch_mc0[..l_area],
+                        &rp0.data,
+                        rp0.stride,
+                        rp0.coded_width as i32,
+                        rp0.coded_height as i32,
+                        px_x as i32,
+                        px_y as i32,
+                        w,
+                        h,
+                        cmv0.y as i32 * 2,
+                        cmv0.x as i32 * 2,
+                        0,
+                    );
+                    mc_predict_block_prep(
+                        self.bd,
+                        &mut self.scratch_mc1[..l_area],
+                        &rp1.data,
+                        rp1.stride,
+                        rp1.coded_width as i32,
+                        rp1.coded_height as i32,
+                        px_x as i32,
+                        px_y as i32,
+                        w,
+                        h,
+                        cmv1.y as i32 * 2,
+                        cmv1.x as i32 * 2,
+                        0,
+                    );
+                    blend_compound_prep(
+                        self.bd,
+                        &mut dp.data,
+                        off,
+                        stride,
+                        &self.scratch_mc0[..l_area],
+                        &self.scratch_mc1[..l_area],
+                        w,
+                        h,
+                        CompInterType::Average,
+                        0,
+                        None,
+                    );
+                }
+                if has_chroma {
+                    let c_area = cw * ch;
+                    for pl in 1..=2 {
+                        let rp0 = &r0.planes[pl];
+                        let rp1 = &r1.planes[pl];
+                        let dp = &mut self.rec.planes[pl];
+                        let off = dp.offset(cpx_x, cpx_y);
+                        let stride = dp.stride;
+                        mc_predict_block_prep(
+                            self.bd,
+                            &mut self.scratch_mc0[..c_area],
+                            &rp0.data,
+                            rp0.stride,
+                            rp0.coded_width as i32,
+                            rp0.coded_height as i32,
+                            cpx_x as i32,
+                            cpx_y as i32,
+                            cw,
+                            ch,
+                            (cmv0.y as i32 * 2) >> ss_y,
+                            (cmv0.x as i32 * 2) >> ss_x,
+                            0,
+                        );
+                        mc_predict_block_prep(
+                            self.bd,
+                            &mut self.scratch_mc1[..c_area],
+                            &rp1.data,
+                            rp1.stride,
+                            rp1.coded_width as i32,
+                            rp1.coded_height as i32,
+                            cpx_x as i32,
+                            cpx_y as i32,
+                            cw,
+                            ch,
+                            (cmv1.y as i32 * 2) >> ss_y,
+                            (cmv1.x as i32 * 2) >> ss_x,
+                            0,
+                        );
+                        blend_compound_prep(
+                            self.bd,
+                            &mut dp.data,
+                            off,
+                            stride,
+                            &self.scratch_mc0[..c_area],
+                            &self.scratch_mc1[..c_area],
+                            cw,
+                            ch,
+                            CompInterType::Average,
+                            0,
+                            None,
+                        );
+                    }
+                }
+                r0_idx = sr0 as i8;
+                r1_idx = sr1 as i8;
+                comp_type_idx = 0;
+                saved_mode = 19;
+                mv0 = cmv0;
+                mv1 = cmv1;
+                filter = 0;
+            }
+        } else if !is_comp {
             // Single-reference selection. A segment with `SEG_LVL_SKIP` or
             // `SEG_LVL_GLOBALMV` infers `SkipSegFrame` and `GLOBALMV` without
             // coding reference or mode symbols (AV2 Spec v1.0.0 §5.20.7.3,
