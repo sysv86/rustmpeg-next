@@ -373,12 +373,38 @@ Post-patch verification & fixes applied:
   when `layout != I400 && bs != chroma.bs`, coded `skip_txfm` with `+3` context
   offset when `skip_mode` is active, and decoded `tx_partition` for non-skipped
   `skip_mode` blocks.
+- Pre-existing encoder/decoder/filter fixes also landed on `av2-patches`:
+  - `NEWMV_NEWMV` (`frame.rs`): fixed compound MV residual encoding order
+    (`encode_mv_magnitude` for both MVs followed by bypass signs
+    `dy0, dx0, dy1, dx1`), matching `dec/frame.rs` and `dav2d`.
+  - CWP `NEAR_NEARMV` (`frame.rs`): fixed `compound_mode == 18` RDO to derive
+    its two predictors from single-reference `mv_stack` lists instead of the
+    compound stack (`1080p_qp100_3f` `rec` now matches `dav2d`).
+  - `TX_CLASS_H` / `TX_CLASS_V` (`dec/syntax.rs`): fixed `decode_coefs`
+    coordinate mapping, `hi_to_low`, `xy` context, `br_y_tok_lf(7)`, adaptive
+    `dc_sign` on `y == 0`, and `lvl_stride = 32` (`x * 32 + y`).
+  - CDEF (`cdef.rs`): fixed `find_cdef_direction` and
+    `cdef_filter_block_normative` to use `coded_width`/`coded_height` instead of
+    display bounds, and fixed the 8x8 skip check to use
+    `BlockDeblockInfo::skip` (`!skip_txfm`) instead of `lr_noskip`.
+  - Intra prediction (`ipred.rs`, `dec/frame.rs`): fixed `mrl_idx` local
+    buffer offset underflow (`conv = |k| (k + 5) as usize`) and replaced the
+    static trailing-zeros edge check with `sb_decoded_rows` bitmask tracking
+    for exact `have_tr`/`have_bl` availability across `PARTITION_V`/`PARTITION_H`.
+  - Implicit reference frame map (`dec/hls.rs`, `dec/mod.rs`): implemented
+    `get_ref_frames_implicit` (`explicit_ref_frame_map == 0`) with `tlayer_id`/
+    `mlayer_id` tracking in `RefFrameInfo`.
 - Gates verified: `cargo fmt --all -- --check`, `cargo check --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo test -p rustmpeg-video` (`340 passed, 0 failed, 13 ignored`; `apv` `7 passed`;
-  `av2_warp` `1 passed`), `DAV2D=dav2d cargo test -p rustmpeg-video --lib av2_ -- --ignored`
-  (`13 passed, 0 failed`, `dav2d` `bff8e5ce`), and `python3 scripts/check-licenses.py`.
-- Stock AVM (`avmenc` `e0e3aa8` / `917ddae`) streams still fail in `av2_decode`
-  with `BitstreamError("chroma intra mode index out of range")` (pre-existing
-  desync; `dav2d` decodes them). Pre-existing `av2_encode`/`av2_decode` `10bit_422`
-  compound+switchable (`NEWMV_NEWMV` MV ordering) also remains on `main`.
+  `cargo test -p rustmpeg-video --no-fail-fast` (`340 passed, 0 failed, 13 ignored`;
+  `apv` `7 passed`; `av2_warp` `1 passed`),
+  `DAV2D=/home/antigravity/oracle/dav2d/build/tools/dav2d cargo test -p rustmpeg-video --lib av2_ -- --ignored`
+  (`13 passed, 0 failed`, `dav2d` `bff8e5ce`), `rustmpeg-core`/`rustmpeg-format`/
+  `rustmpeg-audio`/`rustmpeg-vulkan`/`rustmpeg-cli`/`rustmpeg` test suites,
+  `python3 scripts/check-licenses.py`, and all 15/15 `verify_av2.py`
+  byte-exact `rec == our == dav2d` checks.
+- Remaining stock AVM (`avmenc` `917ddae`) gaps: multi-frame `256x192`
+  with `--enable-warped-motion=0` decodes all 3 frames (`Key`, `Inter`, `Inter`)
+  when unsupported tools are disabled, though `warped_motion` (`invalid warped-motion model`
+  on frame 3) and some `avmenc` bitstreams (`avm64` right-edge `Bs4x8`,
+  `256x192` `qp=100` `frame 0`) still diverge from `dav2d`.

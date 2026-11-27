@@ -1062,7 +1062,8 @@ pub fn decode_coefs(
             let token = if sym < 4 {
                 (sym + 1) as u32
             } else {
-                5 + msac.decode_symbol_adapt(coef.br_y_tok_lf(0), 3)? as u32
+                let br_ctx = if tx_class == 0 { 0 } else { 7 };
+                5 + msac.decode_symbol_adapt(coef.br_y_tok_lf(br_ctx), 3)? as u32
             };
             let dc_ctx = get_dc_sign_ctx(t_dim, a, l) as usize;
             let sign = msac.decode_bool_adapt(coef.dc_sign(0, 0, dc_ctx))? != 0;
@@ -1090,11 +1091,47 @@ pub fn decode_coefs(
         });
     }
 
+    let hi_to_low = match tx_class {
+        2 => (8usize << slh) >> (chroma as usize),
+        3 => (8usize << slw) >> (chroma as usize),
+        _ => hi_to_low,
+    };
+    let shift_v = slw + 2;
+    let mask_v = (4usize << slw) - 1;
+    let scan_coords = |idx: usize| -> (usize, usize, usize, usize) {
+        match tx_class {
+            2 => {
+                // TX_CLASS_H: x = idx & mask, y = idx >> shift, rc = idx
+                let rc = idx;
+                let x = idx & mask;
+                let y = idx >> shift;
+                (rc, x, y, y)
+            }
+            3 => {
+                // TX_CLASS_V: column-major scan; y = idx >> shift_v
+                let x = idx & mask_v;
+                let y = idx >> shift_v;
+                let rc = (x << shift) | y;
+                (rc, x, y, y)
+            }
+            _ => {
+                let rc = scan[idx] as usize;
+                let x = rc >> shift;
+                let y = rc & mask;
+                (rc, x, y, x + y)
+            }
+        }
+    };
+
+    let lvl_stride = if tx_class != 0 { 32usize } else { stride };
+    let lvl_rc =
+        |x: usize, y: usize, rc: usize| -> usize { if tx_class != 0 { x * 32 + y } else { rc } };
+
     let mut levels = [0i8; 1089];
 
     // 5. EOB base token.
     {
-        let rc = scan[eob_idx as usize] as usize;
+        let (rc, x, y, _xy) = scan_coords(eob_idx as usize);
         let lf_eob = (eob_idx as usize) < hi_to_low;
         let ctx_init = 1
             + (eob_idx as usize > 2usize << tx2dszctx) as usize
@@ -1128,24 +1165,23 @@ pub fn decode_coefs(
                 (sym + 1) as u32
             }
         };
-        levels[rc] = token.min(127) as i8;
+        levels[lvl_rc(x, y, rc)] = token.min(127) as i8;
     }
 
     // 6. AC base tokens, high to low scan order.
     for i in (1..eob_idx as usize).rev() {
-        let rc = scan[i] as usize;
-        let x = rc >> shift;
-        let y = rc & mask;
+        let (rc, x, y, xy) = scan_coords(i);
+        let lrc = lvl_rc(x, y, rc);
         let lf = i < hi_to_low;
         let mut hr_ctx = 0u32;
         let ctx = get_lo_ctx(
             &levels,
-            rc,
+            lrc,
             tx_class,
             &mut hr_ctx,
-            (x + y) as u32,
+            xy as u32,
             p.plane,
-            stride,
+            lvl_stride,
         ) as usize;
         let token = if chroma {
             if lf {
@@ -1175,13 +1211,13 @@ pub fn decode_coefs(
                 sym as u32
             }
         };
-        levels[rc] = token.min(127) as i8;
+        levels[lrc] = token.min(127) as i8;
     }
 
     // 7. DC base token.
     {
         let mut hr_ctx = 0u32;
-        let ctx = get_lo_ctx(&levels, 0, tx_class, &mut hr_ctx, 0, p.plane, stride) as usize;
+        let ctx = get_lo_ctx(&levels, 0, tx_class, &mut hr_ctx, 0, p.plane, lvl_stride) as usize;
         let token = if chroma {
             msac.decode_symbol_adapt(coef.base_uv_tok_lf(ctx), 5)? as u32
         } else {
@@ -1198,12 +1234,16 @@ pub fn decode_coefs(
 
     // 8. Signs and high-range residuals, high to low scan order.
     for i in (1..=eob_idx as usize).rev() {
-        let rc = scan[i] as usize;
-        let token = levels[rc] as u32;
+        let (rc, x, y, _xy) = scan_coords(i);
+        let token = levels[lvl_rc(x, y, rc)] as u32;
         if token == 0 {
             continue;
         }
-        let sign = msac.decode_bool_bypass() != 0;
+        let sign = if tx_class != 0 && y == 0 && !chroma {
+            msac.decode_bool_adapt(coef.dc_sign(0, 0, 0))? != 0
+        } else {
+            msac.decode_bool_bypass() != 0
+        };
         let max_br = if i < hi_to_low {
             if chroma { 5 } else { 8 }
         } else {

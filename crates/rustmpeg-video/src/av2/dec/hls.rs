@@ -55,6 +55,10 @@ pub struct RefFrameInfo {
     pub ref_poc: [i32; REFS_PER_FRAME],
     /// Saved per-plane CCSO filter offsets for parameter reuse (`FhCcso`, AV2 §5.18.7.10).
     pub ccso_planes: [FhCcsoPlane; 3],
+    /// Temporal layer id of the stored reference frame.
+    pub tlayer_id: u8,
+    /// Multilayer id of the stored reference frame.
+    pub mlayer_id: u8,
 }
 
 /// One parsed OBU with a borrowed payload.
@@ -716,7 +720,11 @@ pub fn parse_tile_group_slice<'a>(
         )
     })?;
     let n_tiles = (fh_ref.tiling.t.cols.max(1) as usize) * (fh_ref.tiling.t.rows.max(1) as usize);
-    let tile_start_and_end_present = if n_tiles > 1 { br.get_bit()? != 0 } else { false };
+    let tile_start_and_end_present = if n_tiles > 1 {
+        br.get_bit()? != 0
+    } else {
+        false
+    };
     let (tg_start, tg_end) = if n_tiles == 1 || !tile_start_and_end_present {
         (0usize, n_tiles - 1)
     } else {
@@ -797,6 +805,155 @@ pub fn parse_tile_group_with_refs<'a>(
         )));
     }
     Ok((fh, slice.tiles))
+}
+
+fn get_ref_frames_implicit(
+    seq: &SequenceHeader,
+    fh: &mut FrameHeader,
+    ref_info: &[RefFrameInfo; NUM_REF_FRAMES],
+    have_resolution: bool,
+) -> u8 {
+    #[derive(Clone, Copy, Default)]
+    struct Score {
+        score: i32,
+        poc: i32,
+        pocdiff: i32,
+        qidx: u16,
+        mlayer: u8,
+    }
+
+    let mut scores = [Score::default(); NUM_REF_FRAMES];
+    let mut sort_idx = [0usize; NUM_REF_FRAMES];
+    let mut n_refs = 0usize;
+    let poc = fh.frame_offset as i32;
+    let nbits = seq.order_hint_n_bits as i32;
+    let mut have_fwd_refs = false;
+    for info in ref_info.iter() {
+        if !info.present {
+            continue;
+        }
+        if get_poc_diff(nbits, poc, info.poc) < 0 {
+            have_fwd_refs = true;
+            break;
+        }
+    }
+
+    let mlayer = fh.mlayer_id;
+    let tlayer = fh.tlayer_id;
+    let w = fh.width;
+    let h = fh.height;
+    let mut minq = 512u16;
+    let mut maxq = 0u16;
+
+    for (n, info) in ref_info.iter().enumerate() {
+        if !info.present {
+            continue;
+        }
+        if seq.tlayer_dependency_present {
+            if (seq.tlayer_dependencies[tlayer as usize] & (1 << info.tlayer_id)) == 0 {
+                continue;
+            }
+        } else if tlayer < info.tlayer_id {
+            continue;
+        }
+        if seq.mlayer_dependency_present {
+            if (seq.mlayer_dependencies[mlayer as usize] & (1 << info.mlayer_id)) == 0 {
+                continue;
+            }
+        } else if mlayer < info.mlayer_id {
+            continue;
+        }
+        if have_resolution
+            && (2 * w < info.width
+                || 2 * h < info.height
+                || w > 16 * info.width
+                || h > 16 * info.height)
+        {
+            continue;
+        }
+        let area = (info.width.max(1) as u64) * (info.height.max(1) as u64);
+        let res_ratio_log2 = -(63 - area.leading_zeros() as i32);
+        let pocdiff = get_poc_diff(nbits, poc, info.poc);
+        let tdist = pocdiff.abs() + (mlayer as i32 - info.mlayer_id as i32);
+        let mut score = if have_fwd_refs {
+            tdist << 6
+        } else {
+            128 - (128 >> tdist.min(6)) + (tdist - 6).max(0)
+        };
+        score += res_ratio_log2 * (1 << 5) + info.qidx as i32;
+        let r = Score {
+            score,
+            poc: info.poc,
+            pocdiff,
+            qidx: info.qidx,
+            mlayer: info.mlayer_id,
+        };
+        if (0..n_refs).any(|m| {
+            let r2 = &scores[sort_idx[m]];
+            r.score == r2.score && r.poc == r2.poc && r.mlayer == r2.mlayer
+        }) {
+            continue;
+        }
+        scores[n] = r;
+        maxq = maxq.max(r.qidx);
+        minq = minq.min(r.qidx);
+        let mut m = n_refs;
+        while m > 0 {
+            let idx = sort_idx[m - 1];
+            if scores[idx].score <= r.score {
+                break;
+            }
+            sort_idx[m] = idx;
+            m -= 1;
+        }
+        sort_idx[m] = n;
+        n_refs += 1;
+    }
+
+    if n_refs > 7 {
+        let q_thr = (maxq + minq + 1) >> 1;
+        let mut maxpocdiff = [0i32; 2];
+        let mut num = [0usize; 2];
+        let mut furthest_idx = [0usize; 2];
+        for (n, &sidx) in sort_idx[..n_refs].iter().enumerate() {
+            let r = &scores[sidx];
+            if r.qidx < q_thr {
+                continue;
+            }
+            if r.pocdiff > 0 {
+                if r.pocdiff > maxpocdiff[0] {
+                    maxpocdiff[0] = r.pocdiff;
+                    furthest_idx[0] = n;
+                }
+                num[0] += 1;
+            } else if r.pocdiff < 0 {
+                if r.pocdiff < maxpocdiff[1] {
+                    maxpocdiff[1] = r.pocdiff;
+                    furthest_idx[1] = n;
+                }
+                num[1] += 1;
+            }
+        }
+        let idx = if num[0] > num[1] {
+            furthest_idx[0]
+        } else if num[0] < num[1] {
+            furthest_idx[1]
+        } else {
+            furthest_idx[(maxpocdiff[0] < -maxpocdiff[1]) as usize]
+        };
+        if idx < 7 {
+            let moved = sort_idx[idx];
+            for j in idx..7 {
+                sort_idx[j] = sort_idx[j + 1];
+            }
+            sort_idx[7] = moved;
+        }
+    }
+
+    for n in 0..crate::av2::headers::REFS_PER_FRAME {
+        fh.refidx[n] = sort_idx[if n < n_refs { n } else { 0 }] as i8;
+    }
+    n_refs.min(crate::av2::headers::REFS_PER_FRAME) as u8
 }
 
 /// Derives `DerivedPrimaryRefFrame` when the frame header does not signal one.
@@ -1094,17 +1251,12 @@ pub fn parse_frame_header(
         fh.refresh_frame_flags = ((1u32 << seq.ref_frames) - 1) as u16;
     }
 
-    // Reference frame list
+    // Reference frame list (AV2 Spec v1.0.0 §5.18.2)
+    let mut explicit_ref_frame_map = false;
     if fh.is_inter_or_switch() {
-        if fh.frame_type != FrameType::Switch && seq.explicit_ref_frame_map {
-            let flag = br.get_bit()?;
-            if flag == 0 {
-                return Err(Av2Error::Unsupported(
-                    "implicit reference frame map".to_string(),
-                ));
-            }
-        }
-        if fh.frame_type == FrameType::Switch || seq.explicit_ref_frame_map {
+        explicit_ref_frame_map = fh.frame_type == FrameType::Switch
+            || (seq.explicit_ref_frame_map && br.get_bit()? != 0);
+        if explicit_ref_frame_map {
             fh.n_ref_frames = br.get_bits(3)? as u8;
             if fh.n_ref_frames == 0
                 || fh.n_ref_frames as usize > crate::av2::headers::REFS_PER_FRAME
@@ -1122,6 +1274,8 @@ pub fn parse_frame_header(
                 }
                 fh.refidx[i] = r;
             }
+        } else {
+            fh.n_ref_frames = get_ref_frames_implicit(seq, &mut fh, ref_info, false);
         }
     }
 
@@ -1163,6 +1317,9 @@ pub fn parse_frame_header(
     }
 
     if fh.is_inter_or_switch() {
+        if fh.frame_type == FrameType::Inter && !explicit_ref_frame_map {
+            fh.n_ref_frames = get_ref_frames_implicit(seq, &mut fh, ref_info, true);
+        }
         if seq.ref_frame_mvs {
             fh.use_ref_frame_mvs = br.get_bit()? as u8;
             if fh.use_ref_frame_mvs != 0 && fh.n_ref_frames > 1 && seq.sb128 != 0 {
@@ -2077,7 +2234,6 @@ fn parse_film_grain_model(br: &mut BitReader<'_>, layout: PixelLayout) -> Result
     data.block_size = br.get_bit()? as i32;
     Ok(data)
 }
-
 
 /// `scale_warp_model(baseParams, baseDistance, dist)` (AV2 Spec v1.0.0 §5.18.9.1).
 fn scale_warp_model(base_params: &[i32; 6], mut base_dist: i32, mut dist: i32) -> [i32; 6] {

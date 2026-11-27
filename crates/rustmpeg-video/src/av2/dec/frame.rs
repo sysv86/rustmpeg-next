@@ -555,6 +555,7 @@ pub fn decode_frame<BD: BitDepth>(
                 vec![false; f_bw4 * f_bh4],
                 vec![false; f_bw4 * f_bh4],
             ],
+            sb_decoded_rows: [0u32; 32],
         };
         decoder.decode_tile(root_bs, sb_step4)?;
     }
@@ -838,6 +839,8 @@ struct TileDecoder<'a, BD: BitDepth> {
     /// Per-plane `is_coded` map at 4x4 granularity for the lossless
     /// per-transform-block intra prediction (`dav2d` `recon_tmpl.c`).
     tu_coded: [Vec<bool>; 3],
+    /// Per-4x4-row bitmask of already-decoded blocks within the current superblock.
+    sb_decoded_rows: [u32; 32],
 }
 
 impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
@@ -1148,6 +1151,7 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             self.refmv_hits = RefMvBankHits::default();
             let mut bx4 = self.tile_col_start4;
             while bx4 < self.tile_col_end4 {
+                self.sb_decoded_rows = [0u32; 32];
                 self.decode_lr(bx4, by4)?;
                 let root_chroma = ChromaBlockCtx {
                     has_chroma: self.seq.layout != PixelLayout::I400,
@@ -1493,6 +1497,17 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
         let end = bx4 < self.tile_col_end4 && by4 < self.tile_row_end4;
         self.decode_leaf_inner(bs, bx4, by4, chroma)?;
         if end {
+            let bx4_in_sb = bx4 & (self.sb_step4 - 1);
+            let by4_in_sb = by4 & (self.sb_step4 - 1);
+            let w_clamped = bw4.min(self.sb_step4 - bx4_in_sb);
+            let mask = if w_clamped >= 32 {
+                u32::MAX
+            } else {
+                ((1u32 << w_clamped) - 1) << bx4_in_sb
+            };
+            for dy in 0..bh4.min(self.sb_step4 - by4_in_sb) {
+                self.sb_decoded_rows[by4_in_sb + dy] |= mask;
+            }
             self.note_refmv_bank(bw4, bh4, bx4, by4);
         }
         Ok(())
@@ -5770,18 +5785,28 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
         mrl_idx: u8,
     ) -> [BD::Pixel; 512] {
         let plane = &self.rec.planes[pl];
+        let bx4_in_sb = ((px_x << plane.ss_x) >> 2) & (self.sb_step4 - 1);
+        let by4_in_sb = ((px_y << plane.ss_y) >> 2) & (self.sb_step4 - 1);
+        let bw4_blk = ((w << plane.ss_x) >> 2).max(1);
+        let bh4_blk = ((h << plane.ss_y) >> 2).max(1);
+        let tile_end_x = (self.tile_col_end4 * 4) >> plane.ss_x;
+        let tile_end_y = (self.tile_row_end4 * 4) >> plane.ss_y;
         let sb_px = (64usize << self.fh.sb128) >> plane.ss_x.max(plane.ss_y);
-        let (have_tr, have_bl) = crate::av2::ipred::intra_edge_availability(
-            px_x,
-            px_y,
-            w,
-            h,
-            (self.tile_col_end4 * 4) >> plane.ss_x,
-            (self.tile_row_end4 * 4) >> plane.ss_y,
-            sb_px,
-            have_left,
-            have_top,
-        );
+        let by_in_sb = px_y % sb_px.max(1);
+        let have_tr = have_top
+            && px_x + w < tile_end_x
+            && (by_in_sb == 0
+                || (bx4_in_sb + bw4_blk < self.sb_step4
+                    && by4_in_sb > 0
+                    && (self.sb_decoded_rows[by4_in_sb - 1] & (1u32 << (bx4_in_sb + bw4_blk)))
+                        != 0));
+        let have_bl = have_left
+            && px_y + h < tile_end_y
+            && by_in_sb + h < sb_px
+            && (bx4_in_sb == 0
+                || (by4_in_sb + bh4_blk < self.sb_step4
+                    && (self.sb_decoded_rows[by4_in_sb + bh4_blk] & (1u32 << (bx4_in_sb - 1)))
+                        != 0));
         let (rec_w, rec_h) = crate::av2::ipred::intra_reference_extent(
             self.frame_mi_w,
             self.frame_mi_h,

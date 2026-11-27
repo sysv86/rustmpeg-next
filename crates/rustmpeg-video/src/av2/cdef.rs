@@ -86,11 +86,13 @@ pub fn find_cdef_direction<P: Pixel>(
     let mid = 128i32;
     let mut partial = [[0i32; 15]; 8];
 
+    let max_h = plane.coded_height.max(plane.height);
+    let max_w = plane.coded_width.max(plane.width);
     for r in 0..8 {
-        let cy = (by + r).min(plane.height.saturating_sub(1));
+        let cy = (by + r).min(max_h.saturating_sub(1));
         let row = cy * plane.stride;
         for c in 0..8 {
-            let cx = (bx + c).min(plane.width.saturating_sub(1));
+            let cx = (bx + c).min(max_w.saturating_sub(1));
             let x = (plane.data[row + cx].to_i32() >> shift) - mid;
             partial[0][r + c] += x;
             partial[1][r + (c >> 1)] += x;
@@ -169,15 +171,17 @@ pub fn cdef_filter_block_normative<P: Pixel>(
         return;
     }
 
+    let dst_h = dst.coded_height.max(dst.height);
+    let dst_w = dst.coded_width.max(dst.width);
     for i in 0..h {
         let py = y0 + i;
-        if py >= dst.height {
+        if py >= dst_h {
             break;
         }
         let dst_row = py * dst.stride;
         for j in 0..w {
             let px = x0 + j;
-            if px >= dst.width {
+            if px >= dst_w {
                 break;
             }
             let x = src.data[py * src.stride + px].to_i32();
@@ -307,14 +311,10 @@ pub fn cdef_frame_normative<BD: BitDepth>(
             if s00.lossless || s01.lossless || s10.lossless || s11.lossless {
                 continue;
             }
-            // The `Skips` input of §7.18.1 is the per-4x4 non-zero-coefficient
-            // mask (`lr_noskip`), not the inter skip flag: an 8x8 block with no
-            // coded coefficients is not filtered even when `skip_txfm == 0`.
-            let n00 = grid.get_lr_noskip(c, r);
-            let n01 = grid.get_lr_noskip((c + 1).min(f_bw4 - 1), r);
-            let n10 = grid.get_lr_noskip(c, (r + 1).min(f_bh4 - 1));
-            let n11 = grid.get_lr_noskip((c + 1).min(f_bw4 - 1), (r + 1).min(f_bh4 - 1));
-            if fh.cdef.on_skiptx == 0 && !n00 && !n01 && !n10 && !n11 {
+            // CDEF `noskip_mask` (§7.18.1 / dav2d `decode.c:3420`) is `!skip_txfm`
+            // (recorded in `BlockDeblockInfo::skip`), not `lr_noskip` (which only
+            // tracks non-zero luma transform coefficients for loop restoration).
+            if fh.cdef.on_skiptx == 0 && s00.skip && s01.skip && s10.skip && s11.skip {
                 continue;
             }
 

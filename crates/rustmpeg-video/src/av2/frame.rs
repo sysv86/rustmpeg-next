@@ -4077,11 +4077,16 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                 }
 
                 // DistanceWeighted (CWP) uses `NEARMV_NEARMV`, whose two MVs
-                // come directly from the compound stack.
-                let comp_integer = comp_pred[0].x & 7 == 0
-                    && comp_pred[0].y & 7 == 0
-                    && comp_pred[1].x & 7 == 0
-                    && comp_pred[1].y & 7 == 0;
+                // `compound_mode = 18` (`NEAR_NEARMV`) derives its predictors
+                // from one single-reference stack per list (§7.12.2).
+                let cwp_pred = [
+                    self.mv_stack(bx4, by4, bw4, bh4, [0, -1]).get(0),
+                    self.mv_stack(bx4, by4, bw4, bh4, [1, -1]).get(0),
+                ];
+                let comp_integer = cwp_pred[0].x & 7 == 0
+                    && cwp_pred[0].y & 7 == 0
+                    && cwp_pred[1].x & 7 == 0
+                    && cwp_pred[1].y & 7 == 0;
                 if self.seqhdr.cwp
                     && self.tools.compound_types & 8 != 0
                     && comp_stack.count > 0
@@ -4098,8 +4103,8 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                         px_y as i32,
                         w,
                         h,
-                        comp_pred[0].y as i32 * 2,
-                        comp_pred[0].x as i32 * 2,
+                        cwp_pred[0].y as i32 * 2,
+                        cwp_pred[0].x as i32 * 2,
                         best_filter as usize,
                     );
                     mc_predict_block_prep(
@@ -4113,8 +4118,8 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                         px_y as i32,
                         w,
                         h,
-                        comp_pred[1].y as i32 * 2,
-                        comp_pred[1].x as i32 * 2,
+                        cwp_pred[1].y as i32 * 2,
+                        cwp_pred[1].x as i32 * 2,
                         best_filter as usize,
                     );
                     let mut blend_buf = [BD::Pixel::default(); 64 * 64];
@@ -4152,8 +4157,8 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
                             inter_dec.compound_drl_idx = 0;
                             inter_dec.comp_type = CompInterType::DistanceWeighted;
                             inter_dec.mode = InterPredMode::NearMv;
-                            inter_dec.mv = comp_pred;
-                            inter_dec.ref_mv = comp_pred;
+                            inter_dec.mv = cwp_pred;
+                            inter_dec.ref_mv = cwp_pred;
                             inter_dec.cwp_idx = cwp as u8;
                             inter_dec.cost = sad;
                         }
@@ -6790,22 +6795,33 @@ impl<'a, BD: BitDepth> TileEncodeState<'a, BD> {
             }
 
             if compound_mode == 22 {
-                encode_mv_residual(
+                let prec = 3 + self.frame_hdr.mv_precision as usize;
+                let (dx0, dy0) = crate::av2::me::encode_mv_magnitude(
                     &mut self.msac,
                     &mut self.cdf.mv,
                     dec.mv[0],
                     dec.ref_mv[0],
-                    3 + self.frame_hdr.mv_precision as usize,
-                    self.seqhdr.mvd_sign_derive,
+                    prec,
                 );
-                encode_mv_residual(
+                let (dx1, dy1) = crate::av2::me::encode_mv_magnitude(
                     &mut self.msac,
                     &mut self.cdf.mv,
                     dec.mv[1],
                     dec.ref_mv[1],
-                    3 + self.frame_hdr.mv_precision as usize,
-                    self.seqhdr.mvd_sign_derive,
+                    prec,
                 );
+                if dy0 != 0 {
+                    self.msac.encode_bool_bypass((dy0 < 0) as u32);
+                }
+                if dx0 != 0 {
+                    self.msac.encode_bool_bypass((dx0 < 0) as u32);
+                }
+                if dy1 != 0 {
+                    self.msac.encode_bool_bypass((dy1 < 0) as u32);
+                }
+                if dx1 != 0 {
+                    self.msac.encode_bool_bypass((dx1 < 0) as u32);
+                }
             } else if compound_mode == 23 {
                 let start = (self.absrefdist[comp_ref0] < self.absrefdist[comp_ref1]) as usize;
                 encode_mv_residual(

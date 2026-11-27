@@ -532,9 +532,9 @@ pub fn predict_intra_block<BD: BitDepth>(
     debug_assert!((max_base + 5) as usize <= LOCAL_EDGE);
     let mut above = [BD::Pixel::default(); LOCAL_EDGE];
     let mut left = [BD::Pixel::default(); LOCAL_EDGE];
-    // Reference index `k` lives at buffer slot `k + 2`; the low slots hold the
-    // `AboveRow[-2]` / `LeftCol[-2]` extension requested by §7.13.2.8.
-    let conv = |k: i32| (k + 2) as usize;
+    // Reference index `k` lives at buffer slot `k + 5` so `min_base - 1`
+    // (down to `-5` when `mrl_idx == 3`) stays non-negative.
+    let conv = |k: i32| (k + 5) as usize;
     // The reference arrays are indexed from `minBase - 1`: §7.13.2.8 fills that
     // slot with `LeftCol[minBase]` / `AboveRow[minBase]`, which is the
     // above-left corner for the outermost multiple reference line.

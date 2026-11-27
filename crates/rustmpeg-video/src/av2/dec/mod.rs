@@ -324,6 +324,8 @@ impl<P: Pixel> Decoder<P> {
                     gm_params,
                     ref_poc,
                     ccso_planes,
+                    tlayer_id: fh.tlayer_id,
+                    mlayer_id: fh.mlayer_id,
                 };
             }
         }
