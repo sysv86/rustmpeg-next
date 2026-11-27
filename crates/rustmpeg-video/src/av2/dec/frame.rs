@@ -620,9 +620,8 @@ fn validate_tools(seq: &SequenceHeader, fh: &FrameHeader) -> Result<()> {
     if seq.adaptive_mvd || seq.mvd_sign_derive || seq.flex_mvres {
         return unsupported("adaptive MVD / flexible MV resolution");
     }
-    if seq.global_motion && fh.is_inter_or_switch() {
-        return unsupported("global motion");
-    }
+    // Global motion parameters and GLOBALMV warped prediction are supported
+    // (§5.18.9.1 / §7.13.3).
     if seq.ist[0] || seq.ist[1] || seq.inter_ddt {
         return unsupported("implicit transform selection / DDT");
     }
@@ -3013,7 +3012,35 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
                 block_warp_params = matrix;
             } else {
                 mv = match mode {
-                    m if m == InterPredMode::GlobalMv as u8 => MvXY::default(),
+                    m if m == InterPredMode::GlobalMv as u8 => {
+                        let gm = &self.fh.gmv.m[ref_idx.min(self.fh.gmv.m.len() - 1)];
+                        if gm.wm_type != crate::av2::headers::WarpedMotionType::Identity {
+                            let gmv = warp_motion_vector(
+                                &gm.matrix,
+                                bw4,
+                                bh4,
+                                bx4,
+                                by4,
+                                self.frame_mi_w,
+                                self.frame_mi_h,
+                            );
+                            if bw4.min(bh4) >= 2 && gm.affine != 0 {
+                                warp_model = Some((
+                                    gm.matrix,
+                                    [
+                                        gm.abcd[0] as i32,
+                                        gm.abcd[1] as i32,
+                                        gm.abcd[2] as i32,
+                                        gm.abcd[3] as i32,
+                                    ],
+                                ));
+                                block_warp_params = gm.matrix;
+                            }
+                            gmv
+                        } else {
+                            MvXY::default()
+                        }
+                    }
                     m if m == InterPredMode::NewMv as u8 => {
                         let diff_mv = read_mv_residual(
                             &mut self.msac,

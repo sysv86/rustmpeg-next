@@ -64,8 +64,8 @@ use crate::av2::dec::hls::RefFrameInfo;
 use crate::av2::error::{Av2Error, Result};
 use crate::av2::frame::{Frame, ReferenceDpb};
 use crate::av2::headers::{
-    FilmGrainData, FrameHeader, FrameType, NSWienerPlane, NUM_REF_FRAMES, ObuType,
-    PRIMARY_REF_NONE, SequenceHeader,
+    FilmGrainData, FrameHeader, FrameType, NUM_REF_FRAMES, ObuType, PRIMARY_REF_NONE,
+    REFS_PER_FRAME, SequenceHeader,
 };
 use crate::av2::pixel::{BitDepth8, BitDepth16, Pixel};
 use crate::av2::segment::SegmentMap;
@@ -223,20 +223,24 @@ impl<P: Pixel> Decoder<P> {
             .and_then(|map| map.as_ref())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn finish_frame(
         &mut self,
         rec: Frame<P>,
         grain: Option<(FilmGrainData, u16)>,
-        frame_type: FrameType,
-        poc: u8,
-        qidx: u16,
-        refresh_flags: u16,
+        fh: &FrameHeader,
         seg_map: SegmentMap,
         ccso_map: [Vec<bool>; 3],
-        segmentation_enabled: bool,
-        restoration_ns: [NSWienerPlane; 3],
     ) -> DecodedFrame<P> {
+        let frame_type = fh.frame_type;
+        let poc = fh.frame_offset;
+        let qidx = fh.quant.yac;
+        let refresh_flags = fh.refresh_frame_flags;
+        let segmentation_enabled = fh.segmentation.enabled != 0;
+        let restoration_ns = [
+            fh.restoration.planes[0].ns,
+            fh.restoration.planes[1].ns,
+            fh.restoration.planes[2].ns,
+        ];
         // §7.21.1: grain is added to the output picture only. The frame that
         // enters the DPB is the clean reconstruction.
         let frame = match grain {
@@ -259,6 +263,15 @@ impl<P: Pixel> Decoder<P> {
             }
         }
         let ref_is_intra = matches!(frame_type, FrameType::Key | FrameType::Intra);
+        let mut gm_params = [crate::av2::warp::DEFAULT_WARP_PARAMS; REFS_PER_FRAME];
+        let mut ref_poc = [0i32; REFS_PER_FRAME];
+        let n_refs = (fh.n_ref_frames as usize).min(REFS_PER_FRAME);
+        for r in 0..n_refs {
+            gm_params[r] = fh.gmv.m[r].matrix;
+            let rslot = (fh.refidx[r] as usize).min(NUM_REF_FRAMES - 1);
+            ref_poc[r] = self.ref_info[rslot].poc;
+        }
+        let ccso_planes = fh.ccso.planes;
         for (slot, entry) in self.ref_info.iter_mut().enumerate() {
             if refresh_flags & (1u16 << slot) != 0 {
                 *entry = RefFrameInfo {
@@ -267,6 +280,12 @@ impl<P: Pixel> Decoder<P> {
                     qidx,
                     poc: poc as i32,
                     ns: restoration_ns,
+                    width: fh.width,
+                    height: fh.height,
+                    n_ref_frames: fh.n_ref_frames,
+                    gm_params,
+                    ref_poc,
+                    ccso_planes,
                 };
             }
         }
@@ -306,22 +325,7 @@ impl Decoder<u8> {
             group.n_cols,
             prev_segmap,
         )?;
-        let out = self.finish_frame(
-            rec,
-            grain,
-            group.fh.frame_type,
-            group.fh.frame_offset,
-            group.fh.quant.yac,
-            group.fh.refresh_frame_flags,
-            seg_map,
-            ccso_map,
-            group.fh.segmentation.enabled != 0,
-            [
-                group.fh.restoration.planes[0].ns,
-                group.fh.restoration.planes[1].ns,
-                group.fh.restoration.planes[2].ns,
-            ],
-        );
+        let out = self.finish_frame(rec, grain, &group.fh, seg_map, ccso_map);
         Ok(Some(out))
     }
 }
@@ -355,22 +359,7 @@ impl Decoder<u16> {
             group.n_cols,
             prev_segmap,
         )?;
-        let out = self.finish_frame(
-            rec,
-            grain,
-            group.fh.frame_type,
-            group.fh.frame_offset,
-            group.fh.quant.yac,
-            group.fh.refresh_frame_flags,
-            seg_map,
-            ccso_map,
-            group.fh.segmentation.enabled != 0,
-            [
-                group.fh.restoration.planes[0].ns,
-                group.fh.restoration.planes[1].ns,
-                group.fh.restoration.planes[2].ns,
-            ],
-        );
+        let out = self.finish_frame(rec, grain, &group.fh, seg_map, ccso_map);
         Ok(Some(out))
     }
 }

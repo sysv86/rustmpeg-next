@@ -20,9 +20,10 @@ use crate::av2::ccso::CCSO_QUANT_SZ;
 use crate::av2::dec::bitio::BitReader;
 use crate::av2::error::{Av2Error, Result};
 use crate::av2::headers::{
-    AdaptiveBoolean, CropInfo, FilmGrainData, FilterMode, FrameHeader, FrameType, MAX_SEGMENTS,
-    MAX_TILE_COLS, MAX_TILE_ROWS, NSWienerPlane, ObuType, PRIMARY_REF_NONE, PixelLayout,
-    RestorationType, SequenceHeader, TileInfo, TxfmMode,
+    AdaptiveBoolean, CropInfo, FhCcsoPlane, FilmGrainData, FilterMode, FrameHeader, FrameType,
+    MAX_SEGMENTS, MAX_TILE_COLS, MAX_TILE_ROWS, NSWienerPlane, NUM_REF_FRAMES, ObuType,
+    PRIMARY_REF_NONE, PixelLayout, REFS_PER_FRAME, RestorationType, SequenceHeader, TileInfo,
+    TxfmMode, WarpedMotionType,
 };
 use crate::av2::intops::{get_poc_diff, iclip, ulog2};
 use crate::av2::obu::init_uniform_tile_info;
@@ -42,6 +43,18 @@ pub struct RefFrameInfo {
     /// Resolved frame-level NS Wiener filters per plane (`RefFrameLrWienerNs`,
     /// `RefFrameFiltersOn`; AV2 §5.18.7.11). Used by `temporal_pred_flag`.
     pub ns: [NSWienerPlane; 3],
+    /// Reference frame width in luma samples (for reference-derived frame size).
+    pub width: i32,
+    /// Reference frame height in luma samples (for reference-derived frame size).
+    pub height: i32,
+    /// Number of active reference frames used by this stored frame (`RefNumTotalRefs`).
+    pub n_ref_frames: u8,
+    /// Saved global motion parameters per reference (`SavedGmParams`, AV2 §5.18.9.1).
+    pub gm_params: [[i32; 6]; REFS_PER_FRAME],
+    /// Saved reference order hints per reference (`SavedOrderHints`, AV2 §5.18.9.1).
+    pub ref_poc: [i32; REFS_PER_FRAME],
+    /// Saved per-plane CCSO filter offsets for parameter reuse (`FhCcso`, AV2 §5.18.7.10).
+    pub ccso_planes: [FhCcsoPlane; 3],
 }
 
 /// One parsed OBU with a borrowed payload.
@@ -1755,11 +1768,8 @@ pub fn parse_frame_header(
 
     fh.reduced_txtp_set = br.get_bits(2)? as u8;
 
-    if fh.is_inter_or_switch() && seq.global_motion && br.get_bit()? != 0 {
-        return Err(Av2Error::Unsupported(
-            "global motion parameters".to_string(),
-        ));
-    }
+    // global_motion_params() (AV2 Spec v1.0.0 §5.18.9.1)
+    parse_global_motion_params(seq, &mut fh, br, ref_info)?;
 
     if seq.film_grain_present && (fh.show_immediate != 0 || fh.show_implicit != 0) {
         fh.film_grain.present = if seq.reduced_still_picture_header {
@@ -1903,6 +1913,154 @@ fn parse_film_grain_model(br: &mut BitReader<'_>, layout: PixelLayout) -> Result
     }
     data.block_size = br.get_bit()? as i32;
     Ok(data)
+}
+
+
+/// `scale_warp_model(baseParams, baseDistance, dist)` (AV2 Spec v1.0.0 §5.18.9.1).
+fn scale_warp_model(base_params: &[i32; 6], mut base_dist: i32, mut dist: i32) -> [i32; 6] {
+    use crate::av2::warp::{DEFAULT_WARP_PARAMS, resolve_divisor_64, round2_signed};
+    if base_dist == 0 {
+        return DEFAULT_WARP_PARAMS;
+    }
+    if base_dist < 0 {
+        base_dist = -base_dist;
+        dist = -dist;
+    }
+    let (div_shift, div_factor) = resolve_divisor_64(base_dist as i64);
+    let mut out = DEFAULT_WARP_PARAMS;
+    let limit = (1i64 << 22) - 1;
+    for i in 0..6 {
+        let center = DEFAULT_WARP_PARAMS[i] as i64;
+        let input = (base_params[i] as i64 - center).clamp(-limit, limit);
+        let scaled = round2_signed(input * (div_factor as i64), div_shift);
+        let shift = if i < 2 { 13u32 } else { 6u32 };
+        let (pmin, pmax) = if i < 2 {
+            (-16383i64, 16383i64)
+        } else {
+            (-511i64, 511i64)
+        };
+        let v = round2_signed(scaled * (dist as i64), shift).clamp(pmin, pmax) << shift;
+        out[i] = (center + v) as i32;
+    }
+    out
+}
+
+/// `read_global_param(ref, idx)` (AV2 Spec v1.0.0 §5.18.9.2–§5.18.9.5).
+fn read_global_param(br: &mut BitReader<'_>, prev: i32, idx: usize) -> Result<i32> {
+    let (prec_bits, mx) = if idx < 2 {
+        (3u32, 16383i32)
+    } else {
+        (10u32, 511i32)
+    };
+    let prec_diff = 16 - prec_bits;
+    let round = if idx % 3 == 2 { 1i32 << 16 } else { 0 };
+    let sub = if idx % 3 == 2 { 1i32 << prec_bits } else { 0 };
+    let r = (prev >> prec_diff) - sub;
+    let low = -mx;
+    let high = mx + 1;
+    let clamped_r = r.clamp(low, high - 1);
+    let u = br.get_bits_subexp_u((clamped_r - low) as u32, (high - low) as u32, 3)? as i32;
+    Ok(((u + low) << prec_diff) + round)
+}
+
+/// Parses `global_motion_params()` (AV2 Spec v1.0.0 §5.18.9.1) and validates
+/// each non-identity model's shear parameters via `setup_shear()`.
+fn parse_global_motion_params(
+    seq: &SequenceHeader,
+    fh: &mut FrameHeader,
+    br: &mut BitReader<'_>,
+    ref_info: &[RefFrameInfo; NUM_REF_FRAMES],
+) -> Result<()> {
+    use crate::av2::warp::{DEFAULT_WARP_PARAMS, setup_shear};
+
+    for m in &mut fh.gmv.m {
+        m.wm_type = WarpedMotionType::Identity;
+        m.matrix = DEFAULT_WARP_PARAMS;
+        m.abcd = [0; 4];
+        m.affine = 0;
+    }
+    if !fh.is_inter_or_switch() || !seq.global_motion {
+        return Ok(());
+    }
+    if br.get_bit()? == 0 {
+        return Ok(());
+    }
+
+    let n_refs = (fh.n_ref_frames as usize).min(REFS_PER_FRAME);
+    let mut base_params = DEFAULT_WARP_PARAMS;
+    let mut base_dist = 1i32;
+
+    let our_ref = if fh.frame_type == FrameType::Switch {
+        n_refs
+    } else {
+        br.get_uniform((n_refs + 1) as u32)? as usize
+    };
+    fh.gmv.r#ref = our_ref as u8;
+    if our_ref < n_refs {
+        let slot = (fh.refidx[our_ref] as usize).min(NUM_REF_FRAMES - 1);
+        let ref_n = (ref_info[slot].n_ref_frames as usize).min(REFS_PER_FRAME);
+        if ref_n > 0 {
+            let their_ref = br.get_uniform(ref_n as u32)? as usize;
+            fh.gmv.refref = their_ref as u8;
+            base_params = ref_info[slot].gm_params[their_ref];
+            let oh_our = ref_info[slot].poc;
+            let oh_their = ref_info[slot].ref_poc[their_ref];
+            base_dist = crate::av2::intops::get_poc_diff(seq.order_hint_n_bits, oh_our, oh_their);
+        }
+    }
+
+    let cur_poc = fh.frame_offset as i32;
+    for r in 0..n_refs {
+        let slot = (fh.refidx[r] as usize).min(NUM_REF_FRAMES - 1);
+        let ref_poc = ref_info[slot].poc;
+        let dist = crate::av2::intops::get_poc_diff(seq.order_hint_n_bits, cur_poc, ref_poc);
+        if dist == 0 || !ref_info[slot].present {
+            fh.gmv.m[r].wm_type = WarpedMotionType::Identity;
+            fh.gmv.m[r].matrix = DEFAULT_WARP_PARAMS;
+            continue;
+        }
+        let prev = scale_warp_model(&base_params, base_dist, dist);
+        let is_global = br.get_bit()? != 0;
+        if !is_global {
+            fh.gmv.m[r].wm_type = WarpedMotionType::Identity;
+            fh.gmv.m[r].matrix = DEFAULT_WARP_PARAMS;
+            continue;
+        }
+        let is_rot_zoom = br.get_bit()? != 0;
+        let wm_type = if is_rot_zoom {
+            WarpedMotionType::RotZoom
+        } else {
+            WarpedMotionType::Affine
+        };
+        let mut matrix = DEFAULT_WARP_PARAMS;
+        matrix[2] = read_global_param(br, prev[2], 2)?;
+        matrix[3] = read_global_param(br, prev[3], 3)?;
+        if wm_type == WarpedMotionType::Affine {
+            matrix[4] = read_global_param(br, prev[4], 4)?;
+            matrix[5] = read_global_param(br, prev[5], 5)?;
+        } else {
+            matrix[4] = -matrix[3];
+            matrix[5] = matrix[2];
+        }
+        matrix[0] = read_global_param(br, prev[0], 0)?;
+        matrix[1] = read_global_param(br, prev[1], 1)?;
+
+        fh.gmv.m[r].wm_type = wm_type;
+        fh.gmv.m[r].matrix = matrix;
+        if let Some(abcd) = setup_shear(&matrix) {
+            fh.gmv.m[r].abcd = [
+                abcd[0] as i16,
+                abcd[1] as i16,
+                abcd[2] as i16,
+                abcd[3] as i16,
+            ];
+            fh.gmv.m[r].affine = 1;
+        } else {
+            fh.gmv.m[r].abcd = [0; 4];
+            fh.gmv.m[r].affine = 0;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
