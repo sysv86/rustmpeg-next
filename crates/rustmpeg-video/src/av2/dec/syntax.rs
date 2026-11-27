@@ -1078,8 +1078,9 @@ pub fn decode_coefs(
         } else {
             level as i32
         };
+        let active_qm = if (txtp as u32) < 9 { p.qm } else { None };
         dq_out[0] = dequantize_coef(
-            signed, 0, 0, p.dq_tbl, p.qm, t_dim.ctx, p.bitdepth, p.lossless,
+            signed, 0, 0, p.dq_tbl, active_qm, t_dim.ctx, p.bitdepth, p.lossless,
         ) * dq_scale;
         let res_ctx = (level.min(63) as u8) | (dc_sign_level as u8);
         return Ok(CoefDecodeResult {
@@ -1216,8 +1217,9 @@ pub fn decode_coefs(
         };
         cul_level += level;
         let signed = if sign { -(level as i32) } else { level as i32 };
+        let active_qm = if (txtp as u32) < 9 { p.qm } else { None };
         dq_out[rc] = dequantize_coef(
-            signed, i, rc, p.dq_tbl, p.qm, t_dim.ctx, p.bitdepth, p.lossless,
+            signed, i, rc, p.dq_tbl, active_qm, t_dim.ctx, p.bitdepth, p.lossless,
         ) * dq_scale;
     }
 
@@ -1240,8 +1242,9 @@ pub fn decode_coefs(
         };
         cul_level += level;
         let signed = if sign { -(level as i32) } else { level as i32 };
+        let active_qm = if (txtp as u32) < 9 { p.qm } else { None };
         dq_out[0] = dequantize_coef(
-            signed, 0, 0, p.dq_tbl, p.qm, t_dim.ctx, p.bitdepth, p.lossless,
+            signed, 0, 0, p.dq_tbl, active_qm, t_dim.ctx, p.bitdepth, p.lossless,
         ) * dq_scale;
     } else {
         dc_sign_level = 1 << 6;

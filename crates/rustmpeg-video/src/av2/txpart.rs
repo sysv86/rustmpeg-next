@@ -621,17 +621,17 @@ mod tests {
         let (h_units, h_cnt) = expand_tx_partition(RectTxfmSize::Tx16x16, TxPartition::TxH4);
         assert_eq!(h_cnt, 4);
         for (k, u) in h_units.iter().enumerate() {
-            assert_eq!(u.tx, RectTxfmSize::Tx16x4);
+            assert_eq!(u.tx, RectTxfmSize::Rtx16x4);
             assert_eq!(u.x_px, 0);
             assert_eq!(u.y_px, k * 4);
             assert_eq!(u.w_px, 16);
             assert_eq!(u.h_px, 4);
         }
 
-        let (v_units, v_cnt) = expand_tx_partition(RectTxfmSize::Tx32x16, TxPartition::TxV4);
+        let (v_units, v_cnt) = expand_tx_partition(RectTxfmSize::Rtx32x16, TxPartition::TxV4);
         assert_eq!(v_cnt, 4);
         for (k, u) in v_units.iter().enumerate() {
-            assert_eq!(u.tx, RectTxfmSize::Tx8x16);
+            assert_eq!(u.tx, RectTxfmSize::Rtx8x16);
             assert_eq!(u.x_px, k * 8);
             assert_eq!(u.y_px, 0);
             assert_eq!(u.w_px, 8);

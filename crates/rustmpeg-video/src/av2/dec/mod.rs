@@ -304,8 +304,10 @@ impl<P: Pixel> Decoder<P> {
         let n_refs = (fh.n_ref_frames as usize).min(REFS_PER_FRAME);
         for r in 0..n_refs {
             gm_params[r] = fh.gmv.m[r].matrix;
-            let rslot = (fh.refidx[r] as usize).min(NUM_REF_FRAMES - 1);
-            ref_poc[r] = self.ref_info[rslot].poc;
+            let raw_slot = fh.refidx[r];
+            if raw_slot >= 0 && (raw_slot as usize) < NUM_REF_FRAMES {
+                ref_poc[r] = self.ref_info[raw_slot as usize].poc;
+            }
         }
         let ccso_planes = fh.ccso.planes;
         for (slot, entry) in self.ref_info.iter_mut().enumerate() {

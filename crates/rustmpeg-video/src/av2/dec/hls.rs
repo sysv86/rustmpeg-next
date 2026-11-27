@@ -675,11 +675,6 @@ pub fn parse_tile_group<'a>(
     parse_tile_group_with_refs(seq, obu, &[RefFrameInfo::default(); 16])
 }
 
-/// Parses a complete tile-group OBU payload with reference-slot metadata.
-///
-/// `ref_info[slot]` is used to derive `DerivedPrimaryRefFrame` when the frame
-/// header does not signal a primary reference (AV2 Spec v1.0.0 §5.18.1 and
-/// §7.8). The segmentation syntax depends on that derived value.
 /// Parsed slice of tiles from one `tile_group_obu()` (AV2 Spec v1.0.0 §5.19).
 pub struct ParsedTileGroupSlice<'a> {
     /// Frame header parsed from this OBU, when `frame_header_present_flag == 1`.
@@ -778,6 +773,11 @@ pub fn parse_tile_group_slice<'a>(
     })
 }
 
+/// Parses a complete tile-group OBU payload with reference-slot metadata.
+///
+/// `ref_info[slot]` is used to derive `DerivedPrimaryRefFrame` when the frame
+/// header does not signal a primary reference (AV2 Spec v1.0.0 §5.18.1 and
+/// §7.8). The segmentation syntax depends on that derived value.
 pub fn parse_tile_group_with_refs<'a>(
     seq: &SequenceHeader,
     obu: &Obu<'a>,
@@ -1131,7 +1131,13 @@ pub fn parse_frame_header(
         if fh.is_inter_or_switch() {
             for i in 0..fh.n_ref_frames as usize {
                 if br.get_bit()? != 0 {
-                    let slot = (fh.refidx[i] as usize).min(NUM_REF_FRAMES - 1);
+                    let raw_slot = fh.refidx[i];
+                    if raw_slot < 0 || (raw_slot as usize) >= NUM_REF_FRAMES {
+                        return Err(Av2Error::BitstreamError(format!(
+                            "reference-derived frame size has invalid slot {raw_slot}"
+                        )));
+                    }
+                    let slot = raw_slot as usize;
                     if !ref_info[slot].present
                         || ref_info[slot].width <= 0
                         || ref_info[slot].height <= 0
@@ -1440,7 +1446,7 @@ pub fn parse_frame_header(
         && fh.quant.vdc_delta <= 0
         && fh.quant.vac_delta <= 0;
     let n_seg = if fh.segmentation.enabled != 0 {
-        MAX_SEGMENTS
+        crate::av2::headers::SegmentationDataSet::max_segments(seq.segmentation.ext)
     } else {
         1
     };
@@ -1470,7 +1476,7 @@ pub fn parse_frame_header(
             } else {
                 let qm_num = fh.quant.qm.num.max(1) as usize;
                 let qm_idx = if qm_num > 1 {
-                    let bits = tile_log2(1, qm_num as i32) as usize;
+                    let bits = tile_log2(1, qm_num as i32) as u32;
                     br.get_bits(bits)? as usize
                 } else {
                     0
@@ -1794,7 +1800,7 @@ pub fn parse_frame_header(
                     if fh.ccso.planes[p].enabled == 0 {
                         continue;
                     }
-                    if fh.is_inter_or_switch() {
+                    if fh.frame_type == FrameType::Inter {
                         fh.ccso.planes[p].reuse = br.get_bit()? as u8;
                         fh.ccso.planes[p].sb_reuse = br.get_bit()? as u8;
                         if fh.ccso.planes[p].reuse != 0 || fh.ccso.planes[p].sb_reuse != 0 {
@@ -2154,23 +2160,32 @@ fn parse_global_motion_params(
     };
     fh.gmv.r#ref = our_ref as u8;
     if our_ref < n_refs {
-        let slot = (fh.refidx[our_ref] as usize).min(NUM_REF_FRAMES - 1);
-        let ref_n = (ref_info[slot].n_ref_frames as usize).min(REFS_PER_FRAME);
-        if ref_n > 0 {
-            let their_ref = br.get_uniform(ref_n as u32)? as usize;
-            fh.gmv.refref = their_ref as u8;
-            base_params = ref_info[slot].gm_params[their_ref];
-            let oh_our = ref_info[slot].poc;
-            let oh_their = ref_info[slot].ref_poc[their_ref];
-            base_dist = crate::av2::intops::get_poc_diff(seq.order_hint_n_bits, oh_our, oh_their);
+        let raw_slot = fh.refidx[our_ref];
+        if raw_slot >= 0 && (raw_slot as usize) < NUM_REF_FRAMES {
+            let slot = raw_slot as usize;
+            let ref_n = (ref_info[slot].n_ref_frames as usize).min(REFS_PER_FRAME);
+            if ref_n > 0 {
+                let their_ref = br.get_uniform(ref_n as u32)? as usize;
+                fh.gmv.refref = their_ref as u8;
+                base_params = ref_info[slot].gm_params[their_ref];
+                let oh_our = ref_info[slot].poc;
+                let oh_their = ref_info[slot].ref_poc[their_ref];
+                base_dist = get_poc_diff(seq.order_hint_n_bits as i32, oh_our, oh_their);
+            }
         }
     }
 
     let cur_poc = fh.frame_offset as i32;
     for r in 0..n_refs {
-        let slot = (fh.refidx[r] as usize).min(NUM_REF_FRAMES - 1);
+        let raw_slot = fh.refidx[r];
+        if raw_slot < 0 || (raw_slot as usize) >= NUM_REF_FRAMES {
+            fh.gmv.m[r].wm_type = WarpedMotionType::Identity;
+            fh.gmv.m[r].matrix = DEFAULT_WARP_PARAMS;
+            continue;
+        }
+        let slot = raw_slot as usize;
         let ref_poc = ref_info[slot].poc;
-        let dist = crate::av2::intops::get_poc_diff(seq.order_hint_n_bits, cur_poc, ref_poc);
+        let dist = get_poc_diff(seq.order_hint_n_bits as i32, cur_poc, ref_poc);
         if dist == 0 || !ref_info[slot].present {
             fh.gmv.m[r].wm_type = WarpedMotionType::Identity;
             fh.gmv.m[r].matrix = DEFAULT_WARP_PARAMS;
@@ -2388,7 +2403,7 @@ mod frame_header_tests {
     fn test_read_tile_info_non_uniform() {
         let mut pb = crate::av2::putbits::PutBits::new();
         // uniform_tile_spacing_flag = 0
-        pb.put_bits(0, 1);
+        pb.put_bits(1, 0);
         // 256x192 with 64x64 SBs -> sbw = 4, sbh = 3.
         // Columns: width 1 (ns(4) -> 0), width 2 (ns(3) -> 1), width 1 (ns(1) -> 0).
         pb.put_uniform(4, 0);
@@ -2397,7 +2412,7 @@ mod frame_header_tests {
         // Rows: height 1 (ns(3) -> 0), height 2 (ns(2) -> 1).
         pb.put_uniform(3, 0);
         pb.put_uniform(2, 1);
-        let bytes = pb.finish();
+        let bytes = pb.into_bytes();
 
         let mut br = BitReader::new(&bytes);
         let mut t = TileInfo::default();
