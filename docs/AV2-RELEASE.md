@@ -336,3 +336,35 @@ the VVC transform-selection flake described in the verdict, not an AV2 test.
   cache entries.
 - No `unsafe`, no new dependency, no native build step, and no third-party code
   was added by units 1–13.
+
+## Decoder expansion wave (2026-11-27, UNVERIFIED in sandbox)
+
+The following AV2 v1.0.0 decoder capabilities were implemented from the
+normative AV2 Specification v1.0.0 without adding dependencies or `unsafe`:
+
+- Sub-8x8 chroma propagation (`HasChroma`, `ChromaMiRow`, `ChromaMiCol`,
+  `ChromaMiSize`) across `decode_partition_node` and all leaf decoders
+  (intra, lossless intra, inter, IntraBC), plus `is_cfl_allowed` 32x32 gating
+  and chroma directional `uv_angle` propagation (§5.20.3.1, §5.20.5.6).
+- Normative quantization matrices (`setup_qm_params`, `SegQMLevel` per-segment
+  selection, `QmTables::for_level` wired into `CoefDecodeParams` and
+  `dequantize_coef`, §5.18.6.2, §7.15.1, §9.4).
+- Global motion parameter decoding (`global_motion_params`, `scale_warp_model`,
+  `read_global_param`, `setup_shear` validation) and `GLOBALMV` warped/MV
+  prediction (§5.18.9, §7.13.3).
+- Non-uniform tile layouts (`!uniform_tile_spacing_flag`), explicit frame tile
+  layouts, partial and multi-tile-group frame assembly (`parse_tile_group_slice`),
+  reference-derived frame sizes (`frame_size_with_refs`), frame-level DRL and
+  BVP DRL bit count changes, and CCSO parameter reuse (§5.18.2, §5.18.7.3,
+  §5.18.7.12, §5.19).
+- Transposed DIP prediction (§7.13.2.5), inter-intra and warp inter-intra wedge
+  blending (§7.13.3.14), sub-pixel IntraBC prediction (§7.13.3.1), multi-chunk
+  inter `lossless_tx_size`, 4-way transform partitions (`TxH4`/`TxV4`), and
+  IntraBC / intra transform partitioning (§5.20.6.3, §7.14.2).
+- Skip mode (`skip_mode_params`, `read_skip_mode`, `skip_drl_mode`, single and
+  compound average skip prediction, §5.18.8.2, §5.20.5.9).
+
+Verification status: **UNVERIFIED (SKIPPED)**. `cargo`, `rustc`, `dav2d`, and
+`avmenc` are unavailable in the authoring environment, so `cargo check`,
+`cargo clippy`, `cargo test`, `cargo fmt`, `scripts/check-licenses.py`, and
+external-oracle comparisons were not executed and must be run locally.

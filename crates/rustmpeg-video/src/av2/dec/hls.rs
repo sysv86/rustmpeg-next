@@ -2369,4 +2369,43 @@ mod frame_header_tests {
             }
         }
     }
+
+    #[test]
+    fn test_scale_warp_model_identity_and_scaling() {
+        let def = crate::av2::warp::DEFAULT_WARP_PARAMS;
+        assert_eq!(scale_warp_model(&def, 0, 2), def);
+        assert_eq!(scale_warp_model(&def, 1, 3), def);
+
+        let mut base = def;
+        base[0] = 16 << 13; // 16 * 1/8-pel translation
+        let doubled = scale_warp_model(&base, 1, 2);
+        assert_eq!(doubled[0], 32 << 13);
+        let negated = scale_warp_model(&base, -1, 1);
+        assert_eq!(negated[0], -(16 << 13));
+    }
+
+    #[test]
+    fn test_read_tile_info_non_uniform() {
+        let mut pb = crate::av2::putbits::PutBits::new();
+        // uniform_tile_spacing_flag = 0
+        pb.put_bits(0, 1);
+        // 256x192 with 64x64 SBs -> sbw = 4, sbh = 3.
+        // Columns: width 1 (ns(4) -> 0), width 2 (ns(3) -> 1), width 1 (ns(1) -> 0).
+        pb.put_uniform(4, 0);
+        pb.put_uniform(3, 1);
+        pb.put_uniform(1, 0);
+        // Rows: height 1 (ns(3) -> 0), height 2 (ns(2) -> 1).
+        pb.put_uniform(3, 0);
+        pb.put_uniform(2, 1);
+        let bytes = pb.finish();
+
+        let mut br = BitReader::new(&bytes);
+        let mut t = TileInfo::default();
+        read_tile_info(&mut br, &mut t, 0, 256, 192, 8, 0).unwrap();
+        assert!(!t.uniform);
+        assert_eq!(t.cols, 3);
+        assert_eq!(&t.col_start_sb[..4], &[0, 1, 3, 4]);
+        assert_eq!(t.rows, 2);
+        assert_eq!(&t.row_start_sb[..3], &[0, 1, 3]);
+    }
 }
