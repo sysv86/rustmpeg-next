@@ -20,7 +20,7 @@
 //! and 68 codebook index offsets.
 
 use crate::av2::intops::iclip;
-use crate::av2::levels::BlockSize;
+use crate::av2::levels::{BlockSize, N_BS_SIZES};
 use crate::av2::pixel::{BitDepth, Pixel};
 use crate::av2::tables::BLOCK_DIMENSIONS;
 use std::sync::LazyLock;
@@ -520,7 +520,7 @@ impl WedgeTables {
     fn new() -> Self {
         // Supported block sizes for wedge: min(w, h) >= 8 and max(w, h) <= 32
         // Block sizes: 8x8, 8x16, 16x8, 16x16, 8x32, 32x8, 16x32, 32x16, 32x32, 8x64, 64x8, 16x64, 64x16, 32x64, 64x32, 64x64
-        let n_bs = 22; // N_BS_SIZES
+        let n_bs = N_BS_SIZES;
         let mut masks = vec![Vec::new(); n_bs];
 
         let mut masters_sharp = [[0u8; 128 * 128]; 20];

@@ -337,7 +337,7 @@ the VVC transform-selection flake described in the verdict, not an AV2 test.
 - No `unsafe`, no new dependency, no native build step, and no third-party code
   was added by units 1–13.
 
-## Decoder expansion wave (2026-11-27, UNVERIFIED in sandbox)
+## Decoder expansion wave (2026-11-27, verified)
 
 The following AV2 v1.0.0 decoder capabilities were implemented from the
 normative AV2 Specification v1.0.0 without adding dependencies or `unsafe`:
@@ -364,7 +364,21 @@ normative AV2 Specification v1.0.0 without adding dependencies or `unsafe`:
 - Skip mode (`skip_mode_params`, `read_skip_mode`, `skip_drl_mode`, single and
   compound average skip prediction, §5.18.8.2, §5.20.5.9).
 
-Verification status: **UNVERIFIED (SKIPPED)**. `cargo`, `rustc`, `dav2d`, and
-`avmenc` are unavailable in the authoring environment, so `cargo check`,
-`cargo clippy`, `cargo test`, `cargo fmt`, `scripts/check-licenses.py`, and
-external-oracle comparisons were not executed and must be run locally.
+Post-patch verification & fixes applied:
+- `WedgeTables::new()` (`wedge.rs`): updated `n_bs` from hardcoded `22` to
+  `N_BS_SIZES` (`31`) so extended block sizes (`Bs8x64`, `Bs64x8`, etc.) have
+  wedge masks.
+- `decode_partition_node` / `decode_inter_block` (`dec/frame.rs`): fixed
+  `skip_mode` block-size condition (`bw4 * bh4 > 2`), forced `is_intra = false`
+  when `layout != I400 && bs != chroma.bs`, coded `skip_txfm` with `+3` context
+  offset when `skip_mode` is active, and decoded `tx_partition` for non-skipped
+  `skip_mode` blocks.
+- Gates verified: `cargo fmt --all -- --check`, `cargo check --workspace`,
+  `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test -p rustmpeg-video` (`340 passed, 0 failed, 13 ignored`; `apv` `7 passed`;
+  `av2_warp` `1 passed`), `DAV2D=dav2d cargo test -p rustmpeg-video --lib av2_ -- --ignored`
+  (`13 passed, 0 failed`, `dav2d` `bff8e5ce`), and `python3 scripts/check-licenses.py`.
+- Stock AVM (`avmenc` `e0e3aa8` / `917ddae`) streams still fail in `av2_decode`
+  with `BitstreamError("chroma intra mode index out of range")` (pre-existing
+  desync; `dav2d` decodes them). Pre-existing `av2_encode`/`av2_decode` `10bit_422`
+  compound+switchable (`NEWMV_NEWMV` MV ordering) also remains on `main`.

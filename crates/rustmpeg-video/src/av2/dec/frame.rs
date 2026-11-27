@@ -1534,7 +1534,7 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             && self.fh.skip_mode_enabled != 0
             && !seg_skip_pre
             && !forced_globalmv
-            && (bw4.min(bh4) >= 2 || is_thin_4xn_nx4_block(bw4, bh4))
+            && (bw4 * bh4 > 2)
             && self.fh.n_ref_frames >= 1
         {
             let top_sm = have_top && self.skip_mode_map[(by4 - 1) * self.frame_mi_w + bx4];
@@ -1562,6 +1562,10 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
 
         let is_intra = if inter_frame {
             if skip_mode || forced_globalmv {
+                false
+            } else if self.seq.layout != PixelLayout::I400 && bs != chroma.bs {
+                // Mixed-intra/inter regions in inter frames with chroma planes
+                // of different sizes are forced to inter (AV2 Spec v1.0.0 §5.20.5.9).
                 false
             } else {
                 let a_idx = ((bx4 - self.tile_col_start4) >> 5).min(self.a_cols.len() - 1);
@@ -1594,10 +1598,11 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             };
             self.decode_intra_block(bs, bx4, by4, tx, seg_id, chroma)
         } else {
-            // `read_skip()`: `skip_mode` or `SEG_LVL_SKIP` forces `skip_flag`
-            // to 1 and codes no symbol (§5.20.5.10).
+            // `read_skip()`: only `SEG_LVL_SKIP` forces `skip_flag` to 1 without
+            // coding a symbol; `skip_mode` still codes `skip_txfm` with offset +3
+            // (§5.20.5.10).
             let seg_skip = seg_enabled && self.seg_syntax.skip_feature(self.fh, seg_id);
-            let all_zero = if skip_mode || seg_skip {
+            let all_zero = if seg_skip {
                 true
             } else {
                 let a_idx = ((bx4 - self.tile_col_start4) >> 5).min(self.a_cols.len() - 1);
@@ -1613,7 +1618,7 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
                     self.tile_col_end4,
                     self.tile_row_end4,
                 );
-                let skip_ctx = nb.skip_ctx().min(5);
+                let skip_ctx = (nb.skip_ctx().min(2) + (skip_mode as usize) * 3).min(5);
                 self.msac.decode_bool_adapt(self.cdf.m.skip(skip_ctx))? != 0
             };
 
@@ -2853,7 +2858,10 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
         // segment codes 4x4 transforms inside it, everything else a single
         // transform of the plane block size.
         let (cw, ch) = if seg_lossless {
-            ((chroma_bw4 >> ss_x).max(1) * 4, (chroma_bh4 >> ss_y).max(1) * 4)
+            (
+                (chroma_bw4 >> ss_x).max(1) * 4,
+                (chroma_bh4 >> ss_y).max(1) * 4,
+            )
         } else {
             (uv_tdim.w as usize * 4, uv_tdim.h as usize * 4)
         };
@@ -3018,6 +3026,11 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             mv0 = cmv0;
             mv1 = cmv1;
             filter = 0;
+            if !all_zero {
+                let (p, full) = self.decode_tx_partition(bs, 0, 1, all_zero, seg_lossless)?;
+                tx_part = p;
+                tx_part_ll_full = full;
+            }
         } else if !is_comp {
             // Single-reference selection. A segment with `SEG_LVL_SKIP` or
             // `SEG_LVL_GLOBALMV` infers `SkipSegFrame` and `GLOBALMV` without
@@ -3597,13 +3610,14 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
             if let Some((iy, chroma)) = ii_saved {
                 if let Some(widx) = inter_intra_wedge {
                     // Wedge inter-intra blending (AV2 Spec v1.0.0 §7.13.3.14).
-                    let mask_y = WEDGE_TABLES
-                        .get_mask(bs, widx as usize, 0, 0)
-                        .ok_or_else(|| {
-                            Av2Error::BitstreamError(format!(
-                                "missing inter-intra luma wedge mask bs {bs:?} idx {widx}"
-                            ))
-                        })?;
+                    let mask_y =
+                        WEDGE_TABLES
+                            .get_mask(bs, widx as usize, 0, 0)
+                            .ok_or_else(|| {
+                                Av2Error::BitstreamError(format!(
+                                    "missing inter-intra luma wedge mask bs {bs:?} idx {widx}"
+                                ))
+                            })?;
                     let dp = &mut self.rec.planes[0];
                     let off = dp.offset(px_x, px_y);
                     blend_interintra(self.bd, &mut dp.data, off, dp.stride, &iy, mask_y, w, h);
@@ -3618,12 +3632,26 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
                         let dp = &mut self.rec.planes[1];
                         let off = dp.offset(cpx_x, cpx_y);
                         blend_interintra(
-                            self.bd, &mut dp.data, off, dp.stride, &iu, mask_c, cw, ch,
+                            self.bd,
+                            &mut dp.data,
+                            off,
+                            dp.stride,
+                            &iu,
+                            mask_c,
+                            cw,
+                            ch,
                         );
                         let dp = &mut self.rec.planes[2];
                         let off = dp.offset(cpx_x, cpx_y);
                         blend_interintra(
-                            self.bd, &mut dp.data, off, dp.stride, &iv, mask_c, cw, ch,
+                            self.bd,
+                            &mut dp.data,
+                            off,
+                            dp.stride,
+                            &iv,
+                            mask_c,
+                            cw,
+                            ch,
                         );
                     }
                 } else {
@@ -3636,13 +3664,27 @@ impl<'a, BD: BitDepth> TileDecoder<'a, BD> {
                         let dp = &mut self.rec.planes[1];
                         let off = dp.offset(cpx_x, cpx_y);
                         blend_interintra(
-                            self.bd, &mut dp.data, off, dp.stride, &iu, &mask_u, cw, ch,
+                            self.bd,
+                            &mut dp.data,
+                            off,
+                            dp.stride,
+                            &iu,
+                            &mask_u,
+                            cw,
+                            ch,
                         );
                         let mask_v = interintra_mask(inter_intra_mode, cw, ch);
                         let dp = &mut self.rec.planes[2];
                         let off = dp.offset(cpx_x, cpx_y);
                         blend_interintra(
-                            self.bd, &mut dp.data, off, dp.stride, &iv, &mask_v, cw, ch,
+                            self.bd,
+                            &mut dp.data,
+                            off,
+                            dp.stride,
+                            &iv,
+                            &mask_v,
+                            cw,
+                            ch,
                         );
                     }
                 }
