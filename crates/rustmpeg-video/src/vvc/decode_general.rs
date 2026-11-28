@@ -127,6 +127,15 @@ struct LumaCell {
     skip: bool,
     /// `inter_affine_flag` / `merge_subblock_flag` of the co-located CU.
     affine: bool,
+    /// Top-left corner of the owning coding unit (`pu.cu != neighbour.cu`).
+    cu_x: u16,
+    cu_y: u16,
+    /// `inter_pred_idc` (`1` = L0, `2` = L1, `3` = BI).
+    inter_dir: u8,
+    /// `ref_idx_l0` / `ref_idx_l1` (`-1` = unused).
+    ref_idx: [i8; 2],
+    /// Motion vectors in 1/16-pel units.
+    mv: [super::inter::Mv; 2],
 }
 
 #[derive(Clone, Copy, Default)]
@@ -385,6 +394,17 @@ struct Gen<'a> {
     num_ref_idx: [u8; 2],
     /// `slice->getBiDirPred()`: symmetric MVD is available for this picture.
     bidir_pred: bool,
+    /// HMVP table of the current CTU row (`HmvpCandList`).
+    hmvp: Vec<super::inter::InterMergeCand>,
+    /// Prediction planes of the inter coding unit being reconstructed.
+    pred_y: Plane16,
+    pred_u: Plane16,
+    pred_v: Plane16,
+    /// Active reference pictures of the slice, in list order.
+    refs_l0: Vec<super::inter::RefFrame>,
+    refs_l1: Vec<super::inter::RefFrame>,
+    /// `PicOrderCntVal` of the picture being decoded.
+    poc: i32,
     lmcs: Option<LmcsReshaper16>,
     lmcs_on: bool,
     sao: Vec<[filter::SaoType; 3]>,
@@ -438,6 +458,40 @@ impl<'a> Gen<'a> {
         c.valid.then_some(c)
     }
 
+    /// Motion state of the 4x4 unit at `(x, y)` (`cs.getPU(pos)`).
+    fn motion(&self, x: usize, y: usize) -> Option<MotionInfo> {
+        let c = self.lcell(x, y)?;
+        if c.intra {
+            return None;
+        }
+        Some(MotionInfo {
+            valid: true,
+            inter_dir: c.inter_dir,
+            ref_idx: c.ref_idx,
+            mv: c.mv,
+            cu_w: c.cu_w,
+            cu_h: c.cu_h,
+            skip: c.skip,
+            affine: c.affine,
+        })
+    }
+
+    /// `pu.cu != neighbour.cu`.
+    fn same_cu(&self, node: &Node, x: usize, y: usize) -> bool {
+        self.lcell(x, y)
+            .is_some_and(|c| usize::from(c.cu_x) == node.x && usize::from(c.cu_y) == node.y)
+    }
+
+    /// POC of the active reference `ref_idx` in `list`.
+    fn ref_poc(&self, list: usize, ref_idx: i8) -> Option<i32> {
+        let refs = if list == 0 {
+            &self.refs_l0
+        } else {
+            &self.refs_l1
+        };
+        refs.get(usize::try_from(ref_idx).ok()?).map(|r| r.poc)
+    }
+
     fn ccell(&self, x: usize, y: usize) -> Option<ChromaCell> {
         if x >= self.cgrid_w || y >= self.cgrid_h {
             return None;
@@ -487,6 +541,9 @@ impl<'a> Gen<'a> {
         qt: u8,
         skip: bool,
         affine: bool,
+        inter_dir: u8,
+        ref_idx: [i8; 2],
+        mv: [super::inter::Mv; 2],
     ) {
         for yy in y..(y + h).min(self.pic_h) {
             for xx in x..(x + w).min(self.pic_w) {
@@ -498,6 +555,11 @@ impl<'a> Gen<'a> {
                     intra: false,
                     skip,
                     affine,
+                    cu_x: x as u16,
+                    cu_y: y as u16,
+                    inter_dir,
+                    ref_idx,
+                    mv,
                     ..LumaCell::default()
                 };
             }
@@ -755,6 +817,9 @@ pub(crate) fn decode_general_picture(
     qp_joint: i32,
     num_ref_idx: [u8; 2],
     bidir_pred: bool,
+    refs_l0: Vec<super::inter::RefFrame>,
+    refs_l1: Vec<super::inter::RefFrame>,
+    poc: i32,
 ) -> Result<GeneralPicture, VvcError> {
     if sps.info.chroma_format_idc != 1 || !matches!(sps.info.bit_depth_luma, 8 | 10) {
         return Err(VvcError::Unsupported(
@@ -840,6 +905,13 @@ pub(crate) fn decode_general_picture(
         qp_joint,
         num_ref_idx,
         bidir_pred,
+        hmvp: Vec::new(),
+        pred_y: Plane16::new(pic_w, pic_h, bit_depth),
+        pred_u: Plane16::new(cgrid_w, cgrid_h, bit_depth),
+        pred_v: Plane16::new(cgrid_w, cgrid_h, bit_depth),
+        refs_l0,
+        refs_l1,
+        poc,
         lmcs,
         lmcs_on,
         sao: vec![[filter::SaoType::Off; 3]; ctu_cols * ctu_rows],
@@ -1557,6 +1629,323 @@ fn bcw_flag(dec: &mut BinDecoder<'_>, ctx: &mut CtxStore) -> u8 {
     PARSING_ORDER[idx]
 }
 
+/// Per-4x4 motion state (`MotionInfo` in VTM).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct MotionInfo {
+    valid: bool,
+    inter_dir: u8,
+    ref_idx: [i8; 2],
+    mv: [super::inter::Mv; 2],
+    skip: bool,
+    affine: bool,
+    cu_w: u16,
+    cu_h: u16,
+}
+
+impl MotionInfo {
+    fn field(&self, list: usize) -> super::inter::MvField {
+        super::inter::MvField::new(self.mv[list], self.ref_idx[list])
+    }
+    fn has(&self, list: usize) -> bool {
+        self.valid && (self.inter_dir & (1 << list)) != 0 && self.ref_idx[list] >= 0
+    }
+    fn same_motion(&self, o: &MotionInfo) -> bool {
+        self.inter_dir == o.inter_dir && self.ref_idx == o.ref_idx && self.mv == o.mv
+    }
+}
+
+/// `PU::isDiffMER()` (`UnitTools.cpp`).
+fn is_diff_mer(g: &Gen<'_>, x0: usize, y0: usize, x1: usize, y1: usize) -> bool {
+    let p = usize::from(g.sps.log2_parallel_merge_level_minus2) + 2;
+    (x0 >> p) != (x1 >> p) || (y0 >> p) != (y1 >> p)
+}
+
+/// `MV scaling` between two pictures (`H.266 §8.5.2.3`).
+fn scale_mv(mv: super::inter::Mv, td: i32, tr: i32) -> super::inter::Mv {
+    if td == 0 || tr == 0 || td == tr {
+        return mv;
+    }
+    let clip = |v: i64| -> i32 {
+        (v * i64::from(tr) / i64::from(td)).clamp(-(1 << 15), (1 << 15) - 1) as i32
+    };
+    super::inter::Mv::new(clip(i64::from(mv.hor)), clip(i64::from(mv.ver)))
+}
+
+/// Right shift from a coded AMVR precision to the internal 1/16-pel precision.
+///
+/// `Mv::m_amvrPrecision = { QUARTER, ONE, FOUR, HALF }` and
+/// `MvPrecision::INTERNAL == ONE + 4` (VTM `Mv.cpp:43-44`, `Mv.h:50-58`).
+fn amvr_shift(imv: u8) -> u32 {
+    match imv {
+        0 => 2, // 1/4 pel
+        1 => 4, // 1 pel
+        2 => 6, // 4 pel
+        3 => 3, // 1/2 pel
+        _ => 2,
+    }
+}
+
+/// `Mv::changeTransPrecAmvr2Internal`: coded MVD (1/4, 1, 4 or 1/2 pel) to
+/// internal 1/16-pel units.
+fn mvd_to_internal(mv: super::inter::Mv, imv: u8) -> super::inter::Mv {
+    let s = amvr_shift(imv);
+    super::inter::Mv::new(mv.hor << s, mv.ver << s)
+}
+
+/// `Mv::roundTransPrecInternal2Amvr`: truncate an internal MV to the AMVR grid.
+fn round_to_amvr(mv: super::inter::Mv, imv: u8) -> super::inter::Mv {
+    let s = amvr_shift(imv);
+    super::inter::Mv::new((mv.hor >> s) << s, (mv.ver >> s) << s)
+}
+
+/// `PU::getInterMergeCandidates()` (`UnitTools.cpp:1059-1700`).
+fn derive_merge_list(
+    g: &Gen<'_>,
+    node: &Node,
+    hmvp: &[super::inter::InterMergeCand],
+    col: Option<super::inter::InterMergeCand>,
+    is_b: bool,
+) -> Vec<super::inter::InterMergeCand> {
+    let max_cands = usize::from(g.sps.max_num_merge_cand).clamp(1, 6);
+    let (w, h, x, y) = (node.w, node.h, node.x, node.y);
+    let mut list: Vec<super::inter::InterMergeCand> = Vec::with_capacity(max_cands);
+    let push = |info: MotionInfo, list: &mut Vec<super::inter::InterMergeCand>| {
+        if list.len() >= max_cands {
+            return;
+        }
+        let mut c = super::inter::InterMergeCand {
+            inter_dir: info.inter_dir,
+            mv_field: [info.field(0), info.field(1)],
+            bcw_idx: 2,
+            use_alt_hpel_if: false,
+        };
+        if !is_b {
+            c.inter_dir &= 1;
+            c.mv_field[1] = super::inter::MvField::default();
+        }
+        if c.inter_dir != 0 {
+            list.push(c);
+        }
+    };
+
+    let b1 = if y > 0 {
+        g.motion(x + w - 1, y - 1)
+    } else {
+        None
+    }
+    .filter(|m| {
+        !m.affine && is_diff_mer(g, x, y, x + w - 1, y - 1) && !g.same_cu(node, x + w - 1, y - 1)
+    });
+    let a1 = if x > 0 {
+        g.motion(x - 1, y + h - 1)
+    } else {
+        None
+    }
+    .filter(|m| {
+        !m.affine && is_diff_mer(g, x, y, x - 1, y + h - 1) && !g.same_cu(node, x - 1, y + h - 1)
+    });
+    if let Some(m) = b1 {
+        push(m, &mut list);
+    }
+    if list.len() < max_cands {
+        if let Some(m) = a1 {
+            if b1.map_or(true, |b| !b.same_motion(&m)) {
+                push(m, &mut list);
+            }
+        }
+    }
+    if list.len() == max_cands {
+        return list;
+    }
+
+    let b0 = if y > 0 { g.motion(x + w, y - 1) } else { None }
+        .filter(|m| !m.affine && is_diff_mer(g, x, y, x + w, y - 1));
+    if let Some(m) = b0 {
+        if b1.map_or(true, |b| !b.same_motion(&m)) {
+            push(m, &mut list);
+        }
+    }
+    if list.len() == max_cands {
+        return list;
+    }
+    let a0 = if x > 0 { g.motion(x - 1, y + h) } else { None }
+        .filter(|m| !m.affine && is_diff_mer(g, x, y, x - 1, y + h));
+    if let Some(m) = a0 {
+        if a1.map_or(true, |a| !a.same_motion(&m)) {
+            push(m, &mut list);
+        }
+    }
+    if list.len() == max_cands {
+        return list;
+    }
+
+    if list.len() < 4 {
+        let b2 = if x > 0 && y > 0 {
+            g.motion(x - 1, y - 1)
+        } else {
+            None
+        }
+        .filter(|m| !m.affine && is_diff_mer(g, x, y, x - 1, y - 1));
+        if let Some(m) = b2 {
+            let da = a1.map_or(true, |a| !a.same_motion(&m));
+            let db = b1.map_or(true, |b| !b.same_motion(&m));
+            if da && db {
+                push(m, &mut list);
+            }
+        }
+    }
+    if list.len() == max_cands {
+        return list;
+    }
+
+    // TMVP (`H.266 §8.5.2.11`): not available for 4x8/8x4 units.
+    if g.ph.temporal_mvp_enabled && w + h > 12 {
+        if let Some(m) = col {
+            if list.len() < max_cands {
+                list.push(m);
+            }
+        }
+    }
+    if list.len() == max_cands {
+        return list;
+    }
+
+    for c in hmvp.iter().rev() {
+        if list.len() >= max_cands.saturating_sub(1) {
+            break;
+        }
+        let dup = |n: Option<MotionInfo>| {
+            n.is_some_and(|n| {
+                n.inter_dir == c.inter_dir
+                    && [n.ref_idx[0], n.ref_idx[1]]
+                        == [c.mv_field[0].ref_idx, c.mv_field[1].ref_idx]
+            })
+        };
+        if !dup(a1) && !dup(b1) {
+            list.push(*c);
+        }
+    }
+
+    if list.len() >= 2 && list.len() < max_cands {
+        let (c0, c1) = (list[0], list[1]);
+        let mut avg = super::inter::InterMergeCand {
+            inter_dir: 0,
+            mv_field: [super::inter::MvField::default(); 2],
+            bcw_idx: 2,
+            use_alt_hpel_if: false,
+        };
+        for l in 0..if is_b { 2 } else { 1 } {
+            let (f0, f1) = (c0.mv_field[l], c1.mv_field[l]);
+            if f0.is_valid() && f1.is_valid() && f0.ref_idx == f1.ref_idx {
+                avg.mv_field[l] = super::inter::MvField::new(
+                    super::inter::Mv::new((f0.mv.hor + f1.mv.hor) / 2, (f0.mv.ver + f1.mv.ver) / 2),
+                    f0.ref_idx,
+                );
+                avg.inter_dir |= 1 << l;
+            } else if f0.is_valid() {
+                avg.mv_field[l] = f0;
+                avg.inter_dir |= 1 << l;
+            } else if f1.is_valid() {
+                avg.mv_field[l] = f1;
+                avg.inter_dir |= 1 << l;
+            }
+        }
+        if avg.inter_dir != 0 {
+            list.push(avg);
+        }
+    }
+
+    while list.len() < max_cands {
+        let i = list.len();
+        let mut c = super::inter::InterMergeCand {
+            inter_dir: if is_b { 3 } else { 1 },
+            mv_field: [super::inter::MvField::default(); 2],
+            bcw_idx: 2,
+            use_alt_hpel_if: false,
+        };
+        let r0 = i.min(usize::from(g.num_ref_idx[0].saturating_sub(1))) as i8;
+        c.mv_field[0] = super::inter::MvField::new(super::inter::Mv::default(), r0);
+        if is_b {
+            let r1 = i.min(usize::from(g.num_ref_idx[1].saturating_sub(1))) as i8;
+            c.mv_field[1] = super::inter::MvField::new(super::inter::Mv::default(), r1);
+        }
+        list.push(c);
+    }
+    list
+}
+
+/// `PU::fillMvpCand()` (`UnitTools.cpp`): left/above spatial candidates with MV
+/// scaling, then HMVP, then zero.
+fn derive_amvp_list(
+    g: &Gen<'_>,
+    node: &Node,
+    list_idx: usize,
+    ref_idx: usize,
+    hmvp: &[super::inter::InterMergeCand],
+    imv: u8,
+) -> [super::inter::Mv; 2] {
+    let (w, h, x, y) = (node.w, node.h, node.x, node.y);
+    let cur = g.poc;
+    let target = g.ref_poc(list_idx, ref_idx as i8).unwrap_or(cur);
+    let mut out: Vec<super::inter::Mv> = Vec::with_capacity(2);
+    let add = |m: Option<MotionInfo>, out: &mut Vec<super::inter::Mv>| {
+        let Some(m) = m else { return false };
+        if !m.has(list_idx) {
+            return false;
+        }
+        let src = g.ref_poc(list_idx, m.ref_idx[list_idx]).unwrap_or(target);
+        let mv = scale_mv(
+            m.mv[list_idx],
+            (src - cur).abs().max(1),
+            (target - cur).abs().max(1),
+        );
+        if !out.contains(&mv) {
+            out.push(mv);
+            return true;
+        }
+        false
+    };
+    if x > 0 {
+        for &dy in &[h - 1, h - 1 - 4] {
+            if add(g.motion(x - 1, y + dy), &mut out) || out.len() >= 2 {
+                break;
+            }
+            if dy < 4 {
+                break;
+            }
+        }
+    }
+    if out.len() < 2 && y > 0 {
+        for &dx in &[w - 1, w - 1 - 4] {
+            if add(g.motion(x + dx, y - 1), &mut out) || out.len() >= 2 {
+                break;
+            }
+            if dx < 4 {
+                break;
+            }
+        }
+    }
+    for c in hmvp.iter().rev() {
+        if out.len() >= 2 {
+            break;
+        }
+        let f = c.mv_field[list_idx];
+        if f.is_valid() && !out.contains(&f.mv) {
+            out.push(f.mv);
+        }
+    }
+    for mv in &mut out {
+        *mv = round_to_amvr(*mv, imv);
+    }
+    if out.len() >= 2 && out[0] == out[1] {
+        out.truncate(1);
+    }
+    while out.len() < 2 {
+        out.push(super::inter::Mv::default());
+    }
+    [out[0], out[1]]
+}
+
 /// Parse one inter coding unit.
 ///
 /// The prediction and residual reconstruction of inter coding units is the
@@ -1751,8 +2140,30 @@ fn decode_inter_cu(
                 node.x, node.y, w, h, cu.skip, cu.merge, cu.inter_dir
             );
         }
-        g.set_lcell_inter(node.x, node.y, w, h, node.qt_depth, cu.skip, cu.affine);
-        return inter_reconstruction_placeholder(&cu);
+        let mut plan = CuPlan {
+            tree: node.tree,
+            x: node.x,
+            w,
+            h,
+            qp_y: g.qp_y,
+            qp_cb: g.qp_cb,
+            qp_cr: g.qp_cr,
+            mode: 0,
+            mip: None,
+            isp: predict::IspMode::None,
+            mrl: 0,
+            bdpcm_l: 0,
+            bdpcm_c: 0,
+            chroma_mode: 0,
+            lfnst_mode_c: 0,
+            lfnst: 0,
+            mts: 0,
+            implicit_mts: false,
+            dep_quant: g.sh.dep_quant_used,
+            sbt: 0,
+            intra: false,
+        };
+        return reconstruct_inter_cu(g, &node, &cu, &mut plan, &[]);
     }
 
     // A skip coding unit carries no residual syntax: `coding_unit()` returns
@@ -1765,8 +2176,30 @@ fn decode_inter_cu(
                 node.x, node.y, w, h, cu.merge, cu.affine, cu.mmvd, cu.merge_idx
             );
         }
-        g.set_lcell_inter(node.x, node.y, w, h, node.qt_depth, true, cu.affine);
-        return inter_reconstruction_placeholder(&cu);
+        let mut plan = CuPlan {
+            tree: node.tree,
+            x: node.x,
+            w,
+            h,
+            qp_y: g.qp_y,
+            qp_cb: g.qp_cb,
+            qp_cr: g.qp_cr,
+            mode: 0,
+            mip: None,
+            isp: predict::IspMode::None,
+            mrl: 0,
+            bdpcm_l: 0,
+            bdpcm_c: 0,
+            chroma_mode: 0,
+            lfnst_mode_c: 0,
+            lfnst: 0,
+            mts: 0,
+            implicit_mts: false,
+            dep_quant: g.sh.dep_quant_used,
+            sbt: 0,
+            intra: false,
+        };
+        return reconstruct_inter_cu(g, &node, &cu, &mut plan, &[]);
     }
 
     // `sbt_mode()`
@@ -1838,8 +2271,307 @@ fn decode_inter_cu(
             sbt
         );
     }
-    g.set_lcell_inter(node.x, node.y, w, h, node.qt_depth, cu.skip, cu.affine);
-    inter_reconstruction_placeholder(&cu)
+    reconstruct_inter_cu(g, &node, &cu, &mut plan, &tus)
+}
+
+/// Finish an inter coding unit: a unit without residual (skip or
+/// `rqt_root_cbf == 0`) has no transform unit, so its prediction must be copied
+/// into the picture; the others add their residual on top of it.
+fn finish_inter(
+    g: &mut Gen<'_>,
+    node: &Node,
+    plan: &mut CuPlan,
+    tus: &[TuData],
+) -> Result<(), VvcError> {
+    if tus.is_empty() {
+        apply_prediction(g, node);
+    }
+    reconstruct_tus(g, plan, tus)
+}
+
+/// Copy the stored prediction of a residual-free inter coding unit into the
+/// picture and mark the samples as decoded.
+fn apply_prediction(g: &mut Gen<'_>, node: &Node) {
+    let (w, h) = (node.w, node.h);
+    let (cw, ch) = (w / 2, h / 2);
+    for j in 0..h {
+        for i in 0..w {
+            let v = g.pred_y.get(node.x + i, node.y + j);
+            g.y.set(node.x + i, node.y + j, v);
+        }
+    }
+    for j in 0..ch {
+        for i in 0..cw {
+            let u = g.pred_u.get(node.x / 2 + i, node.y / 2 + j);
+            let v = g.pred_v.get(node.x / 2 + i, node.y / 2 + j);
+            g.u.set(node.x / 2 + i, node.y / 2 + j, u);
+            g.v.set(node.x / 2 + i, node.y / 2 + j, v);
+        }
+    }
+    for yy in node.y..(node.y + h).min(g.pic_h) {
+        for xx in node.x..(node.x + w).min(g.pic_w) {
+            g.dec_y[(yy / 4) * g.lgrid_w + xx / 4] = true;
+        }
+    }
+    for yy in (node.y / 2)..(node.y / 2 + ch).min(g.cgrid_h) {
+        for xx in (node.x / 2)..(node.x / 2 + cw).min(g.cgrid_w) {
+            g.dec_c[yy * g.cgrid_w + xx] = true;
+        }
+    }
+}
+
+/// Luma, Cb and Cr prediction samples of one coding unit.
+type CuPrediction = (Vec<i32>, Vec<i32>, Vec<i32>);
+
+/// Motion compensation of one candidate into `(y, u, v)` predictions
+/// (`InterPrediction::motionCompensation`).
+fn mc_block(
+    g: &Gen<'_>,
+    node: &Node,
+    cand: &super::inter::InterMergeCand,
+    bdof: bool,
+    dmvr: bool,
+) -> Result<CuPrediction, VvcError> {
+    let r0: Vec<&super::inter::RefFrame> = g.refs_l0.iter().collect();
+    let r1: Vec<&super::inter::RefFrame> = g.refs_l1.iter().collect();
+    if (cand.inter_dir & 1) != 0
+        && cand.mv_field[0].ref_idx >= 0
+        && cand.mv_field[0].ref_idx as usize >= r0.len()
+    {
+        return Err(VvcError::Bitstream(
+            "missing L0 reference picture".to_string(),
+        ));
+    }
+    if (cand.inter_dir & 2) != 0
+        && cand.mv_field[1].ref_idx >= 0
+        && cand.mv_field[1].ref_idx as usize >= r1.len()
+    {
+        return Err(VvcError::Bitstream(
+            "missing L1 reference picture".to_string(),
+        ));
+    }
+    // All motion vectors in the inter reconstruction state are kept in the
+    // internal 1/16-pel precision expected by the interpolation kernels; AMVR
+    // conversion happens once when the coded MVD is added to the predictor.
+    Ok(super::inter::predict_inter_pu(
+        cand, &r0, &r1, g.poc, node.x, node.y, node.w, node.h, bdof, dmvr,
+    ))
+}
+
+/// Store the prediction of the current coding unit in the `pred_*` planes.
+fn write_prediction(g: &mut Gen<'_>, node: &Node, py: &[i32], pcb: &[i32], pcr: &[i32]) {
+    let max = (1i32 << g.bit_depth) - 1;
+    let (cw, ch) = (node.w / 2, node.h / 2);
+    for j in 0..node.h {
+        for i in 0..node.w {
+            g.pred_y.set(
+                node.x + i,
+                node.y + j,
+                py[j * node.w + i].clamp(0, max) as u16,
+            );
+        }
+    }
+    for j in 0..ch {
+        for i in 0..cw {
+            g.pred_u.set(
+                node.x / 2 + i,
+                node.y / 2 + j,
+                pcb[j * cw + i].clamp(0, max) as u16,
+            );
+            g.pred_v.set(
+                node.x / 2 + i,
+                node.y / 2 + j,
+                pcr[j * cw + i].clamp(0, max) as u16,
+            );
+        }
+    }
+}
+
+/// Resolve the motion vector(s) of an inter coding unit, run motion
+/// compensation into `pred_{y,u,v}` and reconstruct the residual on top.
+fn reconstruct_inter_cu(
+    g: &mut Gen<'_>,
+    node: &Node,
+    cu: &InterCu,
+    plan: &mut CuPlan,
+    tus: &[TuData],
+) -> Result<(), VvcError> {
+    let is_b_slice = g.sh.slice_type == super::hls::VvcSliceType::B;
+    let trace_cu = std::env::var_os("VVC_MV_TRACE").is_some() && node.y < 64 && node.x < 64;
+    if cu.affine {
+        // Subblock merge (`H.266 §8.5.3`). The candidate list starts with
+        // SbTMVP (requires a collocated *inter* picture) and the inherited
+        // affine candidates of the neighbours; when none is available VTM pads
+        // with zero MVs and reference index 0 (`UnitTools.cpp`, zero padding in
+        // `PU::getAffineMergeCand`).
+        let cand = super::inter::InterMergeCand {
+            inter_dir: if is_b_slice { 3 } else { 1 },
+            mv_field: [
+                super::inter::MvField::new(super::inter::Mv::default(), 0),
+                super::inter::MvField::new(super::inter::Mv::default(), 0),
+            ],
+            bcw_idx: 2,
+            use_alt_hpel_if: false,
+        };
+        let (py, pcb, pcr) = mc_block(g, node, &cand, false, false)?;
+        write_prediction(g, node, &py, &pcb, &pcr);
+        g.set_lcell_inter(
+            node.x,
+            node.y,
+            node.w,
+            node.h,
+            node.qt_depth,
+            cu.skip,
+            true,
+            cand.inter_dir,
+            [0, 0],
+            [cand.mv_field[0].mv, cand.mv_field[1].mv],
+        );
+        return finish_inter(g, node, plan, tus);
+    }
+    if cu.ciip {
+        return Err(VvcError::Unsupported("inter coding unit with CIIP"));
+    }
+    let is_b = g.sh.slice_type == super::hls::VvcSliceType::B;
+    if cu.geo {
+        // Geometric partitioning (`H.266 §8.5.7`): blend two uni/bi
+        // predictions with the split-direction mask; BDOF and DMVR are
+        // disabled for these coding units.
+        let hmvp = g.hmvp.clone();
+        let list = derive_merge_list(g, node, &hmvp, None, is_b);
+        let pick = |idx: u8| {
+            list.get(usize::from(idx)).copied().unwrap_or_else(|| {
+                *list
+                    .first()
+                    .unwrap_or(&super::inter::InterMergeCand::default())
+            })
+        };
+        let c0 = pick(cu.geo_cand[0]);
+        let c1 = pick(cu.geo_cand[1]);
+        let (y0, u0, v0) = mc_block(g, node, &c0, false, false)?;
+        let (y1, u1, v1) = mc_block(g, node, &c1, false, false)?;
+        let (cw, ch) = (node.w / 2, node.h / 2);
+        let py =
+            super::inter::predict_gpm_block(&y0, &y1, node.w, node.h, cu.geo_split_dir, true, 1, 1);
+        let pcb = super::inter::predict_gpm_block(&u0, &u1, cw, ch, cu.geo_split_dir, false, 2, 2);
+        let pcr = super::inter::predict_gpm_block(&v0, &v1, cw, ch, cu.geo_split_dir, false, 2, 2);
+        let cand = c0;
+        write_prediction(g, node, &py, &pcb, &pcr);
+        g.set_lcell_inter(
+            node.x,
+            node.y,
+            node.w,
+            node.h,
+            node.qt_depth,
+            cu.skip,
+            cu.affine,
+            cand.inter_dir,
+            [cand.mv_field[0].ref_idx, cand.mv_field[1].ref_idx],
+            [cand.mv_field[0].mv, cand.mv_field[1].mv],
+        );
+        g.hmvp.push(cand);
+        return finish_inter(g, node, plan, tus);
+    }
+    let cand = if cu.merge {
+        let hmvp = g.hmvp.clone();
+        let list = derive_merge_list(g, node, &hmvp, None, is_b);
+        list.get(usize::from(cu.merge_idx))
+            .copied()
+            .unwrap_or_else(|| {
+                *list
+                    .first()
+                    .unwrap_or(&super::inter::InterMergeCand::default())
+            })
+    } else {
+        let mut c = super::inter::InterMergeCand {
+            inter_dir: cu.inter_dir,
+            mv_field: [super::inter::MvField::default(); 2],
+            bcw_idx: cu.bcw,
+            use_alt_hpel_if: cu.imv == 3,
+        };
+        for l in 0..2usize {
+            if cu.inter_dir & (1 << l) == 0 {
+                continue;
+            }
+            if l == 1 && cu.smvd != 0 {
+                continue;
+            }
+            let ref_idx = cu.ref_idx[l].max(0);
+            let mvp = derive_amvp_list(g, node, l, ref_idx as usize, &g.hmvp, cu.imv)[0];
+            if std::env::var_os("VVC_MV_TRACE").is_some() && node.x < 40 && node.y < 8 {
+                eprintln!(
+                    "mvp pos=({},{}) l={} ref={} mvp=({},{}) mvd=({},{})",
+                    node.x, node.y, l, ref_idx, mvp.hor, mvp.ver, cu.mvd[l].hor, cu.mvd[l].ver
+                );
+            }
+            let mvd = mvd_to_internal(cu.mvd[l], cu.imv);
+            c.mv_field[l] = super::inter::MvField::new(
+                super::inter::Mv::new(mvp.hor + mvd.hor, mvp.ver + mvd.ver),
+                ref_idx,
+            );
+        }
+        if cu.smvd != 0 {
+            let cur = usize::from(cu.smvd - 1);
+            let other = 1 - cur;
+            let f = c.mv_field[cur];
+            let sym_ref = if other == 1 { 0 } else { 0 };
+            c.mv_field[other] =
+                super::inter::MvField::new(super::inter::Mv::new(-f.mv.hor, -f.mv.ver), sym_ref);
+            c.inter_dir = 3;
+        }
+        c
+    };
+
+    if trace_cu {
+        let list = derive_merge_list(g, node, &g.hmvp.clone(), None, is_b_slice);
+        eprintln!(
+            "mvcu pos=({},{}) size={}x{} skip={} merge={} midx={} dir={} ref={:?} mv=[({},{}),({},{})] cands={:?}",
+            node.x,
+            node.y,
+            node.w,
+            node.h,
+            cu.skip,
+            cu.merge,
+            cu.merge_idx,
+            cand.inter_dir,
+            [cand.mv_field[0].ref_idx, cand.mv_field[1].ref_idx],
+            cand.mv_field[0].mv.hor,
+            cand.mv_field[0].mv.ver,
+            cand.mv_field[1].mv.hor,
+            cand.mv_field[1].mv.ver,
+            list.iter()
+                .take(6)
+                .map(|c| (
+                    c.inter_dir,
+                    c.mv_field[0].ref_idx,
+                    c.mv_field[0].mv.hor,
+                    c.mv_field[0].mv.ver
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+    // Motion compensation (`InterPrediction::motionCompensation`).
+    let bdof = g.sps.bdof_enabled && !g.ph.bdof_disabled;
+    let dmvr = g.sps.dmvr_enabled && !g.ph.dmvr_disabled && cu.merge;
+    let (py, pcb, pcr) = mc_block(g, node, &cand, bdof, dmvr)?;
+    write_prediction(g, node, &py, &pcb, &pcr);
+
+    g.set_lcell_inter(
+        node.x,
+        node.y,
+        node.w,
+        node.h,
+        node.qt_depth,
+        cu.skip,
+        cu.affine,
+        cand.inter_dir,
+        [cand.mv_field[0].ref_idx, cand.mv_field[1].ref_idx],
+        [cand.mv_field[0].mv, cand.mv_field[1].mv],
+    );
+    g.hmvp.push(cand);
+    // Residual on top of the inter prediction (`reconstruct_tus` reads the
+    // prediction from the `pred_*` planes when `plan.intra == false`).
+    finish_inter(g, node, plan, tus)
 }
 
 /// `ref_idx_l0/l1` (`H.266 §7.3.8.7`, VTM `CABACReader::ref_idx`).
@@ -1976,22 +2708,6 @@ fn decode_inter_mts(
         }
     }
     plan.mts = v;
-}
-
-/// Report that inter reconstruction is not implemented yet.
-///
-/// `VVC_INTER_SYNTAX_ONLY=1` turns this into a no-op so that the CABAC
-/// synchronisation of the inter pictures can be verified against VTM while the
-/// motion-compensation stage is missing. The pixel output of that mode is
-/// meaningless and the frame is dropped.
-fn inter_reconstruction_placeholder(cu: &InterCu) -> Result<(), VvcError> {
-    if std::env::var_os("VVC_INTER_SYNTAX_ONLY").is_some() {
-        return Ok(());
-    }
-    let _ = cu;
-    Err(VvcError::Unsupported(
-        "inter coding unit reconstruction (motion compensation)",
-    ))
 }
 
 fn decode_cu_luma(
@@ -3642,6 +4358,15 @@ fn predict_luma(
     h: usize,
     mode: u8,
 ) -> Vec<i32> {
+    if !plan.intra {
+        let mut out = Vec::with_capacity(w * h);
+        for j in 0..h {
+            for i in 0..w {
+                out.push(i32::from(g.pred_y.get(x + i, y + j)));
+            }
+        }
+        return out;
+    }
     if plan.bdpcm_l != 0 {
         let refs = g.gather_avail(true, x, y, w, h);
         return predict::predict_bdpcm(&refs, w, h, plan.bdpcm_l == 2);
@@ -3718,6 +4443,16 @@ fn predict_chroma(
     h: usize,
     mode: u8,
 ) -> Vec<i32> {
+    if !_plan.intra {
+        let src = if component == 1 { &g.pred_u } else { &g.pred_v };
+        let mut out = Vec::with_capacity(w * h);
+        for j in 0..h {
+            for i in 0..w {
+                out.push(i32::from(src.get(x + i, y + j)));
+            }
+        }
+        return out;
+    }
     let plane = if component == 1 { &g.u } else { &g.v };
     if (81..=83).contains(&mode) {
         let cclm = match mode {

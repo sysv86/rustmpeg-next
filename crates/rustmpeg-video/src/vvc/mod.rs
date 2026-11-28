@@ -2285,6 +2285,9 @@ impl VvcDecoder {
                                 qp_joint,
                                 sh.num_ref_idx_active,
                                 bidir_pred,
+                                ref_l0.iter().map(|r| (*r).clone()).collect(),
+                                ref_l1.iter().map(|r| (*r).clone()).collect(),
+                                slice_poc,
                             )?;
                             let wy = gp.y.width as u32;
                             let hy = gp.y.height as u32;

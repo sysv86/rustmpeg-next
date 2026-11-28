@@ -1765,6 +1765,8 @@ pub struct VvcSps {
     pub gpm_enabled: bool,
     /// `MaxNumGpmMergeCand`.
     pub max_num_gpm_cand: u8,
+    /// `sps_log2_parallel_merge_level_minus2`.
+    pub log2_parallel_merge_level_minus2: u8,
     /// `sps_isp_enabled_flag`.
     pub isp_enabled: bool,
     /// `sps_mrl_enabled_flag`.
@@ -2048,7 +2050,7 @@ pub fn parse_full_sps_rbsp(rbsp: &[u8]) -> Result<VvcSps, VvcError> {
             };
         }
     }
-    let _log2_par_merge = sps_bit(br.read_ue())?;
+    let log2_parallel_merge_level_minus2 = sps_bit(br.read_ue())?.min(6) as u8;
     let isp_enabled = sps_bit(br.read_bit())?;
     let mrl_enabled = sps_bit(br.read_bit())?;
     let mip_enabled = sps_bit(br.read_bit())?;
@@ -2169,6 +2171,7 @@ pub fn parse_full_sps_rbsp(rbsp: &[u8]) -> Result<VvcSps, VvcError> {
         ciip_enabled,
         gpm_enabled,
         max_num_gpm_cand,
+        log2_parallel_merge_level_minus2,
         isp_enabled,
         mrl_enabled,
         mip_enabled,
