@@ -136,6 +136,8 @@ struct LumaCell {
     ref_idx: [i8; 2],
     /// Motion vectors in 1/16-pel units.
     mv: [super::inter::Mv; 2],
+    /// CU-level BCW weight index for bi-prediction.
+    bcw: u8,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -475,6 +477,7 @@ impl<'a> Gen<'a> {
             inter_dir: c.inter_dir,
             ref_idx: c.ref_idx,
             mv: c.mv,
+            bcw: c.bcw,
             cu_w: c.cu_w,
             cu_h: c.cu_h,
             skip: c.skip,
@@ -550,6 +553,7 @@ impl<'a> Gen<'a> {
         inter_dir: u8,
         ref_idx: [i8; 2],
         mv: [super::inter::Mv; 2],
+        bcw: u8,
     ) {
         for yy in y..(y + h).min(self.pic_h) {
             for xx in x..(x + w).min(self.pic_w) {
@@ -566,6 +570,7 @@ impl<'a> Gen<'a> {
                     inter_dir,
                     ref_idx,
                     mv,
+                    bcw,
                     ..LumaCell::default()
                 };
             }
@@ -1730,6 +1735,7 @@ struct MotionInfo {
     inter_dir: u8,
     ref_idx: [i8; 2],
     mv: [super::inter::Mv; 2],
+    bcw: u8,
     skip: bool,
     affine: bool,
     cu_w: u16,
@@ -1966,7 +1972,11 @@ fn derive_merge_list(
         let mut c = super::inter::InterMergeCand {
             inter_dir: info.inter_dir,
             mv_field: [info.field(0), info.field(1)],
-            bcw_idx: 2,
+            bcw_idx: if info.inter_dir == 3 {
+                info.bcw
+            } else {
+                super::inter::BCW_DEFAULT
+            },
             use_alt_hpel_if: false,
         };
         if !is_b {
@@ -2692,6 +2702,7 @@ fn reconstruct_inter_cu(
             cand.inter_dir,
             [0, 0],
             [cand.mv_field[0].mv, cand.mv_field[1].mv],
+            cand.bcw_idx,
         );
         return finish_inter(g, node, plan, tus);
     }
@@ -2735,6 +2746,7 @@ fn reconstruct_inter_cu(
             cand.inter_dir,
             [cand.mv_field[0].ref_idx, cand.mv_field[1].ref_idx],
             [cand.mv_field[0].mv, cand.mv_field[1].mv],
+            cand.bcw_idx,
         );
         return finish_inter(g, node, plan, tus);
     }
@@ -2849,6 +2861,7 @@ fn reconstruct_inter_cu(
         cand.inter_dir,
         [cand.mv_field[0].ref_idx, cand.mv_field[1].ref_idx],
         [cand.mv_field[0].mv, cand.mv_field[1].mv],
+        cand.bcw_idx,
     );
     push_hmvp(g, node, cand);
     // Residual on top of the inter prediction (`reconstruct_tus` reads the
