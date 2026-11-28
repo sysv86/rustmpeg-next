@@ -2060,21 +2060,26 @@ fn derive_merge_list(
         return list;
     }
 
-    for c in hmvp.iter().rev() {
+    // `addMergeHmvpCand` (`UnitTools.cpp:838-929`): only the two newest
+    // history entries are pruned against A1/B1; older ones are always added.
+    for (mrg_idx, c) in hmvp.iter().rev().enumerate() {
         if list.len() >= max_cands.saturating_sub(1) {
             break;
         }
-        let dup = |n: Option<MotionInfo>| {
-            n.is_some_and(|n| {
-                n.inter_dir == c.inter_dir
-                    && [n.ref_idx[0], n.ref_idx[1]]
-                        == [c.mv_field[0].ref_idx, c.mv_field[1].ref_idx]
-                    && n.mv == [c.mv_field[0].mv, c.mv_field[1].mv]
-            })
-        };
-        if !dup(a1) && !dup(b1) {
-            list.push(*c);
+        if mrg_idx < 2 {
+            let dup = |n: Option<MotionInfo>| {
+                n.is_some_and(|n| {
+                    n.inter_dir == c.inter_dir
+                        && [n.ref_idx[0], n.ref_idx[1]]
+                            == [c.mv_field[0].ref_idx, c.mv_field[1].ref_idx]
+                        && n.mv == [c.mv_field[0].mv, c.mv_field[1].mv]
+                })
+            };
+            if dup(a1) || dup(b1) {
+                continue;
+            }
         }
+        list.push(*c);
     }
 
     if list.len() >= 2 && list.len() < max_cands {
@@ -2787,11 +2792,15 @@ fn reconstruct_inter_cu(
 
     if trace_cu {
         eprintln!(
-            "hmvp poc={} pos=({},{}) n={}",
+            "hmvp poc={} pos=({},{}) n={} {:?}",
             g.poc,
             node.x,
             node.y,
-            g.hmvp.len()
+            g.hmvp.len(),
+            g.hmvp
+                .iter()
+                .map(|c| (c.inter_dir, c.mv_field[0].ref_idx, c.mv_field[0].mv.hor))
+                .collect::<Vec<_>>()
         );
         let col = merge_tmvp(g, node, is_b_slice);
         let list = derive_merge_list(g, node, &g.hmvp.clone(), col, is_b_slice);
@@ -4904,6 +4913,34 @@ fn chroma_lens(size_p: u16, size_q: u16, ctb_boundary: bool) -> (usize, usize) {
     }
 }
 
+/// Inter/intra boundary strength for one 4x4 luma edge
+/// (`DeblockingFilter.cpp`, H.266 §8.8.3).
+fn deblock_bs(g: &Gen<'_>, x: usize, y: usize, vertical: bool, is_tu_edge: bool) -> u8 {
+    let (p, q) = if vertical {
+        (g.lcell(x - 1, y), g.lcell(x, y))
+    } else {
+        (g.lcell(x, y - 1), g.lcell(x, y))
+    };
+    let p_intra = p.is_some_and(|c| c.intra);
+    let q_intra = q.is_some_and(|c| c.intra);
+    if p_intra || q_intra {
+        return 2;
+    }
+    let field = |c: LumaCell| -> (super::inter::Mv, i32) {
+        for l in 0..2 {
+            if c.ref_idx[l] >= 0 {
+                return (c.mv[l], g.ref_poc(l, c.ref_idx[l]).unwrap_or(0));
+            }
+        }
+        (super::inter::Mv::default(), 0)
+    };
+    let (pmv, pref) = p.map_or((super::inter::Mv::default(), 0), field);
+    let (qmv, qref) = q.map_or((super::inter::Mv::default(), 0), field);
+    filter::derive_boundary_strength(
+        p_intra, q_intra, false, false, is_tu_edge, pmv, qmv, pref, qref,
+    )
+}
+
 fn apply_deblock(g: &mut Gen<'_>) {
     let max_val = g.max_val();
     let bd = g.bit_depth;
@@ -4930,7 +4967,16 @@ fn apply_deblock(g: &mut Gen<'_>) {
                     }
                 }
                 filter::deblock_luma_edge_normative_bd(
-                    &mut lines, qp_y, qp_y, 2, beta, tc, lp, lq, false, bd,
+                    &mut lines,
+                    qp_y,
+                    qp_y,
+                    deblock_bs(g, x, y, true, true),
+                    beta,
+                    tc,
+                    lp,
+                    lq,
+                    false,
+                    bd,
                 );
                 for (i, line) in lines.iter().enumerate() {
                     let yy = (y + i).min(h - 1);
@@ -4968,7 +5014,7 @@ fn apply_deblock(g: &mut Gen<'_>) {
                     &mut lines,
                     qp_y,
                     qp_y,
-                    2,
+                    deblock_bs(g, x, y, false, true),
                     beta,
                     tc,
                     lp,
