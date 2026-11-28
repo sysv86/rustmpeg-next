@@ -518,10 +518,9 @@ def crates_downloads(crates: tuple[str, ...], token: str | None) -> int | None:
             raise
         if not isinstance(data, dict):
             return None
+        # ``crate.downloads`` is the all-time total across every published
+        # version, so the per-version counters must not be added on top of it.
         total += int((data.get("crate") or {}).get("downloads") or 0)
-        versions = data.get("versions")
-        if isinstance(versions, list) and versions:
-            total += int((versions[0] or {}).get("downloads") or 0)
     return total
 
 
