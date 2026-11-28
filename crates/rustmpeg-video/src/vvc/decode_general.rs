@@ -425,6 +425,8 @@ struct Gen<'a> {
     ccalf_cr: Vec<u8>,
     /// Luma transform-block boundaries: per 4x4 cell id, u32::MAX = none.
     tu_y: Vec<u32>,
+    /// Whether the luma TU covering each 4x4 cell has a coded residual.
+    tu_cbf_y: Vec<bool>,
     tu_u: Vec<u32>,
     tu_v: Vec<u32>,
     tu_y_w: usize,
@@ -994,6 +996,7 @@ pub(crate) fn decode_general_picture(
         tu_c_w: cgrid_w.div_ceil(2),
         tu_c_h: cgrid_h.div_ceil(2),
         tu_y: vec![u32::MAX; lgrid_w * lgrid_h],
+        tu_cbf_y: vec![false; lgrid_w * lgrid_h],
         tu_u: vec![u32::MAX; cgrid_w.div_ceil(2) * cgrid_h.div_ceil(2)],
         tu_v: vec![u32::MAX; cgrid_w.div_ceil(2) * cgrid_h.div_ceil(2)],
         tu_wy: vec![0; lgrid_w * lgrid_h],
@@ -4885,6 +4888,11 @@ fn mark_tu(g: &mut Gen<'_>, t: &TuData) {
         }
     }
     if t.component == 0 {
+        for yy in (y / 4)..((y + h).div_ceil(4)).min(g.tu_y_h) {
+            for xx in (x / 4)..((x + w).div_ceil(4)).min(g.tu_y_w) {
+                g.tu_cbf_y[yy * g.tu_y_w + xx] = t.cbf;
+            }
+        }
         for yy in y..(y + h).min(g.pic_h) {
             for xx in x..(x + w).min(g.pic_w) {
                 g.dec_y[(yy / 4) * g.lgrid_w + xx / 4] = true;
@@ -4949,8 +4957,20 @@ fn deblock_bs(g: &Gen<'_>, x: usize, y: usize, vertical: bool, is_tu_edge: bool)
     };
     let (pmv, pref) = p.map_or((super::inter::Mv::default(), 0), field);
     let (qmv, qref) = q.map_or((super::inter::Mv::default(), 0), field);
+    let cbf = |cx: usize, cy: usize| {
+        if cx / 4 < g.lgrid_w && cy / 4 < g.tu_y_h {
+            g.tu_cbf_y[(cy / 4) * g.lgrid_w + cx / 4]
+        } else {
+            false
+        }
+    };
+    let (pcbf, qcbf) = if vertical {
+        (cbf(x - 1, y), cbf(x, y))
+    } else {
+        (cbf(x, y - 1), cbf(x, y))
+    };
     filter::derive_boundary_strength(
-        p_intra, q_intra, false, false, is_tu_edge, pmv, qmv, pref, qref,
+        p_intra, q_intra, pcbf, qcbf, is_tu_edge, pmv, qmv, pref, qref,
     )
 }
 
