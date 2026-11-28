@@ -245,7 +245,7 @@ AV2 v1.0.0 §7.12.2 process and re-enables encoder emission of `LOCALWARP` and
 ### Verification (2026-11-11)
 
 Environment unchanged: `dav2d` revision `bff8e5c`
-(`/home/nitroarch/avm-bench/bin/dav2d`), one thread, `--threads 1
+(`$DAV2D`), one thread, `--threads 1
 --framedelay 1 --strict 1 -q`. Encoder invocation (all positional):
 
 ```bash

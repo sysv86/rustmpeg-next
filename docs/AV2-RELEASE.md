@@ -373,7 +373,7 @@ Post-patch verification & fixes applied:
   when `layout != I400 && bs != chroma.bs`, coded `skip_txfm` with `+3` context
   offset when `skip_mode` is active, and decoded `tx_partition` for non-skipped
   `skip_mode` blocks.
-- Pre-existing encoder/decoder/filter fixes also landed on `av2-patches`:
+- Pre-existing encoder/decoder/filter fixes included in this wave:
   - `NEWMV_NEWMV` (`frame.rs`): fixed compound MV residual encoding order
     (`encode_mv_magnitude` for both MVs followed by bypass signs
     `dy0, dx0, dy1, dx1`), matching `dec/frame.rs` and `dav2d`.
@@ -394,15 +394,15 @@ Post-patch verification & fixes applied:
   - Implicit reference frame map (`dec/hls.rs`, `dec/mod.rs`): implemented
     `get_ref_frames_implicit` (`explicit_ref_frame_map == 0`) with `tlayer_id`/
     `mlayer_id` tracking in `RefFrameInfo`.
-- Gates verified: `cargo fmt --all -- --check`, `cargo check --workspace`,
+- Gates verified in this tree: `cargo fmt --all -- --check`,
+  `cargo check --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo test -p rustmpeg-video --no-fail-fast` (`340 passed, 0 failed, 13 ignored`;
-  `apv` `7 passed`; `av2_warp` `1 passed`),
-  `DAV2D=/home/antigravity/oracle/dav2d/build/tools/dav2d cargo test -p rustmpeg-video --lib av2_ -- --ignored`
-  (`13 passed, 0 failed`, `dav2d` `bff8e5ce`), `rustmpeg-core`/`rustmpeg-format`/
-  `rustmpeg-audio`/`rustmpeg-vulkan`/`rustmpeg-cli`/`rustmpeg` test suites,
-  `python3 scripts/check-licenses.py`, and all 15/15 `verify_av2.py`
-  byte-exact `rec == our == dav2d` checks.
+  `cargo test --workspace` (820 passed, 0 failed; the `rustmpeg-video` library
+  run is 340 passed and 13 ignored), and `python3 scripts/check-licenses.py`.
+- Oracle checks re-run against `dav2d` `bff8e5c`:
+  `DAV2D=$DAV2D cargo test -p rustmpeg-video --lib av2_ -- --ignored`
+  reports 13 passed and 0 failed. The `verify_av2.py` harness used during
+  development is external to this repository and is not part of this record.
 - Remaining stock AVM (`avmenc` `917ddae`) gaps: multi-frame `256x192`
   with `--enable-warped-motion=0` decodes all 3 frames (`Key`, `Inter`, `Inter`)
   when unsupported tools are disabled, though `warped_motion` (`invalid warped-motion model`
