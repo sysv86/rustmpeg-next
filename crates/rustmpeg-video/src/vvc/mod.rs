@@ -2316,14 +2316,13 @@ impl VvcDecoder {
                                     .ok_or_else(|| {
                                         VvcError::Bitstream("chroma plane size mismatch".into())
                                     })?;
-                                self.dpb.insert(RefFrame::from_planes(
-                                    slice_poc,
-                                    false,
-                                    y,
-                                    u,
-                                    v,
-                                    MotionFieldGrid::new(wy as usize, hy as usize),
-                                ));
+                                let mut reference =
+                                    RefFrame::from_planes(slice_poc, false, y, u, v, gp.mv_grid);
+                                reference.ref_pocs = [
+                                    ref_l0.iter().map(|r| r.poc).collect(),
+                                    ref_l1.iter().map(|r| r.poc).collect(),
+                                ];
+                                self.dpb.insert(reference);
                             }
                             let mut vf = VvcFrame::new(wy, hy, bd, ChromaFormatIdc::Chroma420);
                             vf.y.data = gp.y.data;

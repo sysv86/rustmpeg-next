@@ -405,6 +405,12 @@ struct Gen<'a> {
     refs_l1: Vec<super::inter::RefFrame>,
     /// `PicOrderCntVal` of the picture being decoded.
     poc: i32,
+    /// Collocated picture for TMVP, with its per-4x4 MV grid and reference POCs.
+    collocated: Option<super::inter::RefFrame>,
+    /// `m_checkLdc`: every active reference POC is not in the future.
+    check_ldc: bool,
+    /// Symmetric MVD reference indices (`getSymRefIdx`, DecLib.cpp:3510-3580).
+    sym_ref: [i8; 2],
     lmcs: Option<LmcsReshaper16>,
     lmcs_on: bool,
     sao: Vec<[filter::SaoType; 3]>,
@@ -801,6 +807,8 @@ pub(crate) struct GeneralPicture {
     pub y: Plane16,
     pub u: Plane16,
     pub v: Plane16,
+    /// Reconstructed per-4x4 motion field for TMVP lookups by later pictures.
+    pub mv_grid: super::inter::MotionFieldGrid,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -880,6 +888,58 @@ pub(crate) fn decode_general_picture(
         None
     };
     let bit_depth = sps.info.bit_depth_luma;
+    // `DecLib.cpp:3480-3505`: low-delay check makes the collocated MV use the
+    // current list; otherwise it uses `ph_collocated_from_l0_flag`.
+    if std::env::var_os("VVC_MV_TRACE").is_some() {
+        eprintln!(
+            "sps log2_parallel_merge_level_minus2={} poc={}",
+            sps.log2_parallel_merge_level_minus2, poc
+        );
+    }
+    let check_ldc = refs_l0.iter().chain(refs_l1.iter()).all(|r| r.poc <= poc);
+    let col_list = if sh.slice_type == super::hls::VvcSliceType::B && !ph.collocated_from_l0 {
+        1
+    } else {
+        0
+    };
+    let collocated = (if col_list == 0 { &refs_l0 } else { &refs_l1 })
+        .get(usize::try_from(ph.collocated_ref_idx).unwrap_or(usize::MAX))
+        .cloned();
+    // `DecLib.cpp:3510-3580`: nearest forward POC in L0 and nearest backward
+    // POC in L1 (with the mirrored fallback) are the symmetric references.
+    let mut sym_ref = [-1i8; 2];
+    let nearest = |refs: &[super::inter::RefFrame], forward: bool| -> Option<(i32, i8)> {
+        let mut best: Option<(i32, i8)> = None;
+        for (i, r) in refs.iter().enumerate() {
+            let side = if forward { r.poc < poc } else { r.poc > poc };
+            if side && best.is_none_or(|(p, _)| if forward { r.poc > p } else { r.poc < p }) {
+                best = Some((r.poc, i as i8));
+            }
+        }
+        best
+    };
+    let f0 = nearest(&refs_l0, true);
+    let b1 = nearest(&refs_l1, false);
+    if let (Some(f0), Some(b1)) = (f0, b1) {
+        sym_ref = [f0.1, b1.1];
+    } else {
+        let b0 = nearest(&refs_l0, false);
+        let f1 = nearest(&refs_l1, true);
+        if let (Some(b0), Some(f1)) = (b0, f1) {
+            sym_ref = [f1.1, b0.1];
+        }
+    }
+    if std::env::var_os("VVC_MV_TRACE").is_some() {
+        eprintln!(
+            "colinfo poc={} col_list={} col_ref={} col_from_l0={} check_ldc={} colloc={:?}",
+            poc,
+            col_list,
+            ph.collocated_ref_idx,
+            ph.collocated_from_l0,
+            check_ldc,
+            collocated.as_ref().map(|r| r.poc)
+        );
+    }
     let mut g = Gen {
         sps,
         sh,
@@ -912,6 +972,9 @@ pub(crate) fn decode_general_picture(
         refs_l0,
         refs_l1,
         poc,
+        collocated,
+        check_ldc,
+        sym_ref,
         lmcs,
         lmcs_on,
         sao: vec![[filter::SaoType::Off; 3]; ctu_cols * ctu_rows],
@@ -949,6 +1012,9 @@ pub(crate) fn decode_general_picture(
     for ctu_y in (0..pic_h).step_by(ctu) {
         for ctu_x in (0..pic_w).step_by(ctu) {
             let ctu_idx = (ctu_y / ctu) * ctu_cols + ctu_x / ctu;
+            if ctu_x == 0 {
+                g.hmvp.clear();
+            }
             decode_sao_ctu(&mut g, &mut dec, &mut ctx, ctu_x, ctu_y, ctu_idx);
             decode_alf_ctu(&mut g, &mut dec, &mut ctx, ctu_x, ctu_y, ctu_idx);
 
@@ -1074,10 +1140,35 @@ pub(crate) fn decode_general_picture(
     if g.sps.alf_enabled && sh.alf_enabled && !no_alf {
         apply_alf(&mut g);
     }
+    let mut mv_grid = super::inter::MotionFieldGrid::new(pic_w, pic_h);
+    for gy in 0..g.tu_y_h {
+        for gx in 0..g.lgrid_w {
+            let c = g.lgrid[gy * g.lgrid_w + gx];
+            if !c.valid || c.intra {
+                continue;
+            }
+            mv_grid.fill_region(
+                gx * 4,
+                gy * 4,
+                4,
+                4,
+                Some(super::inter::InterMergeCand {
+                    inter_dir: c.inter_dir,
+                    mv_field: [
+                        super::inter::MvField::new(c.mv[0], c.ref_idx[0]),
+                        super::inter::MvField::new(c.mv[1], c.ref_idx[1]),
+                    ],
+                    bcw_idx: 2,
+                    use_alt_hpel_if: false,
+                }),
+            );
+        }
+    }
     Ok(GeneralPicture {
         y: g.y,
         u: g.u,
         v: g.v,
+        mv_grid,
     })
 }
 
@@ -1460,6 +1551,8 @@ struct InterCu {
     /// `inter_pred_idc`: `1` = L0, `2` = L1, `3` = BI.
     inter_dir: u8,
     ref_idx: [i8; 2],
+    /// `mvp_flag` per list.
+    mvp_idx: [u8; 2],
     mvd: [super::inter::Mv; 2],
     /// `sym_mvd_flag` + 1 (`0` = absent).
     smvd: u8,
@@ -1484,6 +1577,7 @@ impl Default for InterCu {
             merge_idx: 0,
             inter_dir: 0,
             ref_idx: [-1, -1],
+            mvp_idx: [0, 0],
             mvd: [super::inter::Mv::default(); 2],
             smvd: 0,
             imv: 0,
@@ -1660,17 +1754,6 @@ fn is_diff_mer(g: &Gen<'_>, x0: usize, y0: usize, x1: usize, y1: usize) -> bool 
     (x0 >> p) != (x1 >> p) || (y0 >> p) != (y1 >> p)
 }
 
-/// `MV scaling` between two pictures (`H.266 §8.5.2.3`).
-fn scale_mv(mv: super::inter::Mv, td: i32, tr: i32) -> super::inter::Mv {
-    if td == 0 || tr == 0 || td == tr {
-        return mv;
-    }
-    let clip = |v: i64| -> i32 {
-        (v * i64::from(tr) / i64::from(td)).clamp(-(1 << 15), (1 << 15) - 1) as i32
-    };
-    super::inter::Mv::new(clip(i64::from(mv.hor)), clip(i64::from(mv.ver)))
-}
-
 /// Right shift from a coded AMVR precision to the internal 1/16-pel precision.
 ///
 /// `Mv::m_amvrPrecision = { QUARTER, ONE, FOUR, HALF }` and
@@ -1696,6 +1779,173 @@ fn mvd_to_internal(mv: super::inter::Mv, imv: u8) -> super::inter::Mv {
 fn round_to_amvr(mv: super::inter::Mv, imv: u8) -> super::inter::Mv {
     let s = amvr_shift(imv);
     super::inter::Mv::new((mv.hor >> s) << s, (mv.ver >> s) << s)
+}
+
+/// `xGetDistScaleFactor` (`UnitTools.cpp:1703-1717`, H.266 §8.5.2.3).
+fn dist_scale_factor(curr_poc: i32, curr_ref: i32, col_poc: i32, col_ref: i32) -> i32 {
+    let td = col_poc - col_ref;
+    let tb = curr_poc - curr_ref;
+    if td == tb {
+        return 4096;
+    }
+    let tdb = tb.clamp(-128, 127);
+    let tdd = td.clamp(-128, 127);
+    let x = (0x4000 + (tdd / 2).abs()) / tdd;
+    ((tdb * x + 32) >> 6).clamp(-4096, 4095)
+}
+
+/// `Mv::getScaledMv`: multiply by the fixed-point factor and shift right 8.
+fn scale_mv_fixed(mv: super::inter::Mv, scale: i32) -> super::inter::Mv {
+    let clip = |v: i64| -> i32 {
+        ((v * i64::from(scale)) >> 8).clamp(
+            i64::from(super::inter::MV_MIN_STORAGE),
+            i64::from(super::inter::MV_MAX_STORAGE),
+        ) as i32
+    };
+    super::inter::Mv::new(clip(i64::from(mv.hor)), clip(i64::from(mv.ver)))
+}
+
+/// `Mv::convertMvFixedToFloat` / `convertMvFloatToFixed` pair used by
+/// `roundMvComp` (`UnitTools.cpp:1739-1754`).
+fn round_mv_comp(x: i32) -> i32 {
+    let sign = x >> 31;
+    let scale = (31 - ((x ^ sign) | 31).leading_zeros() as i32) - 5;
+    if scale < 0 {
+        return x;
+    }
+    let n = (x + ((1i32 << scale) >> 1)) >> scale;
+    let exponent = scale + ((n ^ sign) >> 5);
+    let mantissa = (n & 31) + sign * 32;
+    let encoded = exponent | (mantissa * 16);
+    let exp = encoded & 15;
+    let mant = encoded >> 4;
+    if exp == 0 {
+        mant
+    } else {
+        (mant ^ 32) * (1 << (exp - 1))
+    }
+}
+
+/// `PU::getColocatedMVP` (`UnitTools.cpp:1808-1928`, H.266 §8.5.2.11).
+fn tmvp_candidate(
+    g: &Gen<'_>,
+    node: &Node,
+    list_idx: usize,
+    ref_idx: i8,
+) -> Option<super::inter::InterMergeCand> {
+    if !g.ph.temporal_mvp_enabled || node.w + node.h <= 12 {
+        return None;
+    }
+    let col = g.collocated.as_ref()?;
+    let (x, y, w, h) = (node.x, node.y, node.w, node.h);
+    let rb = (x + w - 4, y + h - 4);
+    let ctu = g.ctu;
+    let c0 = rb.0 + 4 < g.pic_w && rb.1 + 4 < g.pic_h && (rb.1 & (ctu - 1)) + 4 < ctu;
+    let positions = if c0 {
+        [(rb.0 + 4, rb.1 + 4), (x + w / 2, y + h / 2)]
+    } else {
+        [(x + w / 2, y + h / 2), (x + w / 2, y + h / 2)]
+    };
+    let mut out = None;
+    for (px, py) in positions {
+        let Some(field) = col.mv_grid.get_at_luma(px, py) else {
+            if std::env::var_os("VVC_MV_TRACE").is_some() && node.x < 128 && node.y < 128 {
+                eprintln!(
+                    "tmvp-miss poc={} pos=({},{}) size={}x{} at=({},{}) list={}",
+                    g.poc, x, y, w, h, px, py, list_idx
+                );
+            }
+            continue;
+        };
+        let mut col_list = if g.check_ldc {
+            list_idx
+        } else {
+            usize::from(g.ph.collocated_from_l0)
+        };
+        let mut col_ref = field.mv_field[col_list].ref_idx;
+        if col_ref < 0 {
+            col_list = 1 - col_list;
+            col_ref = field.mv_field[col_list].ref_idx;
+        }
+        if col_ref < 0 {
+            continue;
+        }
+        let (Some(col_ref_poc), Some(curr_ref_poc)) = (
+            col.ref_pocs[col_list].get(col_ref as usize).copied(),
+            g.ref_poc(list_idx, ref_idx),
+        ) else {
+            continue;
+        };
+        let scale = dist_scale_factor(g.poc, curr_ref_poc, col.poc, col_ref_poc);
+        let mv = scale_mv_fixed(
+            super::inter::Mv::new(
+                round_mv_comp(field.mv_field[col_list].mv.hor),
+                round_mv_comp(field.mv_field[col_list].mv.ver),
+            ),
+            scale,
+        );
+        if std::env::var_os("VVC_MV_TRACE").is_some() && node.x < 128 && node.y < 128 {
+            eprintln!(
+                "tmvp-hit poc={} pos=({},{}) size={}x{} at=({},{}) list={} colref={} scale={} mv=({},{})",
+                g.poc, x, y, w, h, px, py, list_idx, col_ref, scale, mv.hor, mv.ver
+            );
+        }
+        out = Some(super::inter::InterMergeCand {
+            inter_dir: 1 << list_idx,
+            mv_field: [
+                if list_idx == 0 {
+                    super::inter::MvField::new(mv, ref_idx)
+                } else {
+                    super::inter::MvField::default()
+                },
+                if list_idx == 1 {
+                    super::inter::MvField::new(mv, ref_idx)
+                } else {
+                    super::inter::MvField::default()
+                },
+            ],
+            bcw_idx: super::inter::BCW_DEFAULT,
+            use_alt_hpel_if: false,
+        });
+        break;
+    }
+    out
+}
+
+/// `CU::saveMotionForHmvp` / `CodingStructure::addMiToLut`
+/// (`UnitTools.cpp:367-396`, `CodingStructure.cpp:1385-1408`).
+fn push_hmvp(g: &mut Gen<'_>, node: &Node, mut cand: super::inter::InterMergeCand) {
+    let p = usize::from(g.sps.log2_parallel_merge_level_minus2) + 2;
+    let mask = !((1usize << p) - 1);
+    if ((node.x ^ (node.x + node.w)) & mask) == 0 || ((node.y ^ (node.y + node.h)) & mask) == 0 {
+        return;
+    }
+    if cand.inter_dir != 3 {
+        cand.bcw_idx = super::inter::BCW_DEFAULT;
+    }
+    if let Some(pos) = g.hmvp.iter().position(|c| *c == cand) {
+        g.hmvp.remove(pos);
+    } else if g.hmvp.len() >= super::inter::MAX_NUM_HMVP_CANDS {
+        g.hmvp.remove(0);
+    }
+    g.hmvp.push(cand);
+}
+
+/// TMVP entry of the regular Merge candidate list (`UnitTools.cpp:1410-1480`).
+fn merge_tmvp(g: &Gen<'_>, node: &Node, is_b: bool) -> Option<super::inter::InterMergeCand> {
+    let mut c = super::inter::InterMergeCand {
+        inter_dir: 0,
+        mv_field: [super::inter::MvField::default(); 2],
+        bcw_idx: super::inter::BCW_DEFAULT,
+        use_alt_hpel_if: false,
+    };
+    for l in 0..if is_b { 2 } else { 1 } {
+        if let Some(t) = tmvp_candidate(g, node, l, 0) {
+            c.mv_field[l] = t.mv_field[l];
+            c.inter_dir |= 1 << l;
+        }
+    }
+    (c.inter_dir != 0).then_some(c)
 }
 
 /// `PU::getInterMergeCandidates()` (`UnitTools.cpp:1059-1700`).
@@ -1819,6 +2069,7 @@ fn derive_merge_list(
                 n.inter_dir == c.inter_dir
                     && [n.ref_idx[0], n.ref_idx[1]]
                         == [c.mv_field[0].ref_idx, c.mv_field[1].ref_idx]
+                    && n.mv == [c.mv_field[0].mv, c.mv_field[1].mv]
             })
         };
         if !dup(a1) && !dup(b1) {
@@ -1885,44 +2136,41 @@ fn derive_amvp_list(
     imv: u8,
 ) -> [super::inter::Mv; 2] {
     let (w, h, x, y) = (node.w, node.h, node.x, node.y);
-    let cur = g.poc;
-    let target = g.ref_poc(list_idx, ref_idx as i8).unwrap_or(cur);
+    let target = g.ref_poc(list_idx, ref_idx as i8);
     let mut out: Vec<super::inter::Mv> = Vec::with_capacity(2);
-    let add = |m: Option<MotionInfo>, out: &mut Vec<super::inter::Mv>| {
-        let Some(m) = m else { return false };
-        if !m.has(list_idx) {
+    // `addMVPCandUnscaled` (`UnitTools.cpp:2918-2993`): a spatial neighbour is
+    // accepted only when one of its reference POCs equals the target POC; the
+    // MV is then copied without temporal scaling.
+    let add = |pos: (usize, usize), out: &mut Vec<super::inter::Mv>| {
+        let Some(m) = g.motion(pos.0, pos.1) else {
             return false;
-        }
-        let src = g.ref_poc(list_idx, m.ref_idx[list_idx]).unwrap_or(target);
-        let mv = scale_mv(
-            m.mv[list_idx],
-            (src - cur).abs().max(1),
-            (target - cur).abs().max(1),
-        );
-        if !out.contains(&mv) {
-            out.push(mv);
-            return true;
+        };
+        for l in [list_idx, 1 - list_idx] {
+            if m.has(l) && g.ref_poc(l, m.ref_idx[l]) == target {
+                let mv = m.mv[l];
+                if !out.contains(&mv) {
+                    out.push(mv);
+                }
+                return true;
+            }
         }
         false
     };
     if x > 0 {
-        for &dy in &[h - 1, h - 1 - 4] {
-            if add(g.motion(x - 1, y + dy), &mut out) || out.len() >= 2 {
-                break;
-            }
-            if dy < 4 {
-                break;
-            }
+        if !add((x - 1, y + h), &mut out) {
+            add((x - 1, y + h - 1), &mut out);
         }
     }
     if out.len() < 2 && y > 0 {
-        for &dx in &[w - 1, w - 1 - 4] {
-            if add(g.motion(x + dx, y - 1), &mut out) || out.len() >= 2 {
-                break;
-            }
-            if dx < 4 {
-                break;
-            }
+        if !add((x + w, y - 1), &mut out) && !add((x + w - 1, y - 1), &mut out) {
+            add((x - 1, y - 1), &mut out);
+        }
+    }
+    // VTM appends TMVP even when it repeats a spatial candidate; only the two
+    // spatial candidates are pruned for equality (`UnitTools.cpp:2138-2144`).
+    if let Some(t) = tmvp_candidate(g, node, list_idx, ref_idx as i8) {
+        if out.len() < 2 {
+            out.push(t.mv_field[list_idx].mv);
         }
     }
     for c in hmvp.iter().rev() {
@@ -1937,11 +2185,23 @@ fn derive_amvp_list(
     for mv in &mut out {
         *mv = round_to_amvr(*mv, imv);
     }
-    if out.len() >= 2 && out[0] == out[1] {
-        out.truncate(1);
-    }
     while out.len() < 2 {
         out.push(super::inter::Mv::default());
+    }
+    if std::env::var_os("VVC_MV_TRACE").is_some() && node.x < 128 && node.y < 128 {
+        eprintln!(
+            "amvp poc={} pos=({},{}) l={} ref={} imv={} cands=[({},{}) ({},{})]",
+            g.poc,
+            node.x,
+            node.y,
+            list_idx,
+            ref_idx,
+            imv,
+            out[0].hor,
+            out[0].ver,
+            out[1].hor,
+            out[1].ver
+        );
     }
     [out[0], out[1]]
 }
@@ -2087,7 +2347,7 @@ fn decode_inter_cu(
                 cu.mvd[0] = super::slice::decode_mvd(dec, ctx);
                 let _ = i;
             }
-            bit_is_on(dec, ctx, ctx::MVP_IDX);
+            cu.mvp_idx[0] = u8::from(bit_is_on(dec, ctx, ctx::MVP_IDX));
         }
         if cu.inter_dir != 1 {
             if cu.smvd == 0 {
@@ -2100,7 +2360,7 @@ fn decode_inter_cu(
                     }
                 }
             }
-            bit_is_on(dec, ctx, ctx::MVP_IDX);
+            cu.mvp_idx[1] = u8::from(bit_is_on(dec, ctx, ctx::MVP_IDX));
         }
         if cu.inter_dir == 3 && ((w == 4 && h == 4) || w + h == 12) {
             cu.inter_dir = 1;
@@ -2110,6 +2370,7 @@ fn decode_inter_cu(
         if cu.smvd != 0 {
             let cur = usize::from(cu.smvd - 1);
             cu.mvd[1 - cur] = super::inter::Mv::new(-cu.mvd[cur].hor, -cu.mvd[cur].ver);
+            cu.ref_idx = g.sym_ref;
         }
     }
 
@@ -2397,7 +2658,7 @@ fn reconstruct_inter_cu(
     tus: &[TuData],
 ) -> Result<(), VvcError> {
     let is_b_slice = g.sh.slice_type == super::hls::VvcSliceType::B;
-    let trace_cu = std::env::var_os("VVC_MV_TRACE").is_some() && node.y < 64 && node.x < 64;
+    let trace_cu = std::env::var_os("VVC_MV_TRACE").is_some() && node.y < 128 && node.x < 128;
     if cu.affine {
         // Subblock merge (`H.266 §8.5.3`). The candidate list starts with
         // SbTMVP (requires a collocated *inter* picture) and the inherited
@@ -2438,7 +2699,8 @@ fn reconstruct_inter_cu(
         // predictions with the split-direction mask; BDOF and DMVR are
         // disabled for these coding units.
         let hmvp = g.hmvp.clone();
-        let list = derive_merge_list(g, node, &hmvp, None, is_b);
+        let col = merge_tmvp(g, node, is_b);
+        let list = derive_merge_list(g, node, &hmvp, col, is_b);
         let pick = |idx: u8| {
             list.get(usize::from(idx)).copied().unwrap_or_else(|| {
                 *list
@@ -2469,12 +2731,12 @@ fn reconstruct_inter_cu(
             [cand.mv_field[0].ref_idx, cand.mv_field[1].ref_idx],
             [cand.mv_field[0].mv, cand.mv_field[1].mv],
         );
-        g.hmvp.push(cand);
         return finish_inter(g, node, plan, tus);
     }
     let cand = if cu.merge {
         let hmvp = g.hmvp.clone();
-        let list = derive_merge_list(g, node, &hmvp, None, is_b);
+        let col = merge_tmvp(g, node, is_b);
+        let list = derive_merge_list(g, node, &hmvp, col, is_b);
         list.get(usize::from(cu.merge_idx))
             .copied()
             .unwrap_or_else(|| {
@@ -2497,8 +2759,9 @@ fn reconstruct_inter_cu(
                 continue;
             }
             let ref_idx = cu.ref_idx[l].max(0);
-            let mvp = derive_amvp_list(g, node, l, ref_idx as usize, &g.hmvp, cu.imv)[0];
-            if std::env::var_os("VVC_MV_TRACE").is_some() && node.x < 40 && node.y < 8 {
+            let mvp = derive_amvp_list(g, node, l, ref_idx as usize, &g.hmvp, cu.imv)
+                [usize::from(cu.mvp_idx[l])];
+            if std::env::var_os("VVC_MV_TRACE").is_some() && node.x < 128 && node.y < 128 {
                 eprintln!(
                     "mvp pos=({},{}) l={} ref={} mvp=({},{}) mvd=({},{})",
                     node.x, node.y, l, ref_idx, mvp.hor, mvp.ver, cu.mvd[l].hor, cu.mvd[l].ver
@@ -2514,7 +2777,7 @@ fn reconstruct_inter_cu(
             let cur = usize::from(cu.smvd - 1);
             let other = 1 - cur;
             let f = c.mv_field[cur];
-            let sym_ref = if other == 1 { 0 } else { 0 };
+            let sym_ref = g.sym_ref[other];
             c.mv_field[other] =
                 super::inter::MvField::new(super::inter::Mv::new(-f.mv.hor, -f.mv.ver), sym_ref);
             c.inter_dir = 3;
@@ -2523,9 +2786,18 @@ fn reconstruct_inter_cu(
     };
 
     if trace_cu {
-        let list = derive_merge_list(g, node, &g.hmvp.clone(), None, is_b_slice);
         eprintln!(
-            "mvcu pos=({},{}) size={}x{} skip={} merge={} midx={} dir={} ref={:?} mv=[({},{}),({},{})] cands={:?}",
+            "hmvp poc={} pos=({},{}) n={}",
+            g.poc,
+            node.x,
+            node.y,
+            g.hmvp.len()
+        );
+        let col = merge_tmvp(g, node, is_b_slice);
+        let list = derive_merge_list(g, node, &g.hmvp.clone(), col, is_b_slice);
+        eprintln!(
+            "mvcu poc={} pos=({},{}) size={}x{} skip={} merge={} midx={} dir={} ref={:?} mv=[({},{}),({},{})] bcw={} cands={:?}",
+            g.poc,
             node.x,
             node.y,
             node.w,
@@ -2539,6 +2811,7 @@ fn reconstruct_inter_cu(
             cand.mv_field[0].mv.ver,
             cand.mv_field[1].mv.hor,
             cand.mv_field[1].mv.ver,
+            cand.bcw_idx,
             list.iter()
                 .take(6)
                 .map(|c| (
@@ -2568,7 +2841,7 @@ fn reconstruct_inter_cu(
         [cand.mv_field[0].ref_idx, cand.mv_field[1].ref_idx],
         [cand.mv_field[0].mv, cand.mv_field[1].mv],
     );
-    g.hmvp.push(cand);
+    push_hmvp(g, node, cand);
     // Residual on top of the inter prediction (`reconstruct_tus` reads the
     // prediction from the `pred_*` planes when `plan.intra == false`).
     finish_inter(g, node, plan, tus)
