@@ -1,5 +1,62 @@
 # H.266 / VVC Implementation Status (`rustmpeg-video::vvc`)
 
+## Current verification baseline (commit `79f4f0431287e197909d45df975bcc2493bea2c4`)
+
+This is the canonical baseline for this snapshot. The numbered wave sections
+below are historical records of earlier commits: their counts are the numbers
+measured for those changes, not the current baseline. The current numbers were
+re-measured from the release examples built in this worktree; nothing below is
+inherited from a previous run.
+
+| Gate | Command | Result |
+| :--- | :--- | :--- |
+| Build | `cargo build --release --examples` in `$REPO` | pass (38 s) |
+| Full matrix | `REPO=$REPO DIR=$WORK/vvc-matrix VTM_BIN=$VTM_BIN VTM_ROOT=$VTM_ROOT VVDEC=$VVDEC bash $WORK/vvc-conf-full/run_conformance_full.sh` | **263 passed / 3 failed / 0 skipped** (266 checks) |
+| Strict 25-case | `REPO=$REPO DIR=$WORK/vvc-strict VTM=$VTM_BIN VVDEC=$VVDEC bash $WORK/vvc-conf/run_conformance.sh` | **50/50** (25 cases × 2 decoders, 0 `ENCODE FAIL`) |
+| License | `python3 scripts/check-licenses.py` in `$REPO` | OK (138 packages, 202 SPDX headers, all permissive) |
+
+The matrix counts a PASS both for a successful decoder invocation and for the
+byte-for-byte `cmp` that follows it: reconstructed Y+U+V planes are compared
+against VTM 24.0 `DecoderApp` and VVdeC 3.3 `vvdecapp`, and in the last three
+rows our decoder output is compared against the VTM 24.0 `EncoderApp`
+reference. Size checks precede every comparison.
+
+The three FAIL rows, verbatim:
+
+```text
+FAIL  b12_420: VVdeC decoder rc=255
+FAIL  ctu16 [modes,deblock]: ENCODE FAIL
+FAIL  d_ra8: rustmpeg decoder failed
+```
+
+- `b12_420`: VVdeC 3.3 rejects `sps_bitdepth_minus8 > 2` (`bit depths above 10
+  are not supported`); VTM 24.0 decodes the same stream byte-exactly. This is an
+  oracle limitation, not a stream defect.
+- `ctu16`: `vvc_multitool_dump` returns a typed `unsupported --ctu-size 16`
+  (`sps_log2_ctu_size_minus5` cannot signal 16) without panicking.
+- `d_ra8`: `vvc_stateful_decode` reports `unsupported VVC feature: inter coding
+  unit reconstruction (motion compensation)`. All five pictures parse
+  bin-for-bin with VTM (§0k); reconstruction of inter CUs is missing.
+- The other decoder-side rows, `d_i8 decoder` and `d_i10 decoder`, PASS.
+
+Oracle setup is part of the reproduction: the default paths in both external
+scripts are stale. The `h266-package` umake release directory has no
+`DecoderApp`, and its `bin/DecoderAppStatic` exits with SIGSEGV (rc=139) on
+every stream, so a first run against it was discarded and is not cited here.
+A pristine VTM 24.0 build was made from
+`$WORK/h266-package/reference/vtm24.tar.gz` with
+`-DCMAKE_BUILD_TYPE=Release -DENABLE_TRACING=OFF
+-DCMAKE_CXX_FLAGS="-Wno-unused-but-set-variable -Wno-unused-variable -Wno-unused-parameter"`
+(GCC 16.2.1 treats an unused variable in VTM's film-grain code as an error).
+`$VTM_BIN`/`VTM_ROOT` point at that build; `$VVDEC` is the recorded VVdeC 3.3
+binary. `$WORK` is the scratch root for the matrix and strict-harness outputs.
+
+Not re-run in this baseline: `cargo test --workspace`, `clippy -D warnings`,
+`cargo fmt --check`, the individual QP sweeps and CABAC bin traces described in
+the historical sections, and the GPU paths. Their historical results remain
+recorded in the sections below as claims from their own commits; they are not
+re-asserted as verified for this snapshot.
+
 ## 0k. d_ra8 inter syntax: all five pictures parse bin-for-bin with VTM (2026-11-15)
 
 The general coding-tree decoder now parses the complete syntax of the four
@@ -55,12 +112,15 @@ special-cased):
   upper bound; and `ts_flag` is not coded in an SBT coding unit
   (`TU::isTSAllowed`).
 
-Verification: strict 25-case harness **50/50**; full 266-check matrix
-**263 passed / 3 failed / 0 skipped** (same `b12_420`, `ctu16`, `d_ra8` rows -
-`d_ra8` now fails at inter reconstruction instead of at the slice); `d_i8`,
-`d_i10` and the `d_ra8` IDR stay byte-exact; `cargo test --workspace`,
-`clippy -D warnings`, `fmt` and the license audit pass. Reproduction of the
-bin comparison is recorded in `VERIFICATION_DEBT.md` §0i.
+Conformance recorded at this wave (identical to the current baseline above):
+strict 25-case harness **50/50**; full 266-check matrix **263 passed / 3 failed /
+0 skipped** (same `b12_420`, `ctu16`, `d_ra8` rows - `d_ra8` failed at inter
+reconstruction instead of at the slice); `d_i8`, `d_i10` and the `d_ra8` IDR
+byte-exact. `cargo test --workspace`, `clippy -D warnings` and `fmt` were
+recorded as passing for that wave; they were not re-run for the current
+snapshot, so treat them as unverified here. The license audit was re-run and
+passes. Reproduction of the bin comparison is recorded in
+`VERIFICATION_DEBT.md` §0i.
 
 ## 0j. 10-bit 128x128 CABAC fixes: maximum transform size and SAO (2026-11-15)
 
@@ -82,7 +142,7 @@ are fixed and the affected streams now decode byte-exactly.
   first CTU.
 
 Verification (VTM 24.0 `EncoderApp`/`DecoderApp`, `cmp` on Y+U+V, `128x128`
-10-bit, `~/vvc-conf-full/ctu128_10.source.yuv`):
+10-bit, `$WORK/vvc-conf-full/ctu128_10.source.yuv`):
 
 | Stream | Result |
 | :--- | :--- |
@@ -93,10 +153,11 @@ Verification (VTM 24.0 `EncoderApp`/`DecoderApp`, `cmp` on Y+U+V, `128x128`
 | `d_i8`, `d_i10` (64x64) | byte-exact (unchanged) |
 | `d_ra8` picture 1 (IDR, 128x128 8-bit) | byte-exact (unchanged) |
 
-Strict 25-case harness: **50/50**. Full 266-check matrix: **263 passed / 3
-failed / 0 skipped**; the same three rows (`b12_420`, `ctu16`, `d_ra8`).
-`cargo test --workspace` passes; no test was added because the acceptance
-evidence is the VTM comparison above.
+Harness results recorded at this wave: strict **50/50**, matrix **263/3/0**
+with the same three rows (`b12_420`, `ctu16`, `d_ra8`); see the canonical
+baseline above for the current snapshot. `cargo test --workspace` was recorded
+as passing at this wave (not re-run in the current baseline); no test was added
+because the acceptance evidence is the VTM comparison above.
 
 ## 0i. Transform blocks larger than 32 samples (2026-11-15)
 
@@ -125,9 +186,9 @@ Verification (pristine VTM 24.0 `EncoderApp`/`DecoderApp`, `cmp` on Y+U+V):
 | `d_i8`, `d_i10` (64x64, 3 frames, stock intra cfg) | byte-exact (unchanged) |
 | `d_ra8` picture 1 (IDR, 128x128, 8-bit) | byte-exact (unchanged) |
 
-Strict 25-case harness (VTM 24.0 `DecoderApp` + VVdeC 3.3 `vvdecapp`): **50/50**.
-Full 266-check matrix: **263 passed / 3 failed / 0 skipped**, the same three
-documented failures (`b12_420`, `ctu16`, `d_ra8`). New unit test:
+Harness results recorded at this wave: strict **50/50**, matrix **263/3/0**
+with the same three documented failures (`b12_420`, `ctu16`, `d_ra8`); see the
+canonical baseline above for the current snapshot. New unit test at this wave:
 `large_transform_scan_covers_the_top_left_32x32_region_with_the_full_stride`.
 
 Not covered: a transform block with chroma larger than 32 samples (needs 4:2:2
@@ -198,12 +259,12 @@ Verification (pristine VTM 24.0 build from `vtm24.tar.gz`, `cmp` on Y+U+V):
 | `d_ra8` pictures 2-5 (B slices) | typed rejection: inter coding units are not implemented |
 | `d_i8`, `d_i10` (64x64, 3 frames, stock intra cfg) | byte-exact (unchanged) |
 
-Strict 25-case harness (VTM 24.0 `DecoderApp` + VVdeC 3.3 `vvdecapp`): **50/50**.
-Full 266-check matrix: **263 passed / 3 failed / 0 skipped**, the same three
-documented failures (`b12_420`, `ctu16`, `d_ra8`). `cargo test --workspace`
-passes; the new unit tests cover the multi sub-layer SPS/DPB parse, the PH
-override/RPL round trip, the slice-header reference-list inheritance and the
-POC output order.
+Harness results recorded at this wave: strict **50/50**, matrix **263/3/0**
+with the same three documented failures (`b12_420`, `ctu16`, `d_ra8`); see the
+canonical baseline above for the current snapshot. `cargo test --workspace`
+was recorded as passing at this wave (not re-run in the current baseline); the
+new unit tests cover the multi sub-layer SPS/DPB parse, the PH override/RPL
+round trip, the slice-header reference-list inheritance and the POC output order.
 
 Remaining for `d_ra8`: the general inter coding-unit syntax and its prediction
 tools, inter motion compensation, and inter boundary strength for deblocking.
@@ -291,11 +352,10 @@ Verification (pristine VTM 24.0 build from `vtm24.tar.gz`, `cmp` on Y+U+V):
 | 10-bit stock cfg, QP26/32/37, 64x64 | 3/3 byte-exact |
 | 8-bit stock cfg, QP37, 64x64 | byte-exact |
 
-Strict 25-case harness (VTM 24.0 `DecoderApp` + VVdeC 3.3 `vvdecapp`):
-**50/50**. Full 266-check matrix: **263 passed / 3 failed / 0 skipped**. The
-three remaining failures are `b12_420` (VVdeC has no 12-bit oracle), `ctu16`
-(the 16-sample CTU cannot be signalled and the harness prints `ENCODE FAIL`),
-and `d_ra8`.
+Harness results recorded at this wave: strict **50/50**, matrix **263/3/0**;
+the three failures are `b12_420` (VVdeC has no 12-bit oracle), `ctu16` (the
+16-sample CTU cannot be signalled and the harness prints `ENCODE FAIL`), and
+`d_ra8`. See the canonical baseline above for the current snapshot.
 
 `d_ra8` (VTM stock `encoder_randomaccess_vtm.cfg`, 128x128, 5 frames, POC order
 0/4/2/1/3, temporal ids 0..5) was outside the decoder at this point: the SPS was
@@ -344,12 +404,12 @@ Verified with `cmp` on full Y+U+V, 3 frames, VTM 24.0 `DecoderApp`, stock
 | stock, stage chain `base`/`+LMCS`/`+SAO`/`+ALF`/`+CCALF`/`+deblock` at QP26/37 | 12/12 byte-exact | 12/12 byte-exact |
 
 The QP37 64x64 full-chain case that sections 0d and 0e recorded as failing is
-byte-exact. Strict 25-case harness (VTM 24.0 `DecoderApp` + VVdeC 3.3 `vvdecapp`):
-**50/50**. Full 266-check matrix: **261 passed / 5 failed / 0 skipped**, the same
-five documented residual failures (12-bit VVdeC oracle limit, the CTU-16 typed
-rejection, and the three VTM-encoder streams outside the decoder subset; section
-0g fixes two of those three). No new failure. `cargo test --workspace` passes
-(two new deblocking unit tests).
+byte-exact. Harness results recorded at this wave (historical, before the 0g
+and 0h fixes): strict **50/50**, matrix **261 passed / 5 failed / 0 skipped**
+(12-bit VVdeC oracle limit, CTU-16 typed rejection, and three VTM-encoder
+streams outside the decoder subset). `cargo test --workspace` was recorded as
+passing at this wave (two new deblocking unit tests); not re-run in the current
+baseline.
 
 ## 0e. LFNST and ISP reconstruction for the stock configuration (2026-11-15)
 
@@ -526,9 +586,9 @@ The strict 25-case harness (rustmpeg encode → VTM 24.0 / VVdeC 3.3 decode) is
 
 ## 0b. Post-fix re-measurement (late 2026-10-28, after waves 1–4)
 
-Full matrix (`$ORACLE/vvc-conf-full/run_conformance_full.sh`): **261 passed /
+Full matrix (`$WORK/vvc-conf-full/run_conformance_full.sh`): **261 passed /
 5 failed / 0 skipped** (266 checks). Strict harness
-(`$ORACLE/vvc-conf/run_conformance.sh`, 25 cases): **50/50** (25 cases on
+(`$WORK/vvc-conf/run_conformance.sh`, 25 cases): **50/50** (25 cases on
 both VTM 24.0 `DecoderApp` and VVdeC 3.3 `vvdecapp`).
 
 Byte-exact now: 10-bit, 4:0:0/4:2:2/4:4:4, CTU 64/128 (8/10-bit), MRL, BDPCM,
@@ -567,8 +627,8 @@ prediction implementation in `predict.rs`.
 
 External full matrix (64 encodes + 3 VTM-encoder cases, VTM 24.0 `DecoderApp`
 and VVdeC 3.3 `vvdecapp`, script kept outside the tree at
-`$ORACLE/vvc-conf-full/run_conformance_full.sh`): **195 checks passed,
-63 failed**. The strict harness (`$ORACLE/vvc-conf/run_conformance.sh`,
+`$WORK/vvc-conf-full/run_conformance_full.sh`): **195 checks passed,
+63 failed**. The strict harness (`$WORK/vvc-conf/run_conformance.sh`,
 25 cases: strict 8-bit 4:2:0, multi-tool intra, MIP, deblock, inter P) is
 **25/25 on both decoders**.
 

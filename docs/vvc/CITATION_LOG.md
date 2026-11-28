@@ -1,6 +1,6 @@
 # H.266 / VVC Normative Citation Log (`rustmpeg-video::vvc`)
 
-Every formula, constant, table, context index, scan, matrix, and syntax condition implemented in `crates/rustmpeg-video/src/vvc/` is verified against the bundled normative specification (`docs/h266/H.266_2026-01.pdf`, ITU-T Rec. H.266 V4, 01/2026) and the bundled VTM 24.0 reference software (`reference/VTM-24.0/`).
+Every formula, constant, table, context index, scan, matrix, and syntax condition implemented in `crates/rustmpeg-video/src/vvc/` is cited against the normative specification (ITU-T Rec. H.266 V4, 01/2026; conventionally `docs/h266/H.266_2026-01.pdf`) and VTM 24.0 reference software (conventionally `reference/VTM-24.0/`). Neither document is bundled in this worktree: the paths below are logical source identifiers, not links to tracked files. The VTM 24.0 revision used for the conformance runs recorded in [`STATUS.md`](STATUS.md) was built from the external `vtm24.tar.gz` at `$WORK/vtm-src`; the decoder binary is `$VTM_BIN/DecoderApp` and the VVdeC 3.3 binary is `$VVDEC`.
 
 Format: `Feature -> Source (H.266 page/clause and/or VTM 24.0 file:line) -> Implementation location`
 

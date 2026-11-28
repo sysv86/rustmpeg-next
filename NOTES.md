@@ -37,49 +37,21 @@ accept hexadecimal, `@file`, or standard input.
 
 ## H.266/VVC
 
-Status: **implemented (Waves 1–14: multi-tool Intra + Inter P, 10-bit/4:2:2/4:4:4/ACT, palette/IBC, RPR/SEI scaffolding); 242 VVC unit tests pass; the 8-bit 4:2:0 strict subset and the recorded multi-tool intra/inter matrix are byte-exact against VTM 24.0 and VVdeC 3.3** — see [`docs/vvc/STATUS.md`](docs/vvc/STATUS.md) and [`VERIFICATION_DEBT.md`](VERIFICATION_DEBT.md). Multi-tool inter outside the checked matrix (QP4/QP10, 200x120 QP40) and B slices remain open.
-
-### Implemented and verified
-
-- Intra-only encoder and strict subset decoder in `crates/rustmpeg-video/src/vvc/`.
-- Main 10 signalling, 8-bit 4:2:0, BT.709 limited range, VUI.
-- One `IDR_N_LP` per access unit, one slice, one tile, one 32x32 CU == TU per CTU.
-- PLANAR and DC intra prediction, selected per CTU by SAD; DM chroma; PDPC.
-- Transform skip at QP 4 (lossless); DCT-2 32x32/16x16, explicit intra MTS
-  (DST-7/DCT-8), and LFNST for QP > 4, with regular residual coding.
-- MTS and LFNST candidates are selected per luma block by reconstruction SSE;
-  chroma stays DCT-2.
-- Annex-B output with in-band VPS/SPS/PPS/PH, emulation prevention, typed errors,
-  checked arithmetic, explicit size limits, and `#![forbid(unsafe_code)]`.
-- Decoder validates SPS/PPS IDs, PPS→SPS and PH→PPS linkage, one VCL per AU,
-  `IDR_N_LP` only, layer 0, temporal sub-layer 0, and rejects unsupported syntax.
-- 84 module tests; `cargo clippy -D warnings` and `cargo fmt --check` pass.
-- Byte-exact reconstruction verified with FFmpeg n9.0.2, vvdec 3.3, and VTM 24.0
-  `DecoderApp` at QP 4 (lossless), 26, 40, and 50 on 200x120 streams.
-
-Compression at 200x120, 3 frames: 170,473 bytes at QP 4, 24,238 at QP 26, 5,205 at
-QP 40, and 1,514 at QP 50. The same clip at QP 26 was 38,737 bytes with transform
-skip only.
-
-### Not implemented
-
-- Dependent quantisation and sign-data hiding.
-- Rate-distortion model; transform selection uses reconstruction SSE only, without
-  a rate term.
-- CU partitioning: sizes 4..128, QT/MTT, transform tree, dual tree.
-- Multi-slice, tiles, WPP, sub-pictures.
-- Inter prediction: P/B, DPB/RPL, motion estimation, merge/AMVP, affine, weighted
-  prediction, BCW/CIIP/GPM.
-- In-loop filters: deblocking, SAO, ALF, CCALF, LMCS, LADF.
-- 10/12-bit, 4:2:2, 4:4:4, non-square transforms, 64-point transforms, scaling lists.
-- General H.266 decoder; the current decoder accepts only this encoder's streams.
-- ISOBMFF `vvc1`/`vvcC` and Matroska `V_MPEGI/ISO/VVC` muxing.
-
-### Boundaries
+Status at commit `79f4f0431287e197909d45df975bcc2493bea2c4`: full-matrix
+**263 passed / 3 failed / 0 skipped** and strict 25-case harness **50/50**,
+measured from release examples built in this worktree with a pristine VTM 24.0
+and VVdeC 3.3; license audit OK. The three failures are `b12_420` (VVdeC has no
+12-bit oracle), `ctu16` (typed rejection), and `d_ra8` (inter CU reconstruction
+missing after a bin-exact syntax parse). The encoder and decoder cover the
+multi-tool intra and Inter P/B subsets, 8/10/12-bit and 4:0:0/4:2:0/4:2:2/4:4:4
+geometry, in-loop filters, palette/IBC, RPR and group syntax; coverage and
+limits are specified in [`docs/vvc/STATUS.md`](docs/vvc/STATUS.md) and
+[`VERIFICATION_DEBT.md`](VERIFICATION_DEBT.md). `cargo test --workspace`,
+clippy and fmt were not re-run for this snapshot and are not asserted here.
 
 The formal scope of the intra profile is in
-[`docs/VVC-INTRA-PROFILE.md`](docs/VVC-INTRA-PROFILE.md). Full VVC requires the
-items above; they are separate milestones, not configuration switches.
+[`docs/VVC-INTRA-PROFILE.md`](docs/VVC-INTRA-PROFILE.md). Full VVC remains a
+milestone, not a configuration switch.
 
 ## AV1
 
